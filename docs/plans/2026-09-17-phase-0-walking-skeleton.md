@@ -52,6 +52,9 @@ Expected: the top commit is `docs: add v1 product and architecture design (#1)`.
 # macOS
 .DS_Store
 
+# Git worktrees created by tooling
+.worktrees/
+
 # Rust
 /target/
 **/*.rs.bk
@@ -171,7 +174,7 @@ Important: `members` must be listed explicitly (no globs). release-please's Rust
 ```toml
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "apps/desktop/src-tauri"]
+members = ["crates/core"]
 
 [workspace.package]
 edition = "2024"
@@ -192,7 +195,7 @@ lto = true
 strip = true
 ```
 
-Note: `apps/desktop/src-tauri` does not exist yet. Cargo will error until Task 4. For Tasks 2 and 3, temporarily use `members = ["crates/core", "crates/cli"]` and add the third member in Task 4.
+Members are added as the crates appear: Task 3 adds `"crates/cli"`, Task 4 adds `"apps/desktop/src-tauri"`.
 
 **Step 2: Write `crates/core/Cargo.toml`**
 
@@ -294,11 +297,14 @@ git commit -m "feat(core): add workspace and app metadata"
 ### Task 3: CLI crate
 
 **Files:**
+- Modify: `Cargo.toml` (add `"crates/cli"` to `members`)
 - Create: `crates/cli/Cargo.toml`
 - Create: `crates/cli/src/main.rs`
 - Create: `crates/cli/tests/cli.rs`
 
-**Step 1: Write `crates/cli/Cargo.toml`**
+**Step 1: Register the member and write `crates/cli/Cargo.toml`**
+
+In the root `Cargo.toml` set `members = ["crates/core", "crates/cli"]`. Then write:
 
 ```toml
 [package]
@@ -423,7 +429,7 @@ Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D wa
 Expected: exit code 0.
 
 ```bash
-git add crates/cli Cargo.lock
+git add Cargo.toml Cargo.lock crates/cli
 git commit -m "feat(cli): add storage-monitor binary with info command"
 ```
 
