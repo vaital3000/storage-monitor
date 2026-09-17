@@ -2021,3 +2021,31 @@ final "Outcome" heading (one short paragraph), via a small `docs:` PR.
 - Branch protection rules (GitHub requires a public repository or a paid
   plan; enable when the repository goes public).
 - Homebrew tap and notarization.
+
+---
+
+## Outcome (2026-09-17)
+
+Phase 0 shipped as [`v0.1.0`](https://github.com/vaital3000/storage-monitor/releases/tag/v0.1.0)
+on the day it was planned: PR #3 (walking skeleton) and PR #4 (release-please)
+were squash-merged, and `release.yml` attached the universal `.dmg`, the CLI
+tarball and `checksums.txt`. Verified locally: checksums match, the app is
+ad-hoc signed and universal, `LSMinimumSystemVersion` is 13.3, the CLI prints
+`0.1.0`.
+
+Deviations from the original plan, all folded back into the text above:
+
+- release-please runs the `simple` strategy with TOML `extra-files` (the Rust
+  strategy fails on a virtual workspace root), and the `Cargo.lock` rules use
+  `@.name.value`.
+- The release PR does not trigger CI; with branch protection on, it is closed
+  and reopened once to get the required checks.
+- Repository settings had to be flipped: Actions may create PRs, squash-only
+  merges, delete branch on merge, private vulnerability reporting, and branch
+  protection on `main` with the checks `rust`, `frontend`, `desktop`, `pr-title`.
+- TypeScript stayed at the scaffold's 6.x; `tsc` checks only `src/`.
+- Minimum macOS is 13.3 (Tailwind v4 needs Safari 16.4); the desktop crate is
+  `rlib`-only; CI job names are the short `rust`/`frontend`/`desktop`.
+- The live Tauri window was launched and ran, but could not be screenshotted
+  on a locked screen; the IPC round trip is covered by the unit test and the
+  mocked e2e.
