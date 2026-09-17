@@ -1,0 +1,25 @@
+name: Module request
+description: Propose a new cleanup module (a tool or cache that eats disk space)
+labels: [module]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool or artifact type
+      placeholder: e.g. Gradle caches, Android emulators, Homebrew
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: Where the data lives and how to measure it
+      description: Paths, commands that list objects and sizes
+    validations:
+      required: true
+  - type: textarea
+    id: rules
+    attributes:
+      label: When is it safe to delete, and how
+      description: The exact cleanup commands and what makes an object stale
+    validations:
+      required: true

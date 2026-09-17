@@ -1,0 +1,30 @@
+name: Bug report
+description: Something is wrong, including wrong sizes or wrong cleanup verdicts
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: From the About screen or `storage-monitor info`
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Steps, expected result, actual result. Paste `storage-monitor ... --json` output where relevant.
+    validations:
+      required: true
+  - type: checkboxes
+    id: data
+    attributes:
+      label: Data loss
+      options:
+        - label: This bug deleted something it should not have
