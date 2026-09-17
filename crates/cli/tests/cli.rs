@@ -17,6 +17,7 @@ fn info_json_prints_name_and_version() {
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     assert_eq!(json["name"], "Storage Monitor");
+    // The binary bakes in core's version; release-please bumps every crate in lockstep, so cli's own version must match.
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
 }
 
@@ -26,7 +27,7 @@ fn info_plain_prints_one_line() {
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
     assert_eq!(
-        text.trim(),
-        format!("Storage Monitor {}", env!("CARGO_PKG_VERSION"))
+        text,
+        format!("Storage Monitor {}\n", env!("CARGO_PKG_VERSION"))
     );
 }
