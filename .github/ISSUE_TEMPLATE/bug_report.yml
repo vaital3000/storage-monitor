@@ -6,7 +6,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: From the About screen or `storage-monitor info`
+      description: Shown in the app window or by `storage-monitor info`
     validations:
       required: true
   - type: input

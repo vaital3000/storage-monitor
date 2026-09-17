@@ -28,13 +28,15 @@ imports Tauri. The UI never calls `invoke` outside `src/lib/ipc.ts`.
 
 ## Commands
 
+Prerequisites: Rust stable (see `rust-toolchain.toml`), Node 22+, pnpm 10, `just` (`brew install just`).
+
 ```
 just setup      install JS deps and the Playwright browser
 just dev        run the desktop app
 just dev-web    run the UI in a browser with mocked IPC (fastest UI loop)
 just test       cargo test + vitest
 just e2e        Playwright against the mocked UI
-just lint       fmt, clippy -D warnings, tsc, eslint, prettier
+just lint       fmt --check, clippy -D warnings, tsc, eslint, prettier --check
 just fmt        apply formatters
 just ci         lint + test + e2e, identical to CI
 ```
@@ -47,18 +49,21 @@ One vitest file: `pnpm --filter @storage-monitor/desktop test src/App.test.tsx`.
 - Never commit to `main`. Branch, open a PR, wait for green CI, squash-merge.
 - Conventional commits and PR titles: `feat(core): ...`, `fix(desktop): ...`,
   `docs: ...`, `chore: ...`, `ci: ...`, `test: ...`, `refactor: ...`.
+  Full list of types and scopes: `CONTRIBUTING.md`.
   Releases and the changelog are generated from them by release-please.
 - TDD: write the failing test first, then the minimal implementation.
 - Every module ships with fixtures for external commands (`gh`, `docker`,
-  `xcrun`) replayed through the fake `System`; tests must pass on Linux.
-- UI changes: add or update a Playwright test and attach its screenshot to the PR.
+  `xcrun`) replayed through the fake `System` (design section 6.3, arrives
+  with the module framework in phase 2); tests must pass on Linux.
+- UI changes: add or update a Playwright test and attach the `home.png`
+  screenshot that `just e2e` writes under `apps/desktop/test-results/` to the PR.
 
 ## Definition of Done
 
 - `just ci` passes locally and in CI.
 - New behavior has tests; verdict rules and action safety have unit tests.
-- Docs updated: the module guide for new modules, an ADR for a changed
-  decision, `CLAUDE.md` for new commands or layout changes.
+- Docs updated: the module guide (`docs/modules/`, from phase 2) for new modules,
+  an ADR for a changed decision, `CLAUDE.md` for new commands or layout changes.
 - No shell strings: external commands are argv arrays through `System`.
 - Deletion code paths respect the allowed roots and the Trash-by-default rule.
 

@@ -51,7 +51,7 @@ worktrees spread over five different locations (`.worktrees/`,
 | Distribution | GitHub Releases: ad-hoc signed `.dmg` and CLI binary | No Developer ID today. Notarization and a Homebrew tap are added later without changing the pipeline shape. |
 | Workflow | Branch + PR, squash merge, self-merge on green CI | Audit trail and CI gate without blocking on human review time. |
 | UI and docs language | English | OSS convention. Conversation with the maintainer stays in Russian. |
-| Minimum macOS | 13 Ventura, universal binary | Modern WebKit; covers Intel and Apple Silicon. |
+| Minimum macOS | 13.3 Ventura, universal binary | Safari 16.4 WebKit, required by Tailwind v4; covers Intel and Apple Silicon. |
 
 ## 5. Architecture
 
