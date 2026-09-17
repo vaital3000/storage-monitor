@@ -52,6 +52,9 @@ Expected: the top commit is `docs: add v1 product and architecture design (#1)`.
 # macOS
 .DS_Store
 
+# Git worktrees created by tooling
+.worktrees/
+
 # Rust
 /target/
 **/*.rs.bk
@@ -171,7 +174,7 @@ Important: `members` must be listed explicitly (no globs). release-please's Rust
 ```toml
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "apps/desktop/src-tauri"]
+members = ["crates/core"]
 
 [workspace.package]
 edition = "2024"
@@ -192,7 +195,7 @@ lto = true
 strip = true
 ```
 
-Note: `apps/desktop/src-tauri` does not exist yet. Cargo will error until Task 4. For Tasks 2 and 3, temporarily use `members = ["crates/core", "crates/cli"]` and add the third member in Task 4.
+Members are added as the crates appear: Task 3 adds `"crates/cli"`, Task 4 adds `"apps/desktop/src-tauri"`.
 
 **Step 2: Write `crates/core/Cargo.toml`**
 
@@ -294,11 +297,14 @@ git commit -m "feat(core): add workspace and app metadata"
 ### Task 3: CLI crate
 
 **Files:**
+- Modify: `Cargo.toml` (add `"crates/cli"` to `members`)
 - Create: `crates/cli/Cargo.toml`
 - Create: `crates/cli/src/main.rs`
 - Create: `crates/cli/tests/cli.rs`
 
-**Step 1: Write `crates/cli/Cargo.toml`**
+**Step 1: Register the member and write `crates/cli/Cargo.toml`**
+
+In the root `Cargo.toml` set `members = ["crates/core", "crates/cli"]`. Then write:
 
 ```toml
 [package]
@@ -423,7 +429,7 @@ Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D wa
 Expected: exit code 0.
 
 ```bash
-git add crates/cli Cargo.lock
+git add Cargo.toml Cargo.lock crates/cli
 git commit -m "feat(cli): add storage-monitor binary with info command"
 ```
 
@@ -456,9 +462,6 @@ Expected: `apps/desktop` exists with `src/`, `src-tauri/`, `package.json`, `vite
 ```yaml
 packages:
   - 'apps/*'
-
-onlyBuiltDependencies:
-  - esbuild
 ```
 
 **Step 3: Write the root `package.json`**
@@ -554,7 +557,7 @@ authors.workspace = true
 
 [lib]
 name = "storage_monitor_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -562,8 +565,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 storage-monitor-core = { workspace = true }
 tauri = { version = "2", features = [] }
-serde = { workspace = true }
-serde_json = { workspace = true }
 ```
 
 **Step 8: Overwrite `apps/desktop/src-tauri/tauri.conf.json`**
@@ -608,7 +609,7 @@ serde_json = { workspace = true }
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "13.0",
+      "minimumSystemVersion": "13.3",
       "signingIdentity": "-"
     }
   }
@@ -655,7 +656,6 @@ fn get_app_info() -> AppInfo {
     app_info()
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![get_app_info])
@@ -727,11 +727,11 @@ export default defineConfig({
     hmr: host ? { protocol: 'ws', host, port: 1421 } : undefined,
     watch: { ignored: ['**/src-tauri/**'] },
   },
-  envPrefix: ['VITE_', 'TAURI_ENV_*'],
+  envPrefix: ['VITE_'],
   build: {
-    // macOS 13+ ships a modern WebKit.
+    // macOS 13.3+ = Safari 16.4, required by Tailwind v4.
     target: 'safari16',
-    minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
+    minify: !process.env.TAURI_ENV_DEBUG,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },
 });
@@ -845,7 +845,7 @@ body,
 
 ```ts
 import { defineConfig, mergeConfig } from 'vitest/config';
-import viteConfig from './vite.config';
+import viteConfig from './vite.config.ts';
 
 export default mergeConfig(
   viteConfig,
@@ -866,16 +866,8 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach } from 'vitest';
 import { cleanup } from '@testing-library/react';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { randomFillSync } from 'node:crypto';
 
-// jsdom does not ship WebCrypto; @tauri-apps/api needs getRandomValues for callback ids.
-if (typeof window.crypto?.getRandomValues !== 'function') {
-  Object.defineProperty(window, 'crypto', {
-    configurable: true,
-    value: { getRandomValues: (buffer: Uint8Array) => randomFillSync(buffer) },
-  });
-}
-
+// jsdom 30+ ships WebCrypto, which @tauri-apps/api needs for callback ids.
 afterEach(() => {
   cleanup();
   clearMocks();
@@ -885,6 +877,7 @@ afterEach(() => {
 **Step 10: Write the failing unit test `apps/desktop/src/App.test.tsx`**
 
 ```tsx
+import { mockIPC } from '@tauri-apps/api/mocks';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import App from './App';
@@ -896,6 +889,14 @@ describe('App', () => {
     render(<App />);
     expect(await screen.findByRole('heading', { name: 'Storage Monitor' })).toBeInTheDocument();
     expect(await screen.findByText('v0.0.0-mock')).toBeInTheDocument();
+  });
+
+  it('shows the backend error when the command fails', async () => {
+    mockIPC(() => {
+      throw new Error('boom');
+    });
+    render(<App />);
+    expect(await screen.findByText('Error: boom')).toBeInTheDocument();
   });
 });
 ```
@@ -933,7 +934,7 @@ export default function App() {
 **Step 12: Run the unit test to verify it passes**
 
 Run: `pnpm --filter @storage-monitor/desktop test`
-Expected: `1 passed`.
+Expected: `2 passed`.
 
 **Step 13: Typecheck and run the real app once**
 
@@ -1008,7 +1009,7 @@ test('renders the app name and the mocked backend version', async ({ page }) => 
 test('takes a screenshot for the PR', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByTestId('version')).toHaveText('v0.0.0-mock');
-  await page.screenshot({ path: 'test-results/home.png', fullPage: true });
+  await page.screenshot({ path: test.info().outputPath('home.png'), fullPage: true });
 });
 ```
 
@@ -1046,8 +1047,9 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
 import tseslint from 'typescript-eslint';
 import prettier from 'eslint-config-prettier';
+import { defineConfig } from 'eslint/config';
 
-export default tseslint.config(
+export default defineConfig(
   { ignores: ['dist', 'src-tauri', 'playwright-report', 'test-results'] },
   {
     files: ['**/*.{ts,tsx}'],
@@ -1081,8 +1083,6 @@ Expected: lint exit 0; `format` rewrites files; `format:check` exit 0. Commit th
 
 ```make
 # Storage Monitor task runner. Install with: brew install just
-
-set shell := ["zsh", "-cu"]
 
 default:
     @just --list
@@ -1126,12 +1126,16 @@ fmt:
     cargo fmt --all
     pnpm format
 
+# Production build of the frontend (what `tauri build` runs first)
+build-web:
+    pnpm --filter @storage-monitor/desktop build
+
 # Release build of the app bundle for this machine
 build:
     pnpm --filter @storage-monitor/desktop tauri build
 
-# Everything CI runs
-ci: lint test e2e
+# Everything CI runs, except the macOS `tauri build` smoke
+ci: lint test build-web e2e
 ```
 
 **Step 5: Run the whole gate**
@@ -1143,7 +1147,7 @@ Expected: every step passes.
 
 ```bash
 git add -A
-git commit -m "chore: add eslint, prettier and just recipes"
+git commit -m "chore: add eslint, prettier formatting and just recipes"
 ```
 
 ---
@@ -1558,7 +1562,7 @@ permissions:
 
 jobs:
   rust:
-    name: Rust (core, cli)
+    name: rust
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1571,7 +1575,7 @@ jobs:
       - run: cargo test --workspace --exclude storage-monitor-desktop
 
   frontend:
-    name: Frontend (typecheck, lint, unit, e2e)
+    name: frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1585,10 +1589,11 @@ jobs:
       - run: pnpm --filter @storage-monitor/desktop typecheck
       - run: pnpm --filter @storage-monitor/desktop lint
       - run: pnpm --filter @storage-monitor/desktop test
+      - run: pnpm --filter @storage-monitor/desktop build
       - run: pnpm --filter @storage-monitor/desktop exec playwright install --with-deps chromium
       - run: pnpm --filter @storage-monitor/desktop e2e
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: playwright
           path: |
@@ -1598,7 +1603,7 @@ jobs:
           if-no-files-found: ignore
 
   desktop:
-    name: Desktop (macOS build smoke)
+    name: desktop
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -1630,7 +1635,8 @@ permissions:
   pull-requests: read
 
 jobs:
-  lint:
+  pr-title:
+    name: pr-title
     runs-on: ubuntu-latest
     steps:
       - uses: amannn/action-semantic-pull-request@v6
@@ -1659,6 +1665,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       rust:
         patterns: ['*']
@@ -1666,6 +1675,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       npm:
         patterns: ['*']
@@ -1673,6 +1685,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       actions:
         patterns: ['*']
@@ -1701,12 +1716,30 @@ and the GitHub Release in the same workflow run, and the `build-macos` job
 the CLI and uploads them. `workflow_dispatch` rebuilds assets for an existing
 tag.
 
+Strategy: `simple`, not `rust`. release-please's Rust strategy also rewrites
+the root `Cargo.toml` and throws `is not a package manifest` on a virtual
+workspace root (release-please issue 1998). With `simple`, every version
+location is bumped through `extra-files`: the three crate manifests, the three
+`[[package]]` entries in `Cargo.lock`, and both `package.json` files.
+release-please ignores a manifest version of `0.0.0`, so the first version is
+set explicitly with `initial-version`.
+
+The `Cargo.lock` rules compare `@.name.value`, not `@.name`: release-please's
+TOML parser wraps every scalar as `{start, end, value}`. A rule that matches
+nothing only logs a warning, so keep the `.value` form and check the release
+PR diff for the three `Cargo.lock` lines.
+
+The release PR is opened with the workflow token, so GitHub does not run CI on
+it; review its diff (versions and `CHANGELOG.md` only) and close/reopen it to
+force a CI run.
+
 **Step 1: Write `release-please-config.json`**
 
 ```json
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
+  "release-type": "simple",
+  "initial-version": "0.1.0",
   "include-component-in-tag": false,
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
@@ -1724,6 +1757,12 @@ tag.
   "packages": {
     ".": {
       "extra-files": [
+        { "type": "toml", "path": "crates/core/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "crates/cli/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "apps/desktop/src-tauri/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='storage-monitor-core')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='storage-monitor-cli')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='storage-monitor-desktop')].version" },
         { "type": "json", "path": "package.json", "jsonpath": "$.version" },
         { "type": "json", "path": "apps/desktop/package.json", "jsonpath": "$.version" }
       ]
@@ -1740,8 +1779,8 @@ tag.
 }
 ```
 
-With `bump-minor-pre-major` and `feat` commits in history, the first release
-PR proposes `0.1.0`.
+The first release PR proposes `0.1.0` because of `initial-version`; later
+releases follow conventional commits (`feat` bumps minor while below 1.0).
 
 **Step 3: Write `.github/workflows/release.yml`**
 
@@ -1762,6 +1801,10 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release-please:
@@ -1786,7 +1829,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+          ref: ${{ env.TAG }}
+      - name: Verify the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$TAG" --json tagName --jq .tagName
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
@@ -1839,6 +1886,18 @@ git commit -m "ci: add release-please and macOS release build"
 
 ### Task 11: Open the PR, get CI green, merge
 
+**Step 0: Repository settings that the release flow depends on**
+
+Run once (they are not files in the repository):
+```bash
+gh api -X PUT repos/vaital3000/storage-monitor/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+gh api -X PUT repos/vaital3000/storage-monitor/private-vulnerability-reporting
+gh api -X PATCH repos/vaital3000/storage-monitor -F allow_merge_commit=false -F allow_rebase_merge=false -F delete_branch_on_merge=true
+```
+The first one lets release-please open its PR with the workflow token; the
+second backs the link in `SECURITY.md`; the third enforces squash-only merges
+and removes merged branches.
+
 **Step 1: Final local gate**
 
 Run: `just ci`
@@ -1874,7 +1933,7 @@ PR
 **Step 3: Watch CI**
 
 Run: `gh pr checks --watch`
-Expected: `rust`, `frontend`, `desktop`, `PR title` all pass. Fix failures on the branch; do not merge red.
+Expected: `rust`, `frontend`, `desktop`, `pr-title` all pass. Fix failures on the branch; do not merge red.
 
 **Step 4: Self-review, then merge**
 
@@ -1890,8 +1949,14 @@ gh pr merge --squash --delete-branch
 
 **Step 1: Wait for the release PR**
 
+Optional preview before the workflow runs (needs a GitHub token):
+```bash
+npx release-please release-pr --dry-run --repo-url=vaital3000/storage-monitor --token="$(gh auth token)" --config-file=release-please-config.json --manifest-file=.release-please-manifest.json
+```
+
 After the merge, the `Release` workflow on `main` opens a PR titled
-`chore(main): release 0.1.0`. Check with:
+`chore(main): release 0.1.0`. GitHub does not run CI on it (it is opened by
+the workflow token); review the diff instead. Check with:
 
 ```bash
 gh pr list --search "chore(main): release" --state open

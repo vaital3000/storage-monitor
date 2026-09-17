@@ -51,7 +51,7 @@ worktrees spread over five different locations (`.worktrees/`,
 | Distribution | GitHub Releases: ad-hoc signed `.dmg` and CLI binary | No Developer ID today. Notarization and a Homebrew tap are added later without changing the pipeline shape. |
 | Workflow | Branch + PR, squash merge, self-merge on green CI | Audit trail and CI gate without blocking on human review time. |
 | UI and docs language | English | OSS convention. Conversation with the maintainer stays in Russian. |
-| Minimum macOS | 13 Ventura, universal binary | Modern WebKit; covers Intel and Apple Silicon. |
+| Minimum macOS | 13.3 Ventura, universal binary | Safari 16.4 WebKit, required by Tailwind v4; covers Intel and Apple Silicon. |
 
 ## 5. Architecture
 
@@ -362,11 +362,17 @@ feel. English UI.
 - `ci.yml` on every PR: `cargo fmt --check`, `cargo clippy -D warnings`,
   `cargo test` (ubuntu); `pnpm typecheck`, `pnpm lint`, `pnpm test`,
   Playwright (ubuntu); `tauri build` smoke on macOS.
-- `release.yml` on tags `v*`: universal `.dmg` via `tauri-action`, universal
-  CLI binary, checksums, attached to the GitHub Release.
+- `release.yml` on every push to `main`: release-please maintains the release
+  PR; merging it creates the tag and the GitHub Release, and a job chained in
+  the same run builds the universal `.dmg` and the CLI, then uploads them with
+  `gh release upload`. No personal access token is needed. The release PR does
+  not trigger CI (it is opened by the workflow token); its diff is versions and
+  changelog only.
 - Versioning and changelog via release-please from conventional commits;
   PR titles are linted; merges are squash-only. Dependabot for cargo, npm
-  and actions.
+  and actions. release-please runs the `simple` strategy with `extra-files`
+  for every version location, because its Rust strategy cannot handle a
+  virtual workspace root.
 - Ad-hoc code signing so the app runs on Apple Silicon; README documents
   the Gatekeeper right-click step until notarization exists.
 

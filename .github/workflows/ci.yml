@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --exclude storage-monitor-desktop --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude storage-monitor-desktop
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm --filter @storage-monitor/desktop typecheck
+      - run: pnpm --filter @storage-monitor/desktop lint
+      - run: pnpm --filter @storage-monitor/desktop test
+      - run: pnpm --filter @storage-monitor/desktop build
+      - run: pnpm --filter @storage-monitor/desktop exec playwright install --with-deps chromium
+      - run: pnpm --filter @storage-monitor/desktop e2e
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright
+          path: |
+            apps/desktop/playwright-report
+            apps/desktop/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+  desktop:
+    name: desktop
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: cargo clippy -p storage-monitor-desktop --all-targets -- -D warnings
+      - run: cargo test -p storage-monitor-desktop
+      - run: pnpm --filter @storage-monitor/desktop tauri build --debug --no-bundle
