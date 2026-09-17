@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/vaital3000/storage-monitor/compare/v0.1.0...v0.1.1) (2026-09-17)
+
+
+### Documentation
+
+* **plan:** record the phase 0 outcome ([#5](https://github.com/vaital3000/storage-monitor/issues/5)) ([6bc025c](https://github.com/vaital3000/storage-monitor/commit/6bc025c4743085207b8cee18b3d62c51dbef8efc))
+
 ## 0.1.0 (2026-09-17)
 
 
