@@ -462,9 +462,6 @@ Expected: `apps/desktop` exists with `src/`, `src-tauri/`, `package.json`, `vite
 ```yaml
 packages:
   - 'apps/*'
-
-onlyBuiltDependencies:
-  - esbuild
 ```
 
 **Step 3: Write the root `package.json`**
@@ -560,7 +557,7 @@ authors.workspace = true
 
 [lib]
 name = "storage_monitor_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -568,8 +565,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 storage-monitor-core = { workspace = true }
 tauri = { version = "2", features = [] }
-serde = { workspace = true }
-serde_json = { workspace = true }
 ```
 
 **Step 8: Overwrite `apps/desktop/src-tauri/tauri.conf.json`**
@@ -614,7 +609,7 @@ serde_json = { workspace = true }
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "13.0",
+      "minimumSystemVersion": "13.3",
       "signingIdentity": "-"
     }
   }
@@ -661,7 +656,6 @@ fn get_app_info() -> AppInfo {
     app_info()
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![get_app_info])
@@ -733,11 +727,11 @@ export default defineConfig({
     hmr: host ? { protocol: 'ws', host, port: 1421 } : undefined,
     watch: { ignored: ['**/src-tauri/**'] },
   },
-  envPrefix: ['VITE_', 'TAURI_ENV_*'],
+  envPrefix: ['VITE_'],
   build: {
-    // macOS 13+ ships a modern WebKit.
+    // macOS 13.3+ = Safari 16.4, required by Tailwind v4.
     target: 'safari16',
-    minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
+    minify: !process.env.TAURI_ENV_DEBUG,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },
 });
@@ -851,7 +845,7 @@ body,
 
 ```ts
 import { defineConfig, mergeConfig } from 'vitest/config';
-import viteConfig from './vite.config';
+import viteConfig from './vite.config.ts';
 
 export default mergeConfig(
   viteConfig,
@@ -872,16 +866,8 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach } from 'vitest';
 import { cleanup } from '@testing-library/react';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { randomFillSync } from 'node:crypto';
 
-// jsdom does not ship WebCrypto; @tauri-apps/api needs getRandomValues for callback ids.
-if (typeof window.crypto?.getRandomValues !== 'function') {
-  Object.defineProperty(window, 'crypto', {
-    configurable: true,
-    value: { getRandomValues: (buffer: Uint8Array) => randomFillSync(buffer) },
-  });
-}
-
+// jsdom 30+ ships WebCrypto, which @tauri-apps/api needs for callback ids.
 afterEach(() => {
   cleanup();
   clearMocks();
@@ -891,6 +877,7 @@ afterEach(() => {
 **Step 10: Write the failing unit test `apps/desktop/src/App.test.tsx`**
 
 ```tsx
+import { mockIPC } from '@tauri-apps/api/mocks';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import App from './App';
@@ -902,6 +889,14 @@ describe('App', () => {
     render(<App />);
     expect(await screen.findByRole('heading', { name: 'Storage Monitor' })).toBeInTheDocument();
     expect(await screen.findByText('v0.0.0-mock')).toBeInTheDocument();
+  });
+
+  it('shows the backend error when the command fails', async () => {
+    mockIPC(() => {
+      throw new Error('boom');
+    });
+    render(<App />);
+    expect(await screen.findByText('Error: boom')).toBeInTheDocument();
   });
 });
 ```
@@ -939,7 +934,7 @@ export default function App() {
 **Step 12: Run the unit test to verify it passes**
 
 Run: `pnpm --filter @storage-monitor/desktop test`
-Expected: `1 passed`.
+Expected: `2 passed`.
 
 **Step 13: Typecheck and run the real app once**
 
@@ -1014,7 +1009,7 @@ test('renders the app name and the mocked backend version', async ({ page }) => 
 test('takes a screenshot for the PR', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByTestId('version')).toHaveText('v0.0.0-mock');
-  await page.screenshot({ path: 'test-results/home.png', fullPage: true });
+  await page.screenshot({ path: test.info().outputPath('home.png'), fullPage: true });
 });
 ```
 
@@ -1052,8 +1047,9 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
 import tseslint from 'typescript-eslint';
 import prettier from 'eslint-config-prettier';
+import { defineConfig } from 'eslint/config';
 
-export default tseslint.config(
+export default defineConfig(
   { ignores: ['dist', 'src-tauri', 'playwright-report', 'test-results'] },
   {
     files: ['**/*.{ts,tsx}'],
@@ -1087,8 +1083,6 @@ Expected: lint exit 0; `format` rewrites files; `format:check` exit 0. Commit th
 
 ```make
 # Storage Monitor task runner. Install with: brew install just
-
-set shell := ["zsh", "-cu"]
 
 default:
     @just --list
@@ -1132,12 +1126,16 @@ fmt:
     cargo fmt --all
     pnpm format
 
+# Production build of the frontend (what `tauri build` runs first)
+build-web:
+    pnpm --filter @storage-monitor/desktop build
+
 # Release build of the app bundle for this machine
 build:
     pnpm --filter @storage-monitor/desktop tauri build
 
-# Everything CI runs
-ci: lint test e2e
+# Everything CI runs, except the macOS `tauri build` smoke
+ci: lint test build-web e2e
 ```
 
 **Step 5: Run the whole gate**
@@ -1149,7 +1147,7 @@ Expected: every step passes.
 
 ```bash
 git add -A
-git commit -m "chore: add eslint, prettier and just recipes"
+git commit -m "chore: add eslint, prettier formatting and just recipes"
 ```
 
 ---
