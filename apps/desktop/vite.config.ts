@@ -18,7 +18,7 @@ export default defineConfig({
   },
   envPrefix: ['VITE_'],
   build: {
-    // macOS 13+ ships a modern WebKit.
+    // macOS 13.3+ = Safari 16.4, required by Tailwind v4.
     target: 'safari16',
     minify: !process.env.TAURI_ENV_DEBUG,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,

@@ -9,5 +9,5 @@ test('renders the app name and the mocked backend version', async ({ page }) => 
 test('takes a screenshot for the PR', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByTestId('version')).toHaveText('v0.0.0-mock');
-  await page.screenshot({ path: 'test-results/home.png', fullPage: true });
+  await page.screenshot({ path: test.info().outputPath('home.png'), fullPage: true });
 });

@@ -17,6 +17,6 @@ describe('App', () => {
       throw new Error('boom');
     });
     render(<App />);
-    expect(await screen.findByTestId('version')).toHaveTextContent('boom');
+    expect(await screen.findByText('Error: boom')).toBeInTheDocument();
   });
 });

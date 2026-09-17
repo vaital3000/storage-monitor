@@ -1,7 +1,5 @@
 # Storage Monitor task runner. Install with: brew install just
 
-set shell := ["zsh", "-cu"]
-
 default:
     @just --list
 
@@ -44,9 +42,13 @@ fmt:
     cargo fmt --all
     pnpm format
 
+# Production build of the frontend (what `tauri build` runs first)
+build-web:
+    pnpm --filter @storage-monitor/desktop build
+
 # Release build of the app bundle for this machine
 build:
     pnpm --filter @storage-monitor/desktop tauri build
 
-# Everything CI runs
-ci: lint test e2e
+# Everything CI runs, except the macOS `tauri build` smoke
+ci: lint test build-web e2e

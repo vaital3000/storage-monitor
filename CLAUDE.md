@@ -66,6 +66,7 @@ One vitest file: `pnpm --filter @storage-monitor/desktop test src/App.test.tsx`.
 
 - Rust 2024 edition, `clippy -D warnings`, `rustfmt` defaults.
 - TypeScript strict, ESLint + Prettier, Tailwind for styling, no CSS modules.
+- `tsc` checks only `src/`. Vite, Vitest and Playwright config files and `e2e/` are validated by running them, not by the type checker.
 - English for code, docs, UI strings and commit messages.
 - IPC payloads: Rust structs that cross IPC carry
   `#[serde(rename_all = "camelCase")]`; TypeScript interfaces in
