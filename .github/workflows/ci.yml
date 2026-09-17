@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   rust:
-    name: Rust (core, cli)
+    name: rust
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -27,7 +27,7 @@ jobs:
       - run: cargo test --workspace --exclude storage-monitor-desktop
 
   frontend:
-    name: Frontend (typecheck, lint, unit, build, e2e)
+    name: frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -45,7 +45,7 @@ jobs:
       - run: pnpm --filter @storage-monitor/desktop exec playwright install --with-deps chromium
       - run: pnpm --filter @storage-monitor/desktop e2e
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: playwright
           path: |
@@ -55,7 +55,7 @@ jobs:
           if-no-files-found: ignore
 
   desktop:
-    name: Desktop (macOS build smoke)
+    name: desktop
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7

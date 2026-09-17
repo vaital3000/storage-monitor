@@ -15,6 +15,10 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release-please:
     if: github.event_name == 'push'
@@ -38,7 +42,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+          ref: ${{ env.TAG }}
+      - name: Verify the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$TAG" --json tagName --jq .tagName
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:

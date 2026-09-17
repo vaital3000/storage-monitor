@@ -38,7 +38,7 @@ Prerequisites: Rust (stable), Node 22+, pnpm 10, [`just`](https://github.com/cas
 just setup   # install JS deps and the Playwright browser
 just dev     # run the desktop app
 just dev-web # run only the UI in a browser with a mocked backend
-just ci      # lint + unit tests + e2e, same as CI
+just ci      # lint, unit tests, frontend build and e2e; CI adds a macOS build smoke
 ```
 
 Layout, conventions and the module contract are described in

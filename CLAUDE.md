@@ -38,7 +38,7 @@ just test       cargo test + vitest
 just e2e        Playwright against the mocked UI
 just lint       fmt --check, clippy -D warnings, tsc, eslint, prettier --check
 just fmt        apply formatters
-just ci         lint + test + e2e, identical to CI
+just ci         lint + test + build-web + e2e; CI adds a macOS `tauri build` smoke
 ```
 
 Rust tests for a single crate: `cargo test -p storage-monitor-core`.
@@ -86,7 +86,12 @@ One vitest file: `pnpm --filter @storage-monitor/desktop test src/App.test.tsx`.
 
 ## Release
 
-Merging to `main` lets release-please maintain a release PR. Merging that PR
-tags `vX.Y.Z`, creates the GitHub Release, and `release.yml` attaches the
-universal `.dmg` and the CLI tarball. Versions live in each crate's
-`Cargo.toml` and in `package.json`; never edit them by hand.
+Every push to `main` runs release-please, which keeps a `chore(main): release X.Y.Z`
+PR up to date. Merging that PR creates the tag `vX.Y.Z` and the GitHub Release; a
+chained job in `release.yml` then builds the universal `.dmg` and the CLI tarball and
+attaches them. Versions are bumped by that PR in every crate's `Cargo.toml`,
+`Cargo.lock` and both `package.json` files; never edit them by hand.
+
+The release PR is opened by the workflow token, so GitHub does not run CI on it. Review
+its diff (version bumps and `CHANGELOG.md` only); to force a CI run, close and reopen
+the PR. `workflow_dispatch` on `release.yml` rebuilds the assets of an existing tag.
