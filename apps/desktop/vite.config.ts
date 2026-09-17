@@ -16,7 +16,7 @@ export default defineConfig({
     hmr: host ? { protocol: 'ws', host, port: 1421 } : undefined,
     watch: { ignored: ['**/src-tauri/**'] },
   },
-  envPrefix: ['VITE_', 'TAURI_ENV_*'],
+  envPrefix: ['VITE_'],
   build: {
     // macOS 13+ ships a modern WebKit.
     target: 'safari16',

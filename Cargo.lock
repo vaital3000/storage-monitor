@@ -2900,8 +2900,6 @@ dependencies = [
 name = "storage-monitor-desktop"
 version = "0.0.0"
 dependencies = [
- "serde",
- "serde_json",
  "storage-monitor-core",
  "tauri",
  "tauri-build",

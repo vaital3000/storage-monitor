@@ -10,7 +10,7 @@ authors.workspace = true
 
 [lib]
 name = "storage_monitor_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -18,5 +18,3 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 storage-monitor-core = { workspace = true }
 tauri = { version = "2", features = [] }
-serde = { workspace = true }
-serde_json = { workspace = true }
