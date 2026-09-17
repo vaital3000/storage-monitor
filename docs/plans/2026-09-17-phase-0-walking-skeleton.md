@@ -1724,6 +1724,11 @@ location is bumped through `extra-files`: the three crate manifests, the three
 release-please ignores a manifest version of `0.0.0`, so the first version is
 set explicitly with `initial-version`.
 
+The `Cargo.lock` rules compare `@.name.value`, not `@.name`: release-please's
+TOML parser wraps every scalar as `{start, end, value}`. A rule that matches
+nothing only logs a warning, so keep the `.value` form and check the release
+PR diff for the three `Cargo.lock` lines.
+
 The release PR is opened with the workflow token, so GitHub does not run CI on
 it; review its diff (versions and `CHANGELOG.md` only) and close/reopen it to
 force a CI run.

@@ -90,7 +90,9 @@ Every push to `main` runs release-please, which keeps a `chore(main): release X.
 PR up to date. Merging that PR creates the tag `vX.Y.Z` and the GitHub Release; a
 chained job in `release.yml` then builds the universal `.dmg` and the CLI tarball and
 attaches them. Versions are bumped by that PR in every crate's `Cargo.toml`,
-`Cargo.lock` and both `package.json` files; never edit them by hand.
+`Cargo.lock` and both `package.json` files; never edit them by hand. In
+`release-please-config.json` the TOML rules compare `@.name.value` (the parser
+wraps scalars); a rule that matches nothing only warns, so keep that form.
 
 The release PR is opened by the workflow token, so GitHub does not run CI on it. Review
 its diff (version bumps and `CHANGELOG.md` only); to force a CI run, close and reopen
