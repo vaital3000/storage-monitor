@@ -11,6 +11,7 @@ pub const APP_NAME: &str = "Storage Monitor";
 
 /// Application metadata shared by the desktop app and the CLI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppInfo {
     pub name: String,
     pub version: String,

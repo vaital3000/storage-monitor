@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use clap::{Parser, Subcommand};
 use storage_monitor_core::app_info;
 
@@ -24,17 +26,27 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Info { json } => {
-            let info = app_info();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&info).expect("AppInfo is serializable")
-                );
-            } else {
-                println!("{} {}", info.name, info.version);
-            }
+    let result = match cli.command {
+        Command::Info { json } => print_info(json),
+    };
+    if let Err(err) = result {
+        // Downstream closed the pipe (for example `... --json | head`); exit quietly.
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            return;
         }
+        eprintln!("error: {err}");
+        std::process::exit(1);
     }
+}
+
+fn print_info(json: bool) -> io::Result<()> {
+    let info = app_info();
+    let mut out = io::stdout().lock();
+    if json {
+        serde_json::to_writer_pretty(&mut out, &info)?;
+        writeln!(out)?;
+    } else {
+        writeln!(out, "{} {}", info.name, info.version)?;
+    }
+    out.flush()
 }
