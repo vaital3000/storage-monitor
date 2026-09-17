@@ -97,3 +97,7 @@ wraps scalars); a rule that matches nothing only warns, so keep that form.
 The release PR is opened by the workflow token, so GitHub does not run CI on it. Review
 its diff (version bumps and `CHANGELOG.md` only); to force a CI run, close and reopen
 the PR. `workflow_dispatch` on `release.yml` rebuilds the assets of an existing tag.
+
+release-please opens its PR with the workflow token, so the repository setting
+"Allow GitHub Actions to create and approve pull requests" (Settings > Actions >
+General) must stay enabled; without it the `Release` run fails at that step.

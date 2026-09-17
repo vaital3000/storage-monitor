@@ -1886,6 +1886,18 @@ git commit -m "ci: add release-please and macOS release build"
 
 ### Task 11: Open the PR, get CI green, merge
 
+**Step 0: Repository settings that the release flow depends on**
+
+Run once (they are not files in the repository):
+```bash
+gh api -X PUT repos/vaital3000/storage-monitor/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+gh api -X PUT repos/vaital3000/storage-monitor/private-vulnerability-reporting
+gh api -X PATCH repos/vaital3000/storage-monitor -F allow_merge_commit=false -F allow_rebase_merge=false -F delete_branch_on_merge=true
+```
+The first one lets release-please open its PR with the workflow token; the
+second backs the link in `SECURITY.md`; the third enforces squash-only merges
+and removes merged branches.
+
 **Step 1: Final local gate**
 
 Run: `just ci`
