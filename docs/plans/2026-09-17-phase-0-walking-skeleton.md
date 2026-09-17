@@ -1562,7 +1562,7 @@ permissions:
 
 jobs:
   rust:
-    name: Rust (core, cli)
+    name: rust
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1575,7 +1575,7 @@ jobs:
       - run: cargo test --workspace --exclude storage-monitor-desktop
 
   frontend:
-    name: Frontend (typecheck, lint, unit, e2e)
+    name: frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1589,10 +1589,11 @@ jobs:
       - run: pnpm --filter @storage-monitor/desktop typecheck
       - run: pnpm --filter @storage-monitor/desktop lint
       - run: pnpm --filter @storage-monitor/desktop test
+      - run: pnpm --filter @storage-monitor/desktop build
       - run: pnpm --filter @storage-monitor/desktop exec playwright install --with-deps chromium
       - run: pnpm --filter @storage-monitor/desktop e2e
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: playwright
           path: |
@@ -1602,7 +1603,7 @@ jobs:
           if-no-files-found: ignore
 
   desktop:
-    name: Desktop (macOS build smoke)
+    name: desktop
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -1634,7 +1635,8 @@ permissions:
   pull-requests: read
 
 jobs:
-  lint:
+  pr-title:
+    name: pr-title
     runs-on: ubuntu-latest
     steps:
       - uses: amannn/action-semantic-pull-request@v6
@@ -1663,6 +1665,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       rust:
         patterns: ['*']
@@ -1670,6 +1675,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       npm:
         patterns: ['*']
@@ -1677,6 +1685,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       actions:
         patterns: ['*']
@@ -1705,12 +1716,25 @@ and the GitHub Release in the same workflow run, and the `build-macos` job
 the CLI and uploads them. `workflow_dispatch` rebuilds assets for an existing
 tag.
 
+Strategy: `simple`, not `rust`. release-please's Rust strategy also rewrites
+the root `Cargo.toml` and throws `is not a package manifest` on a virtual
+workspace root (release-please issue 1998). With `simple`, every version
+location is bumped through `extra-files`: the three crate manifests, the three
+`[[package]]` entries in `Cargo.lock`, and both `package.json` files.
+release-please ignores a manifest version of `0.0.0`, so the first version is
+set explicitly with `initial-version`.
+
+The release PR is opened with the workflow token, so GitHub does not run CI on
+it; review its diff (versions and `CHANGELOG.md` only) and close/reopen it to
+force a CI run.
+
 **Step 1: Write `release-please-config.json`**
 
 ```json
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
+  "release-type": "simple",
+  "initial-version": "0.1.0",
   "include-component-in-tag": false,
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
@@ -1728,6 +1752,12 @@ tag.
   "packages": {
     ".": {
       "extra-files": [
+        { "type": "toml", "path": "crates/core/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "crates/cli/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "apps/desktop/src-tauri/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name=='storage-monitor-core')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name=='storage-monitor-cli')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name=='storage-monitor-desktop')].version" },
         { "type": "json", "path": "package.json", "jsonpath": "$.version" },
         { "type": "json", "path": "apps/desktop/package.json", "jsonpath": "$.version" }
       ]
@@ -1744,8 +1774,8 @@ tag.
 }
 ```
 
-With `bump-minor-pre-major` and `feat` commits in history, the first release
-PR proposes `0.1.0`.
+The first release PR proposes `0.1.0` because of `initial-version`; later
+releases follow conventional commits (`feat` bumps minor while below 1.0).
 
 **Step 3: Write `.github/workflows/release.yml`**
 
@@ -1766,6 +1796,10 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release-please:
@@ -1790,7 +1824,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+          ref: ${{ env.TAG }}
+      - name: Verify the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$TAG" --json tagName --jq .tagName
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
@@ -1878,7 +1916,7 @@ PR
 **Step 3: Watch CI**
 
 Run: `gh pr checks --watch`
-Expected: `rust`, `frontend`, `desktop`, `PR title` all pass. Fix failures on the branch; do not merge red.
+Expected: `rust`, `frontend`, `desktop`, `pr-title` all pass. Fix failures on the branch; do not merge red.
 
 **Step 4: Self-review, then merge**
 
@@ -1894,8 +1932,14 @@ gh pr merge --squash --delete-branch
 
 **Step 1: Wait for the release PR**
 
+Optional preview before the workflow runs (needs a GitHub token):
+```bash
+npx release-please release-pr --dry-run --repo-url=vaital3000/storage-monitor --token="$(gh auth token)" --config-file=release-please-config.json --manifest-file=.release-please-manifest.json
+```
+
 After the merge, the `Release` workflow on `main` opens a PR titled
-`chore(main): release 0.1.0`. Check with:
+`chore(main): release 0.1.0`. GitHub does not run CI on it (it is opened by
+the workflow token); review the diff instead. Check with:
 
 ```bash
 gh pr list --search "chore(main): release" --state open
