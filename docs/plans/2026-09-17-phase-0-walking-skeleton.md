@@ -1755,9 +1755,9 @@ force a CI run.
         { "type": "toml", "path": "crates/core/Cargo.toml", "jsonpath": "$.package.version" },
         { "type": "toml", "path": "crates/cli/Cargo.toml", "jsonpath": "$.package.version" },
         { "type": "toml", "path": "apps/desktop/src-tauri/Cargo.toml", "jsonpath": "$.package.version" },
-        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name=='storage-monitor-core')].version" },
-        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name=='storage-monitor-cli')].version" },
-        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name=='storage-monitor-desktop')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='storage-monitor-core')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='storage-monitor-cli')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='storage-monitor-desktop')].version" },
         { "type": "json", "path": "package.json", "jsonpath": "$.version" },
         { "type": "json", "path": "apps/desktop/package.json", "jsonpath": "$.version" }
       ]

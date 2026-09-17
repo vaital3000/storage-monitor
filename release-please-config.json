@@ -29,17 +29,17 @@
         {
           "type": "toml",
           "path": "Cargo.lock",
-          "jsonpath": "$.package[?(@.name=='storage-monitor-core')].version"
+          "jsonpath": "$.package[?(@.name.value=='storage-monitor-core')].version"
         },
         {
           "type": "toml",
           "path": "Cargo.lock",
-          "jsonpath": "$.package[?(@.name=='storage-monitor-cli')].version"
+          "jsonpath": "$.package[?(@.name.value=='storage-monitor-cli')].version"
         },
         {
           "type": "toml",
           "path": "Cargo.lock",
-          "jsonpath": "$.package[?(@.name=='storage-monitor-desktop')].version"
+          "jsonpath": "$.package[?(@.name.value=='storage-monitor-desktop')].version"
         },
         { "type": "json", "path": "package.json", "jsonpath": "$.version" },
         { "type": "json", "path": "apps/desktop/package.json", "jsonpath": "$.version" }
