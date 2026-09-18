@@ -501,43 +501,54 @@ mod tests {
 
     #[test]
     fn no_event_follows_done_however_fast_the_ticker_runs() {
-        let data = tempfile::tempdir().unwrap();
-        let fixture = wide_fixture(3_000);
-        let manager = manager_in(data.path()).with_progress_interval(Duration::from_millis(1));
-        let emitter = Arc::new(SlowProgressEvents {
-            delay: Duration::from_millis(5),
-            events: Events::default(),
-        });
-        manager
-            .start(emitter.clone(), fixture.path().to_path_buf())
-            .unwrap();
-        assert_eq!(wait_until_finished(&manager).state, ScanState::Done);
-        // Give a ticker that woke up around the end of the scan the time to emit.
-        thread::sleep(Duration::from_millis(50));
+        // The property under test is "no scan:progress after scan:done". Whether the
+        // ticker gets to emit at all before a 3000-file scan finishes depends on the
+        // machine, so the scenario is repeated until a run with at least one tick is
+        // observed; the ordering property is asserted on every run.
+        let mut saw_a_tick = false;
+        for _attempt in 0..10 {
+            let data = tempfile::tempdir().unwrap();
+            let fixture = wide_fixture(3_000);
+            let manager = manager_in(data.path()).with_progress_interval(Duration::from_millis(1));
+            let emitter = Arc::new(SlowProgressEvents {
+                delay: Duration::from_millis(5),
+                events: Events::default(),
+            });
+            manager
+                .start(emitter.clone(), fixture.path().to_path_buf())
+                .unwrap();
+            assert_eq!(wait_until_finished(&manager).state, ScanState::Done);
+            // Give a ticker that woke up around the end of the scan the time to emit.
+            thread::sleep(Duration::from_millis(50));
 
-        let events = emitter.events.lock().unwrap();
-        let done = events
-            .iter()
-            .position(|(event, _)| event == DONE_EVENT)
-            .expect("scan:done was emitted");
-        assert_eq!(
-            done,
-            events.len() - 1,
-            "events after scan:done: {:?}",
-            &events[done + 1..]
-        );
+            let events = emitter.events.lock().unwrap();
+            let done = events
+                .iter()
+                .position(|(event, _)| event == DONE_EVENT)
+                .expect("scan:done was emitted");
+            assert_eq!(
+                done,
+                events.len() - 1,
+                "events after scan:done: {:?}",
+                &events[done + 1..]
+            );
+            assert!(
+                events[..done].iter().all(|(event, status)| {
+                    event == PROGRESS_EVENT && status.state == ScanState::Running
+                }),
+                "{events:?}"
+            );
+            assert_eq!(events[done].1.state, ScanState::Done);
+            assert_eq!(events[done].1.files, 3_000);
+            if done > 0 {
+                saw_a_tick = true;
+                break;
+            }
+        }
         assert!(
-            done > 0,
-            "the scan finished before the first tick; the fixture is too small"
+            saw_a_tick,
+            "no run had a progress tick before scan:done in 10 attempts; the fixture is too small"
         );
-        assert!(
-            events[..done].iter().all(
-                |(event, status)| event == PROGRESS_EVENT && status.state == ScanState::Running
-            ),
-            "{events:?}"
-        );
-        assert_eq!(events[done].1.state, ScanState::Done);
-        assert_eq!(events[done].1.files, 3_000);
     }
 
     #[test]
