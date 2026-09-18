@@ -35,8 +35,8 @@ pub struct Snapshot {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
-    #[error("encode: {0}")]
-    Encode(#[from] postcard::Error),
+    #[error("postcard: {0}")]
+    Postcard(#[from] postcard::Error),
     #[error("decompress: {0}")]
     Decompress(#[from] lz4_flex::block::DecompressError),
     #[error("unsupported snapshot format {0}")]
@@ -78,11 +78,13 @@ impl Snapshot {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         let raw = lz4_flex::decompress_size_prepended(bytes)?;
-        let snapshot: Snapshot = postcard::from_bytes(&raw)?;
-        if snapshot.format != SNAPSHOT_FORMAT {
-            return Err(CodecError::Format(snapshot.format));
+        // `format` is the first field, so another layout is reported as such and not as
+        // a garbled payload.
+        let (format, _) = postcard::take_from_bytes::<u32>(&raw)?;
+        if format != SNAPSHOT_FORMAT {
+            return Err(CodecError::Format(format));
         }
-        Ok(snapshot)
+        Ok(postcard::from_bytes(&raw)?)
     }
 
     pub fn size_index(&self) -> HashMap<String, u64> {
@@ -145,6 +147,16 @@ mod tests {
         let back = Snapshot::decode(&bytes).unwrap();
         assert_eq!(back.entries, snap.entries);
         assert_eq!(back.root, snap.root);
+    }
+
+    #[test]
+    fn decode_rejects_another_format_before_reading_the_payload() {
+        // A format 99 snapshot may have any layout: only the leading varint is inspected.
+        let raw = postcard::to_allocvec(&(99u32, 0xFFu8)).unwrap();
+        let err = Snapshot::decode(&lz4_flex::compress_prepend_size(&raw)).unwrap_err();
+        assert!(matches!(err, CodecError::Format(99)), "{err}");
+        let err = Snapshot::decode(&lz4_flex::compress_prepend_size(&[])).unwrap_err();
+        assert!(matches!(err, CodecError::Postcard(_)), "{err}");
     }
 
     #[test]
