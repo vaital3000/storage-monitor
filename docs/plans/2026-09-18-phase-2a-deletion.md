@@ -851,7 +851,7 @@ pub fn actions_log() -> PathBuf {
 
 `log.rs`: `LogEntry { at, path: String, kind: NodeKind, mode: Mode, result: LogResult, detail: Option<String>, bytes: u64 }` with `LogResult { Removed, Failed, Skipped }`, all camelCase. `ActionLog::append` creates the parent directory, opens with `OpenOptions::new().create(true).append(true)`, and writes all lines of the batch in one `write_all` so a batch never interleaves with another writer. `tail` reads the file as **bytes** and decodes with `String::from_utf8_lossy`, then iterates lines from the end, `serde_json::from_str` per line, skipping the errors, until it has `limit` of them. Not `read_to_string`: that fails the whole read with `InvalidData` when a write was torn in the middle of a multi-byte character, which is exactly the racing-`tail` case this has to survive. Reading from the end also parses at most `limit` lines instead of all of them.
 
-Four things follow from `Outcome` being the only input:
+Several things follow from `Outcome` being the only input:
 
 - Every line of a batch carries the same `at`, read before the first deletion. "Newest first" therefore rests on **file order**, which is what `tail` reverses — do not "improve" it into a sort by `at`, or two batches inside one clock tick will come back shuffled.
 - `EntryOutcome::path` is a `PathBuf` and `LogEntry::path` is a `String`. Convert with `to_string_lossy()`, not an `unwrap`, and point the comment at the paragraph in `model.rs` that explains why a lossy conversion cannot lose anything here.
@@ -860,6 +860,12 @@ Four things follow from `Outcome` being the only input:
 - `detail` carries the failure message for `Failed` **and the block reason for `Skipped`**, as the wire name `BlockReason` serializes to (`"denylisted"`, `"outsideRoots"`, …). Without it a skipped row reaches Activity with no reason at all. It is the same vocabulary `ipc.ts` already mirrors, so Task 15 maps it the way `nodeErrors.ts` maps scan errors.
 - An empty batch writes nothing and creates nothing — no file, no directory. A no-op leaving an empty `actions.jsonl` behind is worse than no file.
 - A filename may contain a newline, so lines are written through `serde_json`, never formatted by hand: an unescaped name could otherwise forge a log line.
+- **`append` prefixes a newline when the file does not already end with one.** A write torn by a full volume — the most likely failure this app will ever meet, since its users are people whose disk is full — leaves the file mid-line; without the check, the remainder and the first object of the next batch glue into one unparseable line and `tail` drops **both**, silently losing a record of a deletion that really happened.
+- `append` calls `sync_all` before returning, so `Ok` means the bytes reached the disk rather than the kernel. One batch is one user gesture, so the cost is imperceptible, and it turns a full volume from "loses a record" into "reports an error".
+- The file is created `0o600`: it names every path the user has ever deleted.
+- **Every field added to `LogEntry` from here on carries `#[serde(default)]`.** The derived `Deserialize` requires every field, so adding one without it makes the whole existing history vanish from the Activity screen — no error, no count, just an empty list over a file full of records.
+- `tail` returns the entries **and how many lines it had to drop**, so the screen can say "3 damaged entries hidden" instead of quietly showing fewer rows than the user remembers deleting.
+- There is no batch identity on a line, deliberately: nothing in 2a groups rows, and the `serde(default)` rule above is what makes adding one later cheap rather than destructive. The line is the unit.
 
 **Step 4: Run the tests**
 
@@ -1238,7 +1244,7 @@ Run: `cargo test -p storage-monitor-desktop activity`
 
 ```rust
 #[tauri::command]
-pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Vec<LogEntry>
+pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Tail
 ```
 
 Default limit 100. A read error returns an empty list and prints to stderr: the Activity screen must never be a dead end because a log line was damaged.
@@ -1311,7 +1317,7 @@ export interface ActivityEntry { at: string; path: string; kind: NodeKind; mode:
 
 export function actionPreview(paths: string[], mode: Mode): Promise<Preview>
 export function actionRun(paths: string[], mode: Mode): Promise<Outcome>
-export function activityLog(limit?: number): Promise<ActivityEntry[]>
+export function activityLog(limit?: number): Promise<{ entries: ActivityEntry[]; damaged: number }>
 ```
 
 The mock implements the same rules against the fixture: `outsideRoots` for anything not under `/Users/demo`, `isRoot` for `/Users/demo` itself, `nested` for a descendant of another entry in the same batch, `missing` for an unknown path. `actionRun` deletes the nodes from the in-memory fixture, subtracts their sizes from the ancestors and appends to a mock log array that `activityLog` reads. Export a `resetMockActions()` helper for tests, and call it from `src/test/setup.ts` between tests.
