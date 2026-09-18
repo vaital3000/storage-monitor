@@ -448,6 +448,8 @@ impl Limits {
 pub fn check(path: &Path, limits: &Limits) -> Result<PathBuf, BlockReason> { ... }
 
 /// Per entry, in input order: false when another entry in the list contains it.
+/// Of several copies of one path the first survives — read literally, the rule would
+/// drop every copy, since equal paths contain each other.
 pub fn drop_nested(paths: &[PathBuf]) -> Vec<bool> { ... }
 ```
 
