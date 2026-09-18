@@ -851,6 +851,13 @@ pub fn actions_log() -> PathBuf {
 
 `log.rs`: `LogEntry { at, path: String, kind: NodeKind, mode: Mode, result: LogResult, detail: Option<String>, bytes: u64 }` with `LogResult { Removed, Failed, Skipped }`, all camelCase. `ActionLog::append` creates the parent directory, opens with `OpenOptions::new().create(true).append(true)`, and writes all lines of the batch in one `write_all` so a batch never interleaves with another writer. `tail` reads the file to a string, iterates lines, `serde_json::from_str` per line, skips the errors, keeps the last `limit` and reverses them.
 
+Four things follow from `Outcome` being the only input:
+
+- Every line of a batch carries the same `at`, read before the first deletion. "Newest first" therefore rests on **file order**, which is what `tail` reverses — do not "improve" it into a sort by `at`, or two batches inside one clock tick will come back shuffled.
+- `EntryOutcome::path` is a `PathBuf` and `LogEntry::path` is a `String`. Convert with `to_string_lossy()`, not an `unwrap`, and point the comment at the paragraph in `model.rs` that explains why a lossy conversion cannot lose anything here.
+- A `Failed` message already embeds the absolute path, because it comes from `SystemError`'s `Display`. `detail` will therefore repeat `path`; harmless in the file, but the Activity screen must not render both.
+- `bytes` is 0 for everything that is not `Removed`. That is deliberate — nothing was freed — but the Activity screen should not read as though a skipped row was worth nothing.
+
 **Step 4: Run the tests**
 
 Run: `cargo test -p storage-monitor-core action::log`

@@ -168,8 +168,11 @@ fn reason_for(err: &SystemError) -> BlockReason {
 /// guards now refuse comes back as `Skipped` with the reason they gave.
 ///
 /// An entry that goes away while the batch runs is `Skipped { reason: Missing }` and not a
-/// failure, whichever side of the last look it goes away on: this app destroyed nothing, and
-/// both windows of that race are one syscall apart.
+/// failure: this app destroyed nothing. That holds for as much of the race as the port can
+/// see, which is most of it — both deletions of [`crate::system::RealSystem`] stat the entry
+/// first, and that is what turns the usual vanish into `Missing`. It does not hold for the
+/// sliver after that stat: `remove` reports its own not-found error there, and the Trash an
+/// opaque Cocoa string, and both land as `Failed`. Narrowed, not closed.
 ///
 /// In [`Mode::Trash`] the freed bytes are what *will* be freed once the Trash is emptied
 /// (ADR 0003); the number is the same and only the wording in the UI differs.
@@ -827,30 +830,45 @@ mod tests {
     /// spelling that opens the same directory on a stock macOS volume. Whether the two are
     /// one directory is asked of the volume, not guessed from the OS, the way `guards.rs`
     /// probes for case sensitivity.
-    fn assert_one_directory_counted_once(on_disk: &str, alias: &str) {
+    /// What it means when a volume does not open both names of a pair.
+    #[derive(Clone, Copy)]
+    enum Aliasing {
+        /// Case. APFS can be formatted case-sensitive, and a developer's volume sometimes
+        /// is; there the two names really are two directories and the rule has nothing to
+        /// do, on a Mac as much as on Linux.
+        MayNotFold,
+        /// Normalization. Every APFS variant folds it, the case-sensitive one included, so
+        /// a Mac that does not is a fixture that stopped working rather than a volume.
+        FoldsOnEveryMac,
+    }
+
+    /// Whether to go quiet about a pair this volume keeps apart, or to stop.
+    fn skip_or_stop(name: &str, aliasing: Aliasing) {
+        // A pair every Mac folds and this one does not is the strongest test in the file
+        // turning into a no-op that still reports `ok`. A case pair on a case-sensitive dev
+        // volume is just that volume, and saying otherwise would be a red test with a false
+        // explanation — and would stop the normalization pairs, which do cover the rule
+        // there, from ever running.
+        if cfg!(target_os = "macos") && matches!(aliasing, Aliasing::FoldsOnEveryMac) {
+            panic!(
+                "{name} is its own name here: every APFS variant folds normalization, so \
+                 this is a broken fixture rather than a volume, and the aliasing rules are \
+                 untested on this Mac"
+            );
+        }
+        eprintln!("skipped: {name} is its own name on this volume");
+    }
+
+    fn assert_one_directory_counted_once(on_disk: &str, alias: &str, aliasing: Aliasing) {
         let sys = TestSystem::new();
         let real = sys.root().join(on_disk);
         fs::create_dir(&real).unwrap();
         let aliased = sys.root().join(alias);
         if !aliased.is_dir() {
-            // A case- and normalization-sensitive volume: two names, two directories, and
-            // nothing here for the rule to do. Asserting the duller outcome instead would
-            // let a green run on such a volume read as coverage it does not have — and CI
-            // runs the core tests on Linux as well as on macOS.
-            //
-            // On macOS it is not a volume property any more, it is a broken fixture: every
-            // stock Mac folds case, and the case-sensitive variant of APFS still folds
-            // normalization. Silence there would turn the strongest test in this file into
-            // a no-op that still reports `ok`.
-            // `assert!(!cfg!(…))` is what this wants to be, and clippy refuses an
-            // assertion whose value is a constant.
-            if cfg!(target_os = "macos") {
-                panic!(
-                    "{alias} is its own name here: this volume folds neither case nor \
-                     normalization, and the aliasing rules are untested on it"
-                );
-            }
-            eprintln!("skipped: {alias} is its own name on this volume");
+            // Two names, two directories, and nothing here for the rule to do. Asserting the
+            // duller outcome instead would let a green run on such a volume read as coverage
+            // it does not have — and CI runs the core tests on Linux as well as on macOS.
+            skip_or_stop(alias, aliasing);
             return;
         }
         let p = Plan {
@@ -883,15 +901,15 @@ mod tests {
 
     #[test]
     fn another_case_of_one_name_is_not_counted_twice() {
-        assert_one_directory_counted_once("Data", "data");
+        assert_one_directory_counted_once("Data", "data", Aliasing::MayNotFold);
     }
 
     #[test]
     fn another_normalization_of_one_name_is_not_counted_twice() {
         // No user error at all: the same name typed on macOS arrives in NFC from one source
         // and in NFD from another, and APFS treats them as one directory.
-        assert_one_directory_counted_once("caf\u{e9}", "cafe\u{301}");
-        assert_one_directory_counted_once("cafe\u{301}", "caf\u{e9}");
+        assert_one_directory_counted_once("caf\u{e9}", "cafe\u{301}", Aliasing::FoldsOnEveryMac);
+        assert_one_directory_counted_once("cafe\u{301}", "caf\u{e9}", Aliasing::FoldsOnEveryMac);
     }
 
     #[test]
@@ -1262,6 +1280,49 @@ mod tests {
     }
 
     #[test]
+    fn a_socket_that_became_a_directory_is_skipped() {
+        // The same loss profile as the symlink row above — nothing promised, everything
+        // destroyed, a log line that would not record what went — for the kind that is
+        // easiest to think of as exotic and is not: `Other` is what the walker mints for
+        // every socket, fifo and device node, and a home folder is full of them. It is also
+        // what the desktop layer falls back to when the tree does not know a path, so it is
+        // the last kind whose re-check should go untested.
+        let sys = TestSystem::new();
+        let swapped = sys.root().join("sock");
+        // A socket with std alone. Dropping the listener closes the descriptor and leaves
+        // the entry on disk, which is all this needs.
+        drop(std::os::unix::net::UnixListener::bind(&swapped).expect("bind a unix socket"));
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let p = Plan {
+            entries: vec![entry(swapped.clone(), NodeKind::Other, 0)],
+            mode: Mode::Permanent,
+        };
+        let checked = preview(&p, &limits, &sys);
+        assert_eq!(
+            checked.entries[0].kind,
+            NodeKind::Other,
+            "the disk said neither file, nor directory, nor link"
+        );
+        fs::remove_file(&swapped).unwrap();
+        let deep = swapped.join("one/two");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("precious.bin"), b"keep").unwrap();
+        let outcome = execute(&checked, &limits, &sys);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::KindChanged
+            }
+        );
+        assert_eq!(
+            fs::read(deep.join("precious.bin")).unwrap(),
+            b"keep",
+            "the tree that took the name is untouched, all the way down"
+        );
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    #[test]
     fn a_directory_that_became_a_symlink_is_skipped() {
         // The other direction. Deleting the link would free none of the bytes the dialog
         // promised, leave the directory the user meant where it was, and say `Removed`.
@@ -1467,6 +1528,9 @@ mod tests {
         fs::remove_dir_all(sys.root().join("dir")).unwrap();
         std::os::unix::fs::symlink(sys.root().join("other"), sys.root().join("dir")).unwrap();
         let outcome = execute(&checked, &limits, &port);
+        // Two entries and not four: the guards stat through `std::fs` on purpose, so their
+        // own looks do not pass the port and are not recorded here. If that ever changes,
+        // this is the assertion that will break first, and confusingly.
         assert_eq!(
             port.stats(),
             vec![sys.root().join("dir/a.bin"), fresh.clone()],
@@ -1632,27 +1696,16 @@ mod tests {
     /// one directory a deletion by either leaves the same disk behind, so what the port was
     /// handed is the only witness of which form the engine used. A symlink cannot stand in
     /// for this — the guards judge one as written, which makes its two forms identical.
-    fn assert_the_port_is_asked_for(on_disk: &str, asked_as: &str) {
+    fn assert_the_port_is_asked_for(on_disk: &str, asked_as: &str, aliasing: Aliasing) {
         let sys = TestSystem::new();
         fs::create_dir(sys.root().join(on_disk)).unwrap();
         let asked = sys.root().join(asked_as);
         if !asked.is_dir() {
-            // Case- and normalization-sensitive: the two names are two directories, the two
-            // forms of a `Checked` cannot differ, and asserting the duller outcome would let
-            // a green run read as coverage it does not have. CI runs these on Linux too.
-            //
-            // Not on macOS, though — see the note in `assert_one_directory_counted_once`.
-            // This is the one test that tells `Checked::path` from `Checked::judged`, and a
-            // Mac where it quietly does nothing is a Mac with no such test at all.
-            // `assert!(!cfg!(…))` is what this wants to be, and clippy refuses an
-            // assertion whose value is a constant.
-            if cfg!(target_os = "macos") {
-                panic!(
-                    "{asked_as} is its own name here: this volume folds neither case nor \
-                     normalization, and the aliasing rules are untested on it"
-                );
-            }
-            eprintln!("skipped: {asked_as} is its own name on this volume");
+            // The two names are two directories here, so the two forms of a `Checked` cannot
+            // differ and there is nothing to tell apart. This is the one test that separates
+            // `Checked::path` from `Checked::judged`, which is why a Mac where it says
+            // nothing is worth stopping for — see `skip_or_stop`.
+            skip_or_stop(asked_as, aliasing);
             return;
         }
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
@@ -1683,12 +1736,14 @@ mod tests {
 
     #[test]
     fn the_port_is_asked_for_the_spelling_the_caller_wrote() {
-        assert_the_port_is_asked_for("Data", "Data");
-        assert_the_port_is_asked_for("Data", "data");
+        // The name on disk always opens itself; the assertion is the same one, and the
+        // pairs below are what can tell the two forms of a `Checked` apart.
+        assert_the_port_is_asked_for("Data", "Data", Aliasing::FoldsOnEveryMac);
+        assert_the_port_is_asked_for("Data", "data", Aliasing::MayNotFold);
         // No user error at all: the same name typed on macOS arrives in NFC from one source
         // and in NFD from another, and APFS treats them as one directory.
-        assert_the_port_is_asked_for("caf\u{e9}", "cafe\u{301}");
-        assert_the_port_is_asked_for("cafe\u{301}", "caf\u{e9}");
+        assert_the_port_is_asked_for("caf\u{e9}", "cafe\u{301}", Aliasing::FoldsOnEveryMac);
+        assert_the_port_is_asked_for("cafe\u{301}", "caf\u{e9}", Aliasing::FoldsOnEveryMac);
     }
 
     #[test]
