@@ -410,6 +410,8 @@ Expected: compile errors, `Limits` and `check` are missing.
 
 The types from design section 5: `Mode`, `PlanEntry`, `Plan`, `BlockReason`, `EntryStatus`, `PreviewEntry`, `Preview`, `EntryResult`, `EntryOutcome`, `Outcome`. All of them `#[serde(rename_all = "camelCase")]`, `BlockReason` and `Mode` also `#[derive(PartialEq, Eq)]` so tests can compare them. `Preview::total_bytes` counts `Ready` entries only.
 
+`EntryResult::Failed` and `EntryResult::Skipped` are struct variants (`Failed { message }`, `Skipped { reason }`), not newtypes. Serde's internal tagging — the `tag = "result"` these types need to cross IPC — cannot serialize a newtype variant whose content is not a map, and it fails at runtime, not at compile time. `EntryStatus::Blocked(BlockReason)` stays a tuple variant; adjacent tagging handles that one.
+
 **Step 4: Implement `guards.rs`**
 
 ```rust
@@ -425,7 +427,10 @@ impl Limits {
     /// given, since a denylist entry may be absent on this machine.
     pub fn new(root: PathBuf, denied: Vec<PathBuf>) -> Self { ... }
 
-    /// The root plus the standard denylist of design section 9.
+    /// The root plus the standard denylist of design section 9. `new` drops any denied
+    /// entry that contains the root — `/` always does, and the home folder does for the
+    /// default scan — otherwise rule 6 would refuse every path in the tree. Nothing is
+    /// lost: rule 4 already refuses the root and its ancestors, and rule 1 refuses `/`.
     pub fn for_scan_root(root: PathBuf) -> Self {
         let mut denied = vec![
             PathBuf::from("/"), PathBuf::from("/System"), PathBuf::from("/usr"),
@@ -626,7 +631,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let checked = preview(&p, &limits, &sys);
         fs::remove_file(sys.root().join("a.bin")).unwrap(); // vanishes between the stages
         let outcome = execute(&checked, &sys);
-        assert!(matches!(outcome.entries[0].result, EntryResult::Skipped(BlockReason::Missing)));
+        assert!(matches!(outcome.entries[0].result, EntryResult::Skipped { reason: BlockReason::Missing }));
         assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
         assert_eq!(outcome.freed_bytes, 10, "only what was really deleted");
     }
@@ -641,7 +646,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         fs::remove_file(sys.root().join("a.bin")).unwrap();
         fs::create_dir(sys.root().join("a.bin")).unwrap(); // same name, now a directory
         let outcome = execute(&checked, &sys);
-        assert!(matches!(outcome.entries[0].result, EntryResult::Skipped(BlockReason::KindChanged)));
+        assert!(matches!(outcome.entries[0].result, EntryResult::Skipped { reason: BlockReason::KindChanged }));
         assert!(sys.root().join("a.bin").is_dir(), "the replacement is left alone");
     }
 
@@ -655,7 +660,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let checked = preview(&p, &limits, &sys);
         sys.fail_next(&sys.root().join("a.bin"));
         let outcome = execute(&checked, &sys);
-        assert!(matches!(outcome.entries[0].result, EntryResult::Failed(_)));
+        assert!(matches!(outcome.entries[0].result, EntryResult::Failed { .. }));
         assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
         assert!(sys.root().join("a.bin").exists(), "a failure leaves the entry alone");
         assert_eq!(outcome.freed_bytes, 10);
@@ -668,7 +673,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
         let outcome = execute(&preview(&p, &limits, &sys), &sys);
         assert_eq!(outcome.entries.len(), 1);
-        assert!(matches!(outcome.entries[0].result, EntryResult::Skipped(BlockReason::Missing)));
+        assert!(matches!(outcome.entries[0].result, EntryResult::Skipped { reason: BlockReason::Missing }));
         assert_eq!(outcome.freed_bytes, 0);
     }
 }
@@ -687,7 +692,7 @@ Expected: compile error, `execute` is missing.
 pub fn execute(preview: &Preview, sys: &dyn System) -> Outcome
 ```
 
-Per entry: `Blocked(reason)` → `Skipped(reason)`. `Ready` → re-read `symlink_metadata` (missing → `Skipped(Missing)`), compare `NodeKind::from_metadata` with the preview's kind (different → `Skipped(KindChanged)`), then `move_to_trash` or `remove` by mode; an error becomes `Failed(message)`. `freed_bytes` sums the `Removed` entries. `at` comes from `sys.now()`.
+Per entry: `Blocked(reason)` → `Skipped { reason }`. `Ready` → re-read `symlink_metadata` (missing → `Skipped { reason: Missing }`), compare `NodeKind::from_metadata` with the preview's kind (different → `Skipped { reason: KindChanged }`), then `move_to_trash` or `remove` by mode; an error becomes `Failed { message }`. `freed_bytes` sums the `Removed` entries. `at` comes from `sys.now()`.
 
 `remove` is not atomic: a tree can be part-deleted and then fail, which lands as `Failed` with 0 bytes even though gigabytes are gone. That is a deliberate lower bound — the tree still ends up correct, because Task 8 rescans the path either way and splices in whatever remains.
 
@@ -778,7 +783,7 @@ mod tests {
         let entry = EntryOutcome {
             path: "/h/x".into(),
             kind: NodeKind::File,
-            result: EntryResult::Failed("permission denied".into()),
+            result: EntryResult::Failed { message: "permission denied".into() },
         };
         log.append(Mode::Trash, chrono::Utc::now(), &[entry]).unwrap();
         let read = &log.tail(1).unwrap()[0];
@@ -1100,7 +1105,7 @@ mod tests {
 }
 ```
 
-Fill the three sketched tests out: the second deletes a directory whose child cannot be removed (make the child read-only through its parent's permissions, as `crates/core/tests/walker.rs` already does) and asserts the remaining node is in the tree with the smaller size; the third passes a path outside the scan root and asserts the tree is untouched and the outcome says `Skipped(OutsideRoots)`; the fourth reads the log back through `ActionLog::tail`.
+Fill the three sketched tests out: the second deletes a directory whose child cannot be removed (make the child read-only through its parent's permissions, as `crates/core/tests/walker.rs` already does) and asserts the remaining node is in the tree with the smaller size; the third passes a path outside the scan root and asserts the tree is untouched and the outcome says `Skipped { reason: OutsideRoots }`; the fourth reads the log back through `ActionLog::tail`.
 
 **Step 2: Run to verify failure**
 

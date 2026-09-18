@@ -98,7 +98,7 @@ pub enum EntryStatus { Ready, Blocked(BlockReason) }
 pub struct PreviewEntry { pub path: PathBuf, pub kind: NodeKind, pub size: u64, pub status: EntryStatus }
 pub struct Preview { pub entries: Vec<PreviewEntry>, pub total_bytes: u64, pub mode: Mode }
 
-pub enum EntryResult { Removed { bytes: u64 }, Failed(String), Skipped(BlockReason) }
+pub enum EntryResult { Removed { bytes: u64 }, Failed { message: String }, Skipped { reason: BlockReason } }
 pub struct Outcome { pub entries: Vec<EntryOutcome>, pub freed_bytes: u64, pub at: DateTime<Utc> }
 ```
 
@@ -113,12 +113,16 @@ Guards live in `guards.rs` as pure functions:
 - **Allowed roots.** An entry must sit inside the scan root. The root itself and
   any of its ancestors are refused.
 - **Denylist.** `/`, `/System`, `/usr`, `/bin`, `/sbin`, `/Library`,
-  `~/Library`, and the home folder itself.
+  `~/Library`, and the home folder itself. A denied entry that *contains* the
+  scan root is dropped when the limits are built: the rule matches a path and
+  everything below it, so leaving `/` in would refuse every entry in every tree,
+  and leaving the home folder in would refuse the default scan. Neither is a
+  loss, because the root and its ancestors are already refused above.
 - **Nesting.** When a batch holds both `a/` and `a/b`, the descendant is
   dropped: otherwise its bytes are counted twice and its deletion fails with
   "no such file".
 - **Re-validation at execution time.** `symlink_metadata` again: the kind must
-  still match the plan, or the entry becomes `Skipped(KindChanged)`. A changed
+  still match the plan, or the entry becomes `Skipped { reason: KindChanged }`. A changed
   size is fine — the disk keeps living.
 
 A failing entry does not abort the batch. Every entry, successful or not, is
