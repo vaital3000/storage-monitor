@@ -230,15 +230,7 @@ fn unread(node: Node, error: &str) -> Subtree {
 }
 
 fn node_from_metadata(name: &str, meta: &Metadata) -> Node {
-    let kind = if meta.is_dir() {
-        NodeKind::Dir
-    } else if meta.file_type().is_symlink() {
-        NodeKind::Symlink
-    } else if meta.is_file() {
-        NodeKind::File
-    } else {
-        NodeKind::Other
-    };
+    let kind = NodeKind::from_metadata(meta);
     let is_dir = kind == NodeKind::Dir;
     Node::new(
         name,

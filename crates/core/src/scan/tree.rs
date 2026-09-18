@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
+use std::fs::Metadata;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,24 @@ pub enum NodeKind {
     File,
     Symlink,
     Other,
+}
+
+impl NodeKind {
+    /// Classifies an entry from metadata that did not follow symlinks. The one place that
+    /// decides: a scan and the re-validation before a deletion must agree, or an entry
+    /// that is neither a file nor a directory — a socket, a fifo — would look like it had
+    /// changed kind and could never be deleted.
+    pub fn from_metadata(meta: &Metadata) -> Self {
+        if meta.is_dir() {
+            Self::Dir
+        } else if meta.file_type().is_symlink() {
+            Self::Symlink
+        } else if meta.is_file() {
+            Self::File
+        } else {
+            Self::Other
+        }
+    }
 }
 
 /// One entry of a scanned tree. Links to relatives are private; navigate with
