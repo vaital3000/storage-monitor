@@ -1,16 +1,228 @@
+// Fake backend for unit tests, e2e and `just dev-web`: every command of
+// `src-tauri/src/commands.rs` answered from the fixture, with a simulated scan that
+// emits the same events as the real scan manager.
+
+import { emit } from '@tauri-apps/api/event';
 import { mockIPC } from '@tauri-apps/api/mocks';
-import type { AppInfo } from '../lib/ipc';
+import { SCAN_DONE_EVENT, SCAN_PROGRESS_EVENT, type AppInfo, type ScanStatus } from '../lib/ipc';
+import {
+  FIXTURE_ROOT,
+  fixtureDisk,
+  fixtureGrowers,
+  fixtureNodeView,
+  fixtureNodes,
+  fixtureStatusDone,
+} from './fixtures';
 
 export const MOCK_APP_INFO: AppInfo = { name: 'Storage Monitor', version: '0.0.0-mock' };
 
-/** Installs fake handlers for every backend command. Used by unit tests, e2e and browser dev. */
-export function installIpcMock(): void {
-  mockIPC((cmd) => {
-    switch (cmd) {
-      case 'get_app_info':
-        return MOCK_APP_INFO;
-      default:
-        throw new Error(`Unmocked IPC command: ${cmd}`);
+/** Paths the UI asked to reveal in Finder, oldest first. */
+export const revealed: string[] = [];
+
+/** Milliseconds between the simulated progress ticks; tests set it to 0. */
+export let mockScanDelayMs = 150;
+
+export function setMockScanDelay(ms: number): void {
+  mockScanDelayMs = ms;
+}
+
+const PROGRESS_TICKS = 6;
+const DEFAULT_CHILDREN_LIMIT = 500;
+const DEFAULT_GROWERS_LIMIT = 10;
+
+/** Directories the simulated scan claims to be reading, one per tick, shallow to deep. */
+const PROGRESS_PATHS: readonly string[] = (() => {
+  const dirs = fixtureNodes.filter((n) => n.kind === 'dir' && n.error === null && n.id !== 0);
+  return Array.from(
+    { length: PROGRESS_TICKS },
+    (_, i) => dirs[Math.floor((i * dirs.length) / PROGRESS_TICKS)].path,
+  );
+})();
+
+const IDLE: ScanStatus = {
+  state: 'idle',
+  root: null,
+  files: 0,
+  dirs: 0,
+  bytes: 0,
+  errors: 0,
+  currentPath: '',
+  durationMs: 0,
+  error: null,
+  hasPrevious: false,
+  previousTakenAt: null,
+};
+
+let status: ScanStatus = IDLE;
+/** A tree is available: the last scan finished or was cancelled. */
+let hasResult = false;
+let timer: ReturnType<typeof setTimeout> | null = null;
+
+type IpcHandler = Parameters<typeof mockIPC>[0];
+type IpcArgs = Parameters<IpcHandler>[1];
+
+function argument(args: IpcArgs, name: string): unknown {
+  if (
+    args === undefined ||
+    Array.isArray(args) ||
+    args instanceof ArrayBuffer ||
+    ArrayBuffer.isView(args)
+  ) {
+    return undefined;
+  }
+  return args[name];
+}
+
+function stringArgument(args: IpcArgs, name: string): string | undefined {
+  const value = argument(args, name);
+  return typeof value === 'string' ? value : undefined;
+}
+
+function numberArgument(args: IpcArgs, name: string): number | undefined {
+  const value = argument(args, name);
+  return typeof value === 'number' ? value : undefined;
+}
+
+/** A command's `Err(String)`: Tauri rejects with the string itself, not with an `Error`. */
+function commandError(message: string): never {
+  throw message;
+}
+
+function clearTimer(): void {
+  if (timer !== null) {
+    clearTimeout(timer);
+    timer = null;
+  }
+}
+
+function after(callback: () => void): void {
+  timer = setTimeout(() => {
+    timer = null;
+    callback();
+  }, mockScanDelayMs);
+}
+
+/** Emits a copy of the status; a mock that was cleared underneath has no listeners left. */
+function publish(event: string): void {
+  void emit(event, { ...status }).catch(() => undefined);
+}
+
+function finish(final: ScanStatus): void {
+  status = final;
+  hasResult = true;
+  publish(SCAN_DONE_EVENT);
+}
+
+function advance(tick: number): void {
+  if (status.state !== 'running') {
+    return;
+  }
+  const done = fixtureStatusDone();
+  if (tick > PROGRESS_TICKS) {
+    finish({ ...done, root: status.root });
+    return;
+  }
+  const share = tick / (PROGRESS_TICKS + 1);
+  status = {
+    ...status,
+    files: Math.floor(done.files * share),
+    dirs: Math.floor(done.dirs * share),
+    bytes: Math.floor(done.bytes * share),
+    errors: Math.floor(done.errors * share),
+    currentPath: PROGRESS_PATHS[tick - 1],
+    durationMs: Math.floor(done.durationMs * share),
+  };
+  publish(SCAN_PROGRESS_EVENT);
+  after(() => advance(tick + 1));
+}
+
+function scanStart(root: string): ScanStatus {
+  if (status.state === 'running') {
+    commandError('a scan is already running');
+  }
+  clearTimer();
+  hasResult = false;
+  status = { ...IDLE, state: 'running', root, currentPath: root };
+  after(() => advance(1));
+  return { ...status };
+}
+
+/** Like the real manager, the reply is still `running`; `scan:done` follows shortly. */
+function scanCancel(): ScanStatus {
+  if (status.state === 'running') {
+    clearTimer();
+    after(() => {
+      finish({
+        ...status,
+        state: 'cancelled',
+        currentPath: '',
+        hasPrevious: false,
+        previousTakenAt: null,
+      });
+    });
+  }
+  return { ...status };
+}
+
+const handle: IpcHandler = (cmd, args) => {
+  switch (cmd) {
+    case 'get_app_info':
+      return MOCK_APP_INFO;
+    case 'default_root':
+      return FIXTURE_ROOT;
+    case 'scan_start':
+      return scanStart(stringArgument(args, 'root') ?? FIXTURE_ROOT);
+    case 'scan_status':
+      return { ...status };
+    case 'scan_cancel':
+      return scanCancel();
+    case 'tree_node': {
+      if (!hasResult) {
+        commandError('no scan result');
+      }
+      const id = numberArgument(args, 'id') ?? 0;
+      const limit = numberArgument(args, 'limit') ?? DEFAULT_CHILDREN_LIMIT;
+      try {
+        return fixtureNodeView(id, limit);
+      } catch (error) {
+        return commandError(error instanceof Error ? error.message : String(error));
+      }
     }
-  });
+    case 'disk_usage':
+      return {
+        ...fixtureDisk(),
+        path: stringArgument(args, 'path') ?? status.root ?? FIXTURE_ROOT,
+      };
+    case 'top_growers':
+      return status.hasPrevious
+        ? fixtureGrowers().slice(0, numberArgument(args, 'limit') ?? DEFAULT_GROWERS_LIMIT)
+        : [];
+    case 'plugin:opener|reveal_item_in_dir': {
+      // `revealItemInDir(path)` sends `{ paths: [path] }`.
+      const paths = argument(args, 'paths');
+      for (const path of Array.isArray(paths) ? paths : [paths]) {
+        revealed.push(String(path));
+      }
+      return null;
+    }
+    default:
+      throw new Error(`Unmocked IPC command: ${cmd}`);
+  }
+};
+
+/** Back to idle: no scan, no tree, no revealed paths, no pending ticks. Keeps the delay. */
+export function resetIpcMock(): void {
+  clearTimer();
+  status = IDLE;
+  hasResult = false;
+  revealed.length = 0;
+}
+
+/**
+ * Installs fake handlers for every backend command and routes `emit` to `listen`.
+ * Used by unit tests, e2e and browser dev; resets the mock state first.
+ */
+export function installIpcMock(): void {
+  resetIpcMock();
+  mockIPC(handle, { shouldMockEvents: true });
 }

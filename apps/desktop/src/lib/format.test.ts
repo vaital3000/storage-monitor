@@ -1,0 +1,95 @@
+import { describe, expect, it } from 'vitest';
+import { formatBytes, formatDate, formatDelta, formatPercent, shortenPath } from './format';
+
+describe('formatBytes', () => {
+  it('shows bytes without a decimal', () => {
+    expect(formatBytes(0)).toBe('0 B');
+    expect(formatBytes(1)).toBe('1 B');
+    expect(formatBytes(999)).toBe('999 B');
+  });
+
+  it('uses 1000-based units with one decimal from KB up', () => {
+    expect(formatBytes(1000)).toBe('1.0 KB');
+    expect(formatBytes(1536)).toBe('1.5 KB');
+    expect(formatBytes(4_500_000_000)).toBe('4.5 GB');
+    expect(formatBytes(1_200_000_000_000)).toBe('1.2 TB');
+    expect(formatBytes(340_000_000)).toBe('340.0 MB');
+  });
+
+  it('steps up instead of showing 1000.0', () => {
+    expect(formatBytes(999_950)).toBe('1.0 MB');
+    expect(formatBytes(999_949)).toBe('999.9 KB');
+  });
+
+  it('never shows a negative or NaN size', () => {
+    expect(formatBytes(-5)).toBe('0 B');
+    expect(formatBytes(Number.NaN)).toBe('0 B');
+  });
+});
+
+describe('formatDelta', () => {
+  it('is empty for null, undefined and zero', () => {
+    expect(formatDelta(null)).toBe('');
+    expect(formatDelta(undefined)).toBe('');
+    expect(formatDelta(0)).toBe('');
+  });
+
+  it('prefixes growth with a plus sign', () => {
+    expect(formatDelta(1_200_000_000)).toBe('+1.2 GB');
+    expect(formatDelta(512)).toBe('+512 B');
+  });
+
+  it('prefixes shrinkage with a real minus sign', () => {
+    expect(formatDelta(-340_000_000)).toBe('−340.0 MB');
+    expect(formatDelta(-1)).toBe('−1 B');
+  });
+});
+
+describe('formatPercent', () => {
+  it('shows one decimal of the share', () => {
+    expect(formatPercent(123, 1000)).toBe('12.3%');
+    expect(formatPercent(1, 1)).toBe('100.0%');
+    expect(formatPercent(0, 10)).toBe('0.0%');
+  });
+
+  it('is 0% when the whole is empty or invalid', () => {
+    expect(formatPercent(5, 0)).toBe('0%');
+    expect(formatPercent(0, 0)).toBe('0%');
+    expect(formatPercent(5, Number.NaN)).toBe('0%');
+  });
+});
+
+describe('formatDate', () => {
+  it('shows the local calendar date of a unix timestamp', () => {
+    // Local noon, so the date is the same in every time zone.
+    const noon = new Date(2026, 8, 18, 12, 0, 0);
+    expect(formatDate(noon.getTime() / 1000)).toBe('2026-09-18');
+    const january = new Date(2024, 0, 5, 12, 0, 0);
+    expect(formatDate(january.getTime() / 1000)).toBe('2024-01-05');
+  });
+});
+
+describe('shortenPath', () => {
+  const path = '/Users/demo/Library/Developer/Xcode/DerivedData';
+
+  it('returns a path that fits unchanged', () => {
+    expect(shortenPath(path, path.length)).toBe(path);
+    expect(shortenPath(path, 200)).toBe(path);
+  });
+
+  it('keeps whole trailing components behind an ellipsis', () => {
+    expect(shortenPath(path, 24)).toBe('…/Xcode/DerivedData');
+    expect(shortenPath(path, 30)).toBe('…/Developer/Xcode/DerivedData');
+  });
+
+  it('cuts the last component when even that does not fit', () => {
+    expect(shortenPath(path, 8)).toBe('…vedData');
+  });
+
+  it('never returns more than max characters', () => {
+    for (const max of [1, 2, 5, 10, 19, 20, 45]) {
+      expect(shortenPath(path, max).length).toBeLessThanOrEqual(Math.max(max, 1));
+    }
+    expect(shortenPath(path, 1)).toBe('…');
+  });
+});
