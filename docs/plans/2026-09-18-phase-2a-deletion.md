@@ -1247,7 +1247,7 @@ Run: `cargo test -p storage-monitor-desktop activity`
 pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> LogTail
 ```
 
-Default limit 100. A read error returns an empty list and prints to stderr: the Activity screen must never be a dead end because a log line was damaged.
+Default limit 100. A **damaged line** is already handled below the command — `tail` skips it and counts it in `LogTail::damaged`. A **read error** is different and must not be flattened into an empty list: "No actions yet" over a log that exists and is full of the user's deletions is the same silent-loss failure `damaged` was added to prevent, one layer up. Surface it, so the screen can say the log could not be read.
 
 **Step 4: Run the tests and commit**
 
@@ -1445,7 +1445,7 @@ git commit -m "feat(desktop): delete selected entries from the Explorer"
 
 **Step 1: Write the failing tests**
 
-An empty log renders "No actions yet"; entries render newest first with a formatted time, the path, the mode and the size; a failed entry shows its message; the page refetches when it is opened after a batch.
+An empty log renders "No actions yet"; entries render newest first with a formatted time, the path, the mode and the size; a failed entry shows its message; a **skipped** entry shows its reason, mapped from `detail` — and the map reads `result` first, because `detail` carries a failure message for `Failed` and a block reason for `Skipped`, so a failure whose message reads `denylisted` is not a blocked entry; a non-zero `damaged` count renders as "N damaged entries hidden", never silently; a log that could not be read renders as an error rather than as an empty list; the page refetches when it is opened after a batch.
 
 **Step 2: Run to verify failure**
 
@@ -1504,7 +1504,7 @@ git commit -m "test(desktop): cover deletion and the Activity screen end to end"
 
 **Step 2: `CLAUDE.md`**
 
-Add `crates/core/src/system/` and `crates/core/src/action/` to the layout, `apps/desktop/src-tauri/src/actions.rs`, and the new UI files. Extend the Data section with `actions.jsonl`. Add to Conventions: deletion goes through `System`, never through `std::fs` directly; the CSP is set (drop the line that says it is still `null`).
+Add `crates/core/src/system/` and `crates/core/src/action/` to the layout, `apps/desktop/src-tauri/src/actions.rs`, and the new UI files. Extend the Data section with `actions.jsonl`: where it lives, that it is created `0o600` because it names every path the user has ever deleted, that a batch is one append and `Ok` means the bytes reached the volume, and that — unlike snapshots, which are pruned to ten — nothing prunes it. Add to Conventions: deletion goes through `System`, never through `std::fs` directly; the CSP is set (drop the line that says it is still `null`).
 
 **Step 3: `README.md`**
 
