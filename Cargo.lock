@@ -3104,9 +3104,13 @@ dependencies = [
 name = "storage-monitor-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
  "storage-monitor-core",
  "tauri",
  "tauri-build",
+ "tempfile",
 ]
 
 [[package]]
