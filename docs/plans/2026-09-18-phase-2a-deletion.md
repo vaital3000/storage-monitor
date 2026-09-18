@@ -587,7 +587,7 @@ Expected: compile errors, `preview` is missing.
 pub fn preview(plan: &Plan, limits: &Limits, sys: &dyn System) -> Preview
 ```
 
-For each entry: run `check`; then `sys.symlink_metadata` (a `Missing` error becomes `Blocked(Missing)`) and record the kind the disk reports, through `NodeKind::from_metadata` — the same classification the walker uses, so a socket or a fifo is `Other` here as well. Rolling a private `if is_dir { Dir } else { File }` instead would make every such entry fail re-validation with `KindChanged` forever. Then apply `drop_nested` over the normalized paths of the entries that are still `Ready`, blocking the descendants with `Nested`. Sum `size` over `Ready` entries into `total_bytes`.
+For each entry: run `limits.check(path)`, which already reports `Missing`, `Unreadable` and `Malformed` as well as the three placement reasons; then `sys.symlink_metadata` on what it returned (a `Missing` error becomes `Blocked(Missing)`) and record the kind the disk reports, through `NodeKind::from_metadata` — the same classification the walker uses, so a socket or a fifo is `Other` here as well. Rolling a private `if is_dir { Dir } else { File }` instead would make every such entry fail re-validation with `KindChanged` forever. Then apply `drop_nested` over the normalized paths of the entries that are still `Ready`, blocking the descendants with `Nested`. Sum `size` over `Ready` entries into `total_bytes`.
 
 **Step 4: Run the tests**
 
