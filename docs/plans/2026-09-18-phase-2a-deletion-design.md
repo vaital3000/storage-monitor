@@ -154,6 +154,16 @@ a deleted path owned the bytes of a hard-linked file, its twins keep reporting
 0 until the next full scan. Re-attribution would mean keeping all `(dev, ino)`
 pairs of the tree — 3.7M entries for a rare case.
 
+**Second known limitation.** A file whose name is not valid UTF-8 cannot be
+deleted from the app. `Node::name` is a `str` filled through `to_string_lossy`,
+so such a name reaches the tree with U+FFFD in it and the path it yields names
+nothing on disk. The entry stays visible with its real size and every attempt to
+delete it is blocked as missing. This is deliberate rather than guarded against:
+APFS validates filenames as UTF-8, and the scanner stays on one volume, so the
+case needs a foreign filesystem mounted inside the home folder. It fails safely
+— a path full of U+FFFD matches nothing, so nothing else is deleted in its
+place.
+
 The snapshot is not rewritten and the deltas are left alone: they describe
 growth since the previous snapshot, and the next scan reports the deletion
 honestly as negative growth. `disk_usage` is re-read after every batch, since

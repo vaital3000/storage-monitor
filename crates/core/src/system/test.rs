@@ -204,7 +204,9 @@ mod tests {
         (outside, door, precious)
     }
 
-    /// Appends raw bytes to a path, which `PathBuf::join` and friends would normalize.
+    /// Appends raw bytes to a path, so a test states the dangerous form literally.
+    /// `join` would build the same string for `"."` and `""`, but reading it would leave
+    /// the reader guessing which of the two is the point.
     fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
         let mut raw = path.to_path_buf().into_os_string();
         raw.push(suffix);

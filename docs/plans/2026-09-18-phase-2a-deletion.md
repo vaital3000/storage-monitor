@@ -371,6 +371,15 @@ mod tests {
     }
 
     #[test]
+    fn the_filesystem_root_is_refused() {
+        // The port accepts "/": it is a well-formed absolute path and the port is not a
+        // policy layer. These two rules are the only thing between a batch and
+        // `remove_dir_all("/")`, so they get their own test.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(check(std::path::Path::new("/"), &limits(dir.path())), Err(BlockReason::Denylisted));
+    }
+
+    #[test]
     fn nested_entries_collapse_to_their_ancestor() {
         let paths = vec![
             std::path::PathBuf::from("/h/a"),
@@ -447,6 +456,11 @@ pub fn drop_nested(paths: &[PathBuf]) -> Vec<bool> { ... }
 6. Any denied `d` with `normalized == d || normalized.starts_with(d)` → `Denylisted`.
 
 `starts_with` on `Path` compares whole components, so `/h/ab` does not start with `/h/a`. Use it everywhere; never compare strings.
+
+Two constraints the `System` port places on this step, both verified in its review:
+
+- The port refuses any path that is not absolute and in normal form. Step 3 above is what produces that form, so `parent.canonicalize().join(file_name)` carries two loads at once: it defends against a symlink in the middle of the path, and it makes the result absolute even when the scan root was relative (`Tree::path` keeps whatever the root was; only the CLI normalizes it). Do not "optimize" the canonicalization away for paths that already look absolute.
+- The port accepts `/` — it is a well-formed path and the port is not a policy layer. Rules 1 and 4 are therefore the only thing standing between a batch and `remove_dir_all("/")`, hence the dedicated test above.
 
 **Step 5: Run the tests**
 
