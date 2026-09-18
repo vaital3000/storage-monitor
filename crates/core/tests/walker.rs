@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use storage_monitor_core::scan::{NodeKind, ScanOptions, ScanProgress, Tree, scan};
+use storage_monitor_core::scan::{Node, NodeKind, ScanOptions, ScanProgress, Tree, scan};
 use tempfile::TempDir;
 
 fn write(path: &Path, bytes: usize) {
@@ -24,15 +24,10 @@ fn fixture() -> TempDir {
     dir
 }
 
-fn child<'a>(
-    tree: &'a Tree,
-    parent: u32,
-    name: &str,
-) -> (u32, &'a storage_monitor_core::scan::Node) {
+fn child<'a>(tree: &'a Tree, parent: u32, name: &str) -> (u32, &'a Node) {
     tree.children(parent)
-        .iter()
-        .map(|id| (*id, tree.get(*id).unwrap()))
-        .find(|(_, n)| n.name == name)
+        .map(|id| (id, tree.get(id).unwrap()))
+        .find(|(_, n)| &*n.name == name)
         .unwrap_or_else(|| panic!("no child {name}"))
 }
 
@@ -43,7 +38,7 @@ fn scans_a_tree_with_logical_sizes_counts_and_kinds() {
     let result = scan(&ScanOptions::new(dir.path().to_path_buf()), &progress).unwrap();
     let tree = &result.tree;
 
-    assert_eq!(tree.root().name, dir.path().to_string_lossy());
+    assert_eq!(&*tree.root().name, dir.path().to_string_lossy().as_ref());
     assert_eq!(tree.root().kind, NodeKind::Dir);
     assert_eq!(tree.root().logical_size, 3_000 + 100 + 200 + 50 + 20_000);
     assert!(
@@ -59,9 +54,9 @@ fn scans_a_tree_with_logical_sizes_counts_and_kinds() {
     assert_eq!(notes.file_count, 2);
     let (_, hidden) = child(tree, Tree::ROOT, ".hidden");
     assert_eq!(hidden.file_count, 1, "hidden entries are scanned");
-    let (_, empty) = child(tree, Tree::ROOT, "empty");
+    let (empty_id, empty) = child(tree, Tree::ROOT, "empty");
     assert_eq!(empty.file_count, 0);
-    assert!(empty.children.is_empty());
+    assert!(!tree.has_children(empty_id));
     let (_, big) = child(tree, Tree::ROOT, "big.bin");
     assert_eq!(big.kind, NodeKind::File);
     assert_eq!(big.logical_size, 20_000);
@@ -83,14 +78,13 @@ fn children_are_sorted_by_size_descending() {
     let tree = &result.tree;
     let sizes: Vec<u64> = tree
         .children(Tree::ROOT)
-        .iter()
-        .map(|id| tree.get(*id).unwrap().size)
+        .map(|id| tree.get(id).unwrap().size)
         .collect();
     let mut sorted = sizes.clone();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
     assert_eq!(sizes, sorted);
     assert_eq!(
-        tree.get(tree.children(Tree::ROOT)[0]).unwrap().name,
+        &*tree.get(tree.children(Tree::ROOT).start).unwrap().name,
         "big.bin"
     );
 }
@@ -107,12 +101,12 @@ fn symlinks_are_recorded_but_never_followed() {
     )
     .unwrap();
     let tree = &result.tree;
-    let (_, link) = child(tree, Tree::ROOT, "docs-link");
+    let (link_id, link) = child(tree, Tree::ROOT, "docs-link");
     assert_eq!(link.kind, NodeKind::Symlink);
-    assert!(link.children.is_empty());
+    assert!(!tree.has_children(link_id));
     assert!(link.logical_size < 1_000);
-    let (_, looped) = child(tree, Tree::ROOT, "loop");
-    assert!(looped.children.is_empty());
+    let (loop_id, _) = child(tree, Tree::ROOT, "loop");
+    assert!(!tree.has_children(loop_id));
     assert_eq!(result.stats.files, 7, "symlinks count as entries");
 }
 
@@ -177,11 +171,11 @@ fn unreadable_directory_is_recorded_as_error_and_scan_continues() {
     );
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     let result = result.unwrap();
-    let (_, node) = child(&result.tree, Tree::ROOT, "locked");
+    let (locked_id, _) = child(&result.tree, Tree::ROOT, "locked");
+    let error = result.tree.error(locked_id);
     assert!(
-        node.error.as_deref().unwrap_or("").contains("ermission"),
-        "error: {:?}",
-        node.error
+        error.unwrap_or("").contains("ermission"),
+        "error: {error:?}"
     );
     assert_eq!(result.stats.errors, 1);
     assert_eq!(
@@ -196,13 +190,12 @@ fn excluded_directories_are_skipped() {
     let mut options = ScanOptions::new(dir.path().to_path_buf());
     options.excludes.push(dir.path().join("docs"));
     let result = scan(&options, &ScanProgress::default()).unwrap();
-    let names: Vec<String> = result
+    let names: Vec<&str> = result
         .tree
         .children(Tree::ROOT)
-        .iter()
-        .map(|id| result.tree.get(*id).unwrap().name.clone())
+        .map(|id| &*result.tree.get(id).unwrap().name)
         .collect();
-    assert!(!names.contains(&"docs".to_owned()));
+    assert!(!names.contains(&"docs"));
     assert_eq!(result.stats.files, 2);
 }
 
@@ -213,7 +206,7 @@ fn cancelled_scan_stops_early_and_says_so() {
     progress.cancel();
     let result = scan(&ScanOptions::new(dir.path().to_path_buf()), &progress).unwrap();
     assert!(result.cancelled);
-    assert!(result.tree.root().children.is_empty());
+    assert!(!result.tree.has_children(Tree::ROOT));
 }
 
 #[test]

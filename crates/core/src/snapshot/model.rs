@@ -55,7 +55,7 @@ impl Snapshot {
                     path: tree.path(id).to_string_lossy().into_owned(),
                     kind: node.kind,
                     size: node.size,
-                    file_count: node.file_count,
+                    file_count: u64::from(node.file_count),
                     mtime: node.mtime,
                 });
             }
@@ -65,7 +65,7 @@ impl Snapshot {
             taken_at: result.started_at,
             root: result.root.clone(),
             total_bytes: tree.root().size,
-            file_count: tree.root().file_count,
+            file_count: u64::from(tree.root().file_count),
             file_threshold,
             entries,
         }
@@ -100,40 +100,21 @@ mod tests {
     use crate::scan::{ScanResult, ScanStats};
 
     fn node(name: &str, kind: NodeKind, size: u64) -> Node {
-        Node {
-            name: name.into(),
-            kind,
-            parent: None,
-            size,
-            logical_size: size,
-            file_count: u64::from(kind != NodeKind::Dir),
-            mtime: 7,
-            error: None,
-            children: vec![],
-        }
+        Node::new(name, kind, size, size, u32::from(kind != NodeKind::Dir), 7)
     }
 
     fn result() -> ScanResult {
-        let tree = Subtree {
-            node: node("/home", NodeKind::Dir, 0),
-            children: vec![
-                Subtree {
-                    node: node("small.txt", NodeKind::File, 10),
-                    children: vec![],
-                },
-                Subtree {
-                    node: node("big.iso", NodeKind::File, 20_000),
-                    children: vec![],
-                },
-                Subtree {
-                    node: node("cache", NodeKind::Dir, 0),
-                    children: vec![Subtree {
-                        node: node("blob", NodeKind::File, 5_000),
-                        children: vec![],
-                    }],
-                },
+        let (tree, _) = Subtree::with_children(
+            node("/home", NodeKind::Dir, 0),
+            vec![
+                Subtree::new(node("small.txt", NodeKind::File, 10)),
+                Subtree::new(node("big.iso", NodeKind::File, 20_000)),
+                Subtree::with_children(
+                    node("cache", NodeKind::Dir, 0),
+                    vec![Subtree::new(node("blob", NodeKind::File, 5_000))],
+                ),
             ],
-        }
+        )
         .flatten();
         ScanResult {
             root: "/home".into(),

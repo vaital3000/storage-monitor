@@ -53,8 +53,7 @@ pub struct ScanStats {
     pub hardlinks_skipped: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct ScanResult {
     pub root: PathBuf,
     pub started_at: DateTime<Utc>,
@@ -106,10 +105,9 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
         seen_inodes: Mutex::new(HashSet::new()),
         hardlinks_skipped: AtomicU64::new(0),
     };
-    let root_node = node_from_metadata(root.to_string_lossy().into_owned(), &meta);
+    let root_node = node_from_metadata(&root.to_string_lossy(), &meta);
     let subtree = walk_dir(root, root_node, &ctx);
-    let mut tree = subtree.flatten();
-    tree.sort_children_by_size();
+    let (tree, _) = subtree.flatten();
     let snap = progress.snapshot();
     Ok(ScanResult {
         root: root.clone(),
@@ -130,21 +128,16 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
 fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
     ctx.progress.enter(path);
     if ctx.progress.is_cancelled() {
-        return Subtree {
-            node,
-            children: Vec::new(),
-        };
+        return Subtree::new(node);
     }
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(err) => {
-            node.error = Some(err.to_string());
             ctx.progress.add_error();
             ctx.progress.add_dir(node.size);
-            return Subtree {
-                node,
-                children: Vec::new(),
-            };
+            let mut subtree = Subtree::new(node);
+            subtree.error = Some(err.to_string().into());
+            return subtree;
         }
     };
 
@@ -166,18 +159,16 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
                 continue;
             }
         };
-        let mut child = node_from_metadata(entry.file_name().to_string_lossy().into_owned(), &meta);
+        let mut child = node_from_metadata(&entry.file_name().to_string_lossy(), &meta);
         if meta.is_dir() {
             if ctx.is_excluded(&child_path) {
                 continue;
             }
             if ctx.options.same_device && meta.dev() != ctx.root_dev {
-                child.error = Some("skipped: different volume".to_owned());
                 ctx.progress.add_dir(child.size);
-                leaves.push(Subtree {
-                    node: child,
-                    children: Vec::new(),
-                });
+                let mut subtree = Subtree::new(child);
+                subtree.error = Some("skipped: different volume".into());
+                leaves.push(subtree);
                 continue;
             }
             dirs.push((child_path, child));
@@ -187,10 +178,7 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
                 ctx.hardlinks_skipped.fetch_add(1, Ordering::Relaxed);
             }
             ctx.progress.add_file(child.size);
-            leaves.push(Subtree {
-                node: child,
-                children: Vec::new(),
-            });
+            leaves.push(Subtree::new(child));
         }
     }
 
@@ -207,10 +195,10 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
         node.logical_size += child.node.logical_size;
         node.file_count += child.node.file_count;
     }
-    Subtree { node, children }
+    Subtree::with_children(node, children)
 }
 
-fn node_from_metadata(name: String, meta: &Metadata) -> Node {
+fn node_from_metadata(name: &str, meta: &Metadata) -> Node {
     let kind = if meta.is_dir() {
         NodeKind::Dir
     } else if meta.file_type().is_symlink() {
@@ -220,15 +208,13 @@ fn node_from_metadata(name: String, meta: &Metadata) -> Node {
     } else {
         NodeKind::Other
     };
-    Node {
+    let is_dir = kind == NodeKind::Dir;
+    Node::new(
         name,
         kind,
-        parent: None,
-        size: meta.blocks() * 512,
-        logical_size: if kind == NodeKind::Dir { 0 } else { meta.len() },
-        file_count: if kind == NodeKind::Dir { 0 } else { 1 },
-        mtime: meta.mtime(),
-        error: None,
-        children: Vec::new(),
-    }
+        meta.blocks() * 512,
+        if is_dir { 0 } else { meta.len() },
+        u32::from(!is_dir),
+        meta.mtime(),
+    )
 }
