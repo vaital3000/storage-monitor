@@ -5,6 +5,11 @@
 //! fields, and enums tagged so that TypeScript sees discriminated unions instead of
 //! serde's default externally tagged form. The tests at the bottom pin the four shapes the
 //! UI is written against.
+//!
+//! Paths stay `PathBuf`, which serde refuses to serialize when it is not valid UTF-8. That
+//! cannot be reached from here: a name that is not UTF-8 arrives in the tree with U+FFFD
+//! in it, so it matches nothing on disk and cannot be deleted at all — the design's second
+//! known limitation in section 6.
 
 use std::path::PathBuf;
 
@@ -50,12 +55,19 @@ pub enum BlockReason {
     OutsideRoots,
     /// Inside a place the app never deletes from.
     Denylisted,
+    /// The path does not name an entry at all: `/`, or a path ending in `..`.
+    Malformed,
     /// The scan root itself, or one of its ancestors.
     IsRoot,
     /// Another entry of the same batch contains it.
     Nested,
     /// Nothing is there any more.
     Missing,
+    /// Something on the way to it cannot be read — permissions, a symlink loop, a
+    /// component that is not a directory. Distinct from [`Self::Missing`] on purpose: the
+    /// entry may well be there, and telling the user it vanished sends them hunting for a
+    /// ghost instead of granting access.
+    Unreadable,
     /// The entry is no longer what the preview saw.
     KindChanged,
 }
@@ -77,11 +89,20 @@ pub struct PreviewEntry {
     pub path: PathBuf,
     /// The kind the disk reports now, not the one the plan carried.
     pub kind: NodeKind,
+    /// The size the plan carried, from the scan — deliberately not re-read while the kind
+    /// is. Re-reading it would mean walking the subtree of every selected directory just
+    /// to show a dialog, and the number the user is about to confirm is the one the
+    /// Explorer showed them. A stale size costs nothing; a stale kind deletes the wrong
+    /// thing, which is why only that one is checked again.
     pub size: u64,
     pub status: EntryStatus,
 }
 
 /// A checked plan: no side effects, safe to show and to throw away.
+///
+/// Trustworthy only as long as it stays in the process that built it. One that arrives
+/// from the wire is a claim, not a verdict: the command re-plans from the paths rather
+/// than believing the statuses it is handed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
@@ -151,6 +172,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(BlockReason::OutsideRoots).unwrap(),
             json!("outsideRoots")
+        );
+        assert_eq!(
+            serde_json::to_value(BlockReason::Unreadable).unwrap(),
+            json!("unreadable")
+        );
+        assert_eq!(
+            serde_json::to_value(BlockReason::Malformed).unwrap(),
+            json!("malformed")
         );
     }
 
@@ -246,7 +275,9 @@ mod tests {
 
     #[test]
     fn a_plan_is_read_from_camel_case_json() {
-        // The one type that travels the other way: the UI submits it.
+        // `Plan` does not cross IPC — the commands take the paths and a mode and build it
+        // in the backend. Its shape is pinned anyway: it is the vocabulary the UI mirrors,
+        // and fixtures are written in this form.
         let plan: Plan = serde_json::from_value(json!({
             "entries": [{ "path": "/h/a.bin", "kind": "dir", "size": 10 }],
             "mode": "permanent",
