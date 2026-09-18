@@ -635,7 +635,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let outcome = execute(&preview(&p, &limits, &sys), &limits, &sys);
         assert_eq!(outcome.freed_bytes, 10);
         assert!(matches!(outcome.entries[0].result, EntryResult::Removed { bytes: 10 }));
-        assert!(sys.trash_dir().join("a.bin").exists());
+        assert!(fs::symlink_metadata(sys.trash_dir().join("a.bin")).is_ok());
         assert_eq!(outcome.at, sys.now());
     }
 
@@ -646,7 +646,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let p = plan(&sys, &["a.bin"], Mode::Permanent);
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
         execute(&preview(&p, &limits, &sys), &limits, &sys);
-        assert!(!sys.root().join("a.bin").exists());
+        assert!(fs::symlink_metadata(sys.root().join("a.bin")).is_err());
         assert_eq!(fs::read_dir(sys.trash_dir()).unwrap().count(), 0);
     }
 
@@ -691,7 +691,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let outcome = execute(&checked, &limits, &sys);
         assert!(matches!(outcome.entries[0].result, EntryResult::Failed { .. }));
         assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
-        assert!(sys.root().join("a.bin").exists(), "a failure leaves the entry alone");
+        assert!(fs::symlink_metadata(sys.root().join("a.bin")).is_ok(), "a failure leaves the entry alone");
         assert_eq!(outcome.freed_bytes, 10);
     }
 
