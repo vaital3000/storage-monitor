@@ -16,6 +16,7 @@ fn get_app_info() -> AppInfo {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .manage(ScanManager::default())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
