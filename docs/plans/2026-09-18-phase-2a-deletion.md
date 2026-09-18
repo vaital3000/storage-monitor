@@ -651,7 +651,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
     }
 
     #[test]
-    fn one_failing_entry_does_not_stop_the_batch() {
+    fn an_entry_that_vanished_between_the_stages_does_not_stop_the_batch() {
         let sys = TestSystem::new();
         fs::write(sys.root().join("a.bin"), b"x").unwrap();
         fs::write(sys.root().join("b.bin"), b"x").unwrap();
@@ -730,7 +730,7 @@ Per entry: `Blocked(reason)` → `Skipped { reason }`. `Ready` → re-read `syml
 **Step 4: Run the tests**
 
 Run: `cargo test -p storage-monitor-core action`
-Expected: 19 passed.
+Expected: every action test, tasks 2 and 3 included — around 70 by this point, not only the ones this task adds.
 
 **Step 5: Commit**
 
