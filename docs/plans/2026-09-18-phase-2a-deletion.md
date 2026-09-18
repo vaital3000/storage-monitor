@@ -442,8 +442,10 @@ impl Limits {
         let mut denied = vec![
             PathBuf::from("/"), PathBuf::from("/System"), PathBuf::from("/usr"),
             PathBuf::from("/bin"), PathBuf::from("/sbin"), PathBuf::from("/Library"),
-            PathBuf::from("/etc"), PathBuf::from("/var"), PathBuf::from("/private"),
-            PathBuf::from("/Applications"),
+            PathBuf::from("/etc"), PathBuf::from("/var"), PathBuf::from("/tmp"),
+            PathBuf::from("/private"), PathBuf::from("/Applications"),
+            PathBuf::from("/Users"), PathBuf::from("/Volumes"),
+            PathBuf::from("/opt"), PathBuf::from("/cores"),
         ];
         if let Some(home) = crate::paths::home_dir() {
             denied.push(home.join("Library"));

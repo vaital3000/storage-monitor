@@ -119,10 +119,16 @@ Guards live in `guards.rs` as pure functions:
 - **Allowed roots.** An entry must sit inside the scan root. The root itself and
   any of its ancestors are refused.
 - **Denylist.** `/`, `/System`, `/usr`, `/bin`, `/sbin`, `/Library`, `/etc`,
-  `/var`, `/private`, `/Applications`, `~/Library`, and the home folder itself.
-  Each entry is held both fully canonicalized and with only its parent
-  canonicalized, so `/etc` — a symlink on macOS — refuses the link itself as
-  well as `/private/etc` beneath it.
+  `/var`, `/tmp`, `/private`, `/Applications`, `/Users`, `/Volumes`, `/opt`,
+  `/cores`, `~/Library`, and the home folder itself. Each entry is held both
+  fully canonicalized and with only its parent canonicalized, so `/etc` — a
+  symlink on macOS, like `/var` and `/tmp` — refuses the link itself as well as
+  `/private/etc` beneath it.
+
+  The entries that only matter when the root is `/` cost an ordinary scan
+  nothing, because an entry containing the root is dropped: a home-folder scan
+  never sees `/Users`, and a future `/Volumes/Backup` root never sees
+  `/Volumes`.
 
   A denied entry that *contains* the scan root is dropped when the limits are
   built: the rule matches a path and everything below it, so leaving `/` in would
