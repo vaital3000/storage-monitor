@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod scan;
+pub mod snapshot;
 
 /// Human-readable product name.
 pub const APP_NAME: &str = "Storage Monitor";
