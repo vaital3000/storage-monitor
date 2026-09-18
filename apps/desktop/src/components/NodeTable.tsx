@@ -41,21 +41,23 @@ interface Column {
 
 const MTIME_TITLE = 'Directory modification time, not the newest content';
 
+// Fixed widths for the numeric columns (about 490 px in total); the name column takes
+// the rest, at least 150 px at the window's minimum width of 900 px.
 const COLUMNS: readonly Column[] = [
   { key: 'name', label: 'Name', numeric: false, sortable: true, width: 'w-auto' },
-  { key: 'size', label: 'Size', numeric: true, sortable: true, width: 'w-44' },
-  { key: 'percent', label: '%', numeric: true, sortable: false, width: 'w-16' },
+  { key: 'size', label: 'Size', numeric: true, sortable: true, width: 'w-36' },
+  { key: 'percent', label: '%', numeric: true, sortable: false, width: 'w-14' },
   { key: 'delta', label: 'Δ', numeric: true, sortable: true, width: 'w-24' },
-  { key: 'fileCount', label: 'Files', numeric: true, sortable: true, width: 'w-20' },
+  { key: 'fileCount', label: 'Files', numeric: true, sortable: true, width: 'w-16' },
   {
     key: 'mtime',
     label: 'Modified',
     numeric: true,
     sortable: true,
-    width: 'w-28',
+    width: 'w-24',
     title: MTIME_TITLE,
   },
-  { key: 'actions', label: '', numeric: false, sortable: false, width: 'w-10' },
+  { key: 'actions', label: '', numeric: false, sortable: false, width: 'w-8' },
 ];
 
 /** The direction a column starts with: names read A to Z, numbers largest first. */
@@ -176,7 +178,7 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
       </td>
       <td className={numeric}>
         <div className="flex items-center justify-end gap-2">
-          <div className="h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+          <div className="h-1.5 w-12 shrink-0 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
             <div className="h-full rounded-full bg-blue-500/70" style={{ width: `${barWidth}%` }} />
           </div>
           <span className="w-16">{formatBytes(child.size)}</span>
@@ -188,7 +190,7 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
       <td className={`${numeric} text-neutral-500`} title={isDir ? MTIME_TITLE : undefined}>
         {formatDate(child.mtime)}
       </td>
-      <td className="px-2 py-1.5">
+      <td className="px-1 py-1.5">
         <button
           type="button"
           aria-label="Reveal in Finder"

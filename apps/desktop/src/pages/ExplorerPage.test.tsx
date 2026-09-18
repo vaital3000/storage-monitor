@@ -1,6 +1,6 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
 import {
   DIFFERENT_VOLUME,
@@ -13,8 +13,15 @@ import {
   fixtureStatusDone,
 } from '../mocks/fixtures';
 import { installIpcMock, revealed, setMockScanDelay } from '../mocks/ipc';
+import { charts, lastChart } from '../test/echarts';
 import { renderWithClient } from '../test/render';
 import ExplorerPage from './ExplorerPage';
+
+// jsdom has no canvas: the treemap draws into a recording fake (see src/test/echarts.ts).
+vi.mock('echarts/core', async () => (await import('../test/echarts')).echartsCoreMock);
+vi.mock('echarts/charts', () => ({ TreemapChart: {} }));
+vi.mock('echarts/components', () => ({ TooltipComponent: {} }));
+vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 const SCAN_NOTE =
   'Scans the home folder. Some folders in Library need Full Disk Access; they are reported, not skipped.';
@@ -22,6 +29,7 @@ const MTIME_TITLE = 'Directory modification time, not the newest content';
 
 beforeEach(() => {
   installIpcMock();
+  charts.length = 0;
 });
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
@@ -310,6 +318,28 @@ describe('ExplorerPage after a scan', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Δ' }));
     expect(names()[0]).toBe('Library');
     expect(names()[names().length - 1]).toBe('Downloads');
+  });
+
+  it('draws the treemap of the current directory and navigates from a cell click', async () => {
+    await scanned();
+    expect(screen.getByTestId('treemap')).toBeInTheDocument();
+    const chart = lastChart();
+    const option = chart.lastOption() as {
+      series: Array<{ data: Array<{ name: string; nodeId: number | null; kind: string }> }>;
+    };
+    const cells = option.series[0].data;
+    expect(cells.map((cell) => cell.name)).toEqual(
+      fixtureNodeView(0)
+        .children.filter((c) => c.size > 0)
+        .map((c) => c.name),
+    );
+
+    const library = cells.find((cell) => cell.name === 'Library')!;
+    chart.trigger('click', { data: library });
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library']));
+    expect(charts).toHaveLength(1);
+    const redrawn = chart.lastOption() as typeof option;
+    expect(redrawn.series[0].data[0].name).toBe('Developer');
   });
 
   it('rescans from the header and lands on the root of the new tree', async () => {

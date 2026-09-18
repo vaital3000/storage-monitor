@@ -6,6 +6,7 @@ import DiskUsageBar from '../components/DiskUsageBar';
 import EmptyState from '../components/EmptyState';
 import NodeTable from '../components/NodeTable';
 import ScanProgress from '../components/ScanProgress';
+import Treemap from '../components/Treemap';
 import { useScan } from '../hooks/useScan';
 import { formatBytes, formatDate } from '../lib/format';
 import {
@@ -82,7 +83,7 @@ function ResultHeader({ status, disk, onRescan }: ResultHeaderProps) {
       </div>
       <div className="flex items-center gap-4">
         {disk !== undefined && (
-          <div className="w-80">
+          <div className="w-80 max-w-full">
             <DiskUsageBar usage={disk} scanned={status.bytes} />
           </div>
         )}
@@ -197,6 +198,7 @@ export default function ExplorerPage() {
               {describeNodeError(view.error).title}
             </p>
           )}
+          <Treemap items={view.children} parentSize={view.size} onSelect={open} />
           <NodeTable node={view} onOpen={open} onReveal={reveal} />
         </>
       ) : node.isError ? (
