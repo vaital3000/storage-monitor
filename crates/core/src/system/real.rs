@@ -6,7 +6,7 @@ use trash::TrashContext;
 #[cfg(target_os = "macos")]
 use trash::macos::{DeleteMethod, TrashContextExtMacos};
 
-use super::{System, SystemError};
+use super::{System, SystemError, check_path};
 
 /// The real machine.
 #[derive(Debug, Clone, Default)]
@@ -14,6 +14,7 @@ pub struct RealSystem;
 
 impl System for RealSystem {
     fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError> {
+        check_path(path)?;
         fs::symlink_metadata(path).map_err(|source| match source.kind() {
             std::io::ErrorKind::NotFound => SystemError::Missing(path.to_path_buf()),
             _ => SystemError::Metadata {
@@ -24,6 +25,10 @@ impl System for RealSystem {
     }
 
     fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
+        check_path(path)?;
+        // An entry that vanished between the preview and now reads as `Missing`: the
+        // Trash error for it is an opaque Cocoa message.
+        self.symlink_metadata(path)?;
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut ctx = TrashContext::default();
         // `Finder` is the crate's default and the only method that produces a reliable
@@ -34,11 +39,12 @@ impl System for RealSystem {
         ctx.set_delete_method(DeleteMethod::NsFileManager);
         ctx.delete(path).map_err(|err| SystemError::Trash {
             path: path.to_path_buf(),
-            message: err.to_string(),
+            message: trash_message(err),
         })
     }
 
     fn remove(&self, path: &Path) -> Result<(), SystemError> {
+        check_path(path)?;
         let meta = self.symlink_metadata(path)?;
         let result = if meta.is_dir() {
             // Not a symlink: `symlink_metadata` reports links as links, and std removes
@@ -55,5 +61,14 @@ impl System for RealSystem {
 
     fn now(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+}
+
+/// What to show the user. The crate's own `Display` is its `Debug` dump, and the message
+/// ends up in the action log and on the Activity screen.
+fn trash_message(err: trash::Error) -> String {
+    match err {
+        trash::Error::Unknown { description } => description,
+        other => other.to_string(),
     }
 }

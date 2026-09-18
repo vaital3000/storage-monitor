@@ -1,34 +1,54 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use tempfile::TempDir;
 
-use super::{RealSystem, System, SystemError};
+use super::{RealSystem, System, SystemError, check_path};
+
+/// What an injected failure reports.
+const INJECTED: &str = "the test system was told to fail";
 
 /// A [`System`] confined to a temporary directory: the real filesystem for metadata and
 /// deletion, a Trash that is just another folder, and a clock that moves only when a test
 /// moves it. Everything it touches disappears when it is dropped.
+///
+/// Deleting outside that directory panics rather than fails, so a test of a broken guard
+/// cannot quietly wipe the developer's `$HOME`. One instance per test thread: the search
+/// for a free name in the Trash is a check followed by a rename, which two threads sharing
+/// one instance could interleave.
 pub struct TestSystem {
     // Owns the temporary tree; dropping it removes `root` and `trash`.
     _dir: TempDir,
+    /// The canonical temporary directory: on macOS `TempDir::path` starts with `/var` and
+    /// canonicalizing it yields `/private/var`, and confinement compares canonical paths.
+    base: PathBuf,
     root: PathBuf,
     trash: PathBuf,
     clock: Mutex<DateTime<Utc>>,
+    /// Paths whose next deletion fails; see [`TestSystem::fail_next`].
+    failures: Mutex<HashSet<PathBuf>>,
 }
 
 impl TestSystem {
     /// Creates `root/` and `trash/` in a fresh temporary directory.
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("create the temporary directory");
-        let root = dir.path().join("root");
-        let trash = dir.path().join("trash");
+        let base = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize the temporary directory");
+        let root = base.join("root");
+        let trash = base.join("trash");
         fs::create_dir(&root).expect("create the root directory");
         fs::create_dir(&trash).expect("create the trash directory");
         Self {
             _dir: dir,
+            base,
             root,
             trash,
             clock: Mutex::new(
@@ -36,6 +56,7 @@ impl TestSystem {
                     .single()
                     .expect("a valid start instant"),
             ),
+            failures: Mutex::new(HashSet::new()),
         }
     }
 
@@ -54,8 +75,51 @@ impl TestSystem {
         *self.clock.lock().expect("an unpoisoned clock") += delta;
     }
 
-    /// The name the entry gets in the Trash: the macOS Trash keeps both entries when a
-    /// name repeats, and so does this one.
+    /// Makes the next [`System::move_to_trash`] or [`System::remove`] of `path` fail,
+    /// leaving the entry in place. For the batch tests, where one entry has to fail
+    /// without stopping the rest.
+    pub fn fail_next(&self, path: &Path) {
+        self.failures
+            .lock()
+            .expect("an unpoisoned failure list")
+            .insert(path.to_path_buf());
+    }
+
+    /// Panics unless the path is inside the temporary directory. A panic, not an error:
+    /// the guards of the action engine are developed test-first, and a test that hands
+    /// `$HOME` to a guard that does not work yet must stop, not record an expected
+    /// failure.
+    fn assert_confined(&self, path: &Path) {
+        // The parent is resolved, not the entry itself: canonicalizing the entry would
+        // follow a symlink that is about to be deleted and answer with its target. A
+        // parent that cannot be resolved leaves the path as it is; it is compared
+        // literally then, and the deletion fails on its own.
+        let resolved = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => match parent.canonicalize() {
+                Ok(parent) => parent.join(name),
+                Err(_) => path.to_path_buf(),
+            },
+            _ => path.to_path_buf(),
+        };
+        assert!(
+            resolved.starts_with(&self.base),
+            "TestSystem refuses to touch {}, which is outside {}",
+            path.display(),
+            self.base.display(),
+        );
+    }
+
+    /// Whether this deletion is one a test asked to fail, consuming the request.
+    fn told_to_fail(&self, path: &Path) -> bool {
+        self.failures
+            .lock()
+            .expect("an unpoisoned failure list")
+            .remove(path)
+    }
+
+    /// The name the entry gets in the Trash: like the macOS Trash, a repeated name keeps
+    /// both entries. Only the intent matches, not the spelling — macOS puts the counter
+    /// before the extension and this does not, so no test should depend on the exact name.
     fn trash_target(&self, name: &OsStr) -> PathBuf {
         let mut target = self.trash.join(name);
         let mut suffix = 2;
@@ -83,18 +147,37 @@ impl System for TestSystem {
     }
 
     fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
+        check_path(path)?;
+        self.assert_confined(path);
+        if self.told_to_fail(path) {
+            return Err(SystemError::Trash {
+                path: path.to_path_buf(),
+                message: INJECTED.to_owned(),
+            });
+        }
         let name = path.file_name().ok_or_else(|| SystemError::Trash {
             path: path.to_path_buf(),
             message: "the path has no file name".to_owned(),
         })?;
         // `rename` moves a symlink as a link, the way the macOS Trash does.
-        fs::rename(path, self.trash_target(name)).map_err(|source| SystemError::Trash {
-            path: path.to_path_buf(),
-            message: source.to_string(),
+        fs::rename(path, self.trash_target(name)).map_err(|source| match source.kind() {
+            io::ErrorKind::NotFound => SystemError::Missing(path.to_path_buf()),
+            _ => SystemError::Trash {
+                path: path.to_path_buf(),
+                message: source.to_string(),
+            },
         })
     }
 
     fn remove(&self, path: &Path) -> Result<(), SystemError> {
+        check_path(path)?;
+        self.assert_confined(path);
+        if self.told_to_fail(path) {
+            return Err(SystemError::Remove {
+                path: path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::PermissionDenied, INJECTED),
+            });
+        }
         RealSystem.remove(path)
     }
 
@@ -114,7 +197,7 @@ mod tests {
         let file = sys.root().join("a.bin");
         fs::write(&file, b"xxx").unwrap();
         sys.move_to_trash(&file).unwrap();
-        assert!(!file.exists());
+        assert!(fs::symlink_metadata(&file).is_err());
         assert_eq!(fs::read(sys.trash_dir().join("a.bin")).unwrap(), b"xxx");
     }
 
@@ -137,7 +220,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("f.bin"), b"x").unwrap();
         sys.remove(&sys.root().join("tree")).unwrap();
-        assert!(!sys.root().join("tree").exists());
+        assert!(fs::symlink_metadata(sys.root().join("tree")).is_err());
     }
 
     #[test]
@@ -148,8 +231,37 @@ mod tests {
         let link = sys.root().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         sys.remove(&link).unwrap();
-        assert!(!link.exists());
+        // Not `exists`, which follows the link: it would also pass if `remove` had deleted
+        // the target and left the link behind.
+        assert!(fs::symlink_metadata(&link).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn remove_deletes_a_symlink_to_a_directory_without_touching_the_directory() {
+        let sys = TestSystem::new();
+        let target = sys.root().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside.bin"), b"keep").unwrap();
+        let link = sys.root().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        sys.remove(&link).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read(target.join("inside.bin")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn removing_a_missing_path_is_reported_as_missing() {
+        let sys = TestSystem::new();
+        let err = sys.remove(&sys.root().join("nope")).unwrap_err();
+        assert!(matches!(err, SystemError::Missing(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn trashing_a_missing_path_is_reported_as_missing() {
+        let sys = TestSystem::new();
+        let err = sys.move_to_trash(&sys.root().join("nope")).unwrap_err();
+        assert!(matches!(err, SystemError::Missing(_)), "got {err:?}");
     }
 
     #[test]
@@ -192,5 +304,92 @@ mod tests {
         assert_eq!(sys.now(), first, "the test clock does not drift");
         sys.advance(chrono::Duration::seconds(5));
         assert_eq!(sys.now(), first + chrono::Duration::seconds(5));
+    }
+
+    #[test]
+    fn a_trailing_parent_component_is_rejected() {
+        let sys = TestSystem::new();
+        let inner = sys.root().join("b/c");
+        fs::create_dir_all(&inner).unwrap();
+        let sibling = sys.root().join("b/keep.bin");
+        fs::write(&sibling, b"keep").unwrap();
+        // The kernel resolves the `..`, so this would delete the contents of `b`.
+        let err = sys.remove(&inner.join("..")).unwrap_err();
+        assert!(matches!(err, SystemError::Rejected { .. }), "got {err:?}");
+        assert_eq!(fs::read(&sibling).unwrap(), b"keep");
+        assert!(inner.is_dir());
+    }
+
+    #[test]
+    fn a_parent_component_in_the_middle_is_rejected() {
+        let sys = TestSystem::new();
+        let file = sys.root().join("a.bin");
+        fs::write(&file, b"keep").unwrap();
+        fs::create_dir(sys.root().join("b")).unwrap();
+        let err = sys
+            .move_to_trash(&sys.root().join("b/../a.bin"))
+            .unwrap_err();
+        assert!(matches!(err, SystemError::Rejected { .. }), "got {err:?}");
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_relative_path_is_rejected() {
+        let sys = TestSystem::new();
+        let err = sys.remove(Path::new("relative-only.bin")).unwrap_err();
+        assert!(matches!(err, SystemError::Rejected { .. }), "got {err:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "refuses to touch")]
+    fn removing_outside_the_temporary_directory_panics() {
+        let sys = TestSystem::new();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let file = elsewhere.path().join("precious.bin");
+        fs::write(&file, b"keep").unwrap();
+        let _ = sys.remove(&file);
+    }
+
+    #[test]
+    #[should_panic(expected = "refuses to touch")]
+    fn trashing_outside_the_temporary_directory_panics() {
+        let sys = TestSystem::new();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let file = elsewhere.path().join("precious.bin");
+        fs::write(&file, b"keep").unwrap();
+        let _ = sys.move_to_trash(&file);
+    }
+
+    #[test]
+    fn escaping_through_a_symlinked_parent_panics_too() {
+        let sys = TestSystem::new();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let file = elsewhere.path().join("precious.bin");
+        fs::write(&file, b"keep").unwrap();
+        let door = sys.root().join("door");
+        std::os::unix::fs::symlink(elsewhere.path(), &door).unwrap();
+        let escaped = door.join("precious.bin");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sys.remove(&escaped);
+        }));
+        assert!(panicked.is_err(), "the path resolves outside the temp dir");
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn an_injected_failure_applies_once_to_the_named_path() {
+        let sys = TestSystem::new();
+        let trashed = sys.root().join("trashed.bin");
+        let removed = sys.root().join("removed.bin");
+        fs::write(&trashed, b"x").unwrap();
+        fs::write(&removed, b"x").unwrap();
+        sys.fail_next(&trashed);
+        sys.fail_next(&removed);
+        assert!(sys.move_to_trash(&trashed).is_err());
+        assert!(sys.remove(&removed).is_err());
+        assert!(trashed.exists() && removed.exists(), "nothing was touched");
+        sys.move_to_trash(&trashed).unwrap();
+        sys.remove(&removed).unwrap();
+        assert!(!trashed.exists() && !removed.exists());
     }
 }

@@ -7,7 +7,7 @@ mod real;
 mod test;
 
 use std::fs::Metadata;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -31,14 +31,49 @@ pub enum SystemError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The path is not one the port accepts; nothing was touched.
+    #[error("refusing {}: {reason}", path.display())]
+    Rejected { path: PathBuf, reason: &'static str },
 }
 
+/// Deleting, reading an entry without following it, and the clock.
+///
+/// Every path must be **absolute and free of `.` and `..` components**, the way a scan
+/// produces them; anything else is [`SystemError::Rejected`] and nothing is touched. The
+/// rule is not pedantry: the kernel resolves a trailing `..` before the syscall sees it,
+/// so `remove("/a/b/c/..")` would delete the contents of `/a/b` — siblings the caller
+/// never named — and report success.
 pub trait System: Send + Sync {
     /// Metadata that does not follow symlinks.
     fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError>;
     /// Moves the entry to the Trash. A symlink is moved as a link.
     fn move_to_trash(&self, path: &Path) -> Result<(), SystemError>;
     /// Deletes a file, a symlink or a whole directory tree, permanently.
+    ///
+    /// Not atomic: a tree can be deleted in part and then fail, so a caller that cares
+    /// about what survived has to look, not assume.
     fn remove(&self, path: &Path) -> Result<(), SystemError>;
+    /// The current time. In the port because the action log is timestamped and tests
+    /// compare those timestamps.
     fn now(&self) -> DateTime<Utc>;
+}
+
+/// Enforces the invariant documented on [`System`].
+fn check_path(path: &Path) -> Result<(), SystemError> {
+    let reject = |reason| {
+        Err(SystemError::Rejected {
+            path: path.to_path_buf(),
+            reason,
+        })
+    };
+    if !path.is_absolute() {
+        return reject("the path is not absolute");
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return reject("the path contains `.` or `..`");
+    }
+    Ok(())
 }
