@@ -67,19 +67,20 @@ fn build(tree: &Tree, id: NodeId, depth: usize, top: usize) -> ReportNode {
     }
 }
 
+/// Decimal units with one decimal above bytes: `999 B`, `1.0 KB`, `1.5 MB`.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.0;
+    let mut unit = 1;
+    // `{:.1}` shows 999.95 and above as `1000.0`, which belongs to the next unit.
+    while value >= 999.95 && unit < UNITS.len() - 1 {
         value /= 1000.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 #[cfg(test)]
@@ -156,5 +157,14 @@ mod tests {
         assert_eq!(human_bytes(1_536_000), "1.5 MB");
         assert_eq!(human_bytes(2_000_000_000_000), "2.0 TB");
         assert_eq!(human_bytes(u64::MAX), "18446.7 PB");
+    }
+
+    #[test]
+    fn human_bytes_steps_to_the_next_unit_instead_of_rounding_to_1000() {
+        assert_eq!(human_bytes(999_949), "999.9 KB");
+        assert_eq!(human_bytes(999_950), "1.0 MB");
+        assert_eq!(human_bytes(999_999), "1.0 MB");
+        assert_eq!(human_bytes(1_000_000), "1.0 MB");
+        assert_eq!(human_bytes(999_950_000_000), "1.0 TB");
     }
 }

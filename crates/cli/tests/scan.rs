@@ -99,6 +99,63 @@ fn scan_save_writes_a_snapshot_and_reports_growers_on_the_second_run() {
 }
 
 #[test]
+fn scan_save_with_an_unwritable_data_dir_still_reports_and_exits_with_1() {
+    let dir = fixture();
+    let data = tempfile::tempdir().unwrap();
+    let file = data.path().join("file");
+    fs::write(&file, b"").unwrap();
+    let out = bin()
+        .env("STORAGE_MONITOR_DATA_DIR", file.join("child"))
+        .args(["scan", dir.path().to_str().unwrap(), "--json", "--save"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: could not save the snapshot: "),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("error:"), "stderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["stats"]["files"], 3, "the report is still printed");
+    assert!(json["snapshot"].is_null());
+    assert!(json["topGrowers"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn scan_keys_a_symlinked_root_by_the_path_as_given() {
+    let dir = fixture();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("link");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    let out = bin()
+        .args([
+            "scan",
+            &format!("{}/", link.display()),
+            "--json",
+            "--depth",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json["root"],
+        link.to_str().unwrap(),
+        "not canonicalized, trailing slash dropped"
+    );
+    assert_eq!(
+        json["stats"]["files"], 3,
+        "the scanner follows a symlinked root"
+    );
+}
+
+#[test]
 fn scan_text_output_mentions_the_root_and_a_child() {
     let dir = fixture();
     let out = bin()
