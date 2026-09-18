@@ -201,6 +201,8 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
 
     let mut children = leaves;
     children.extend(subdirs);
+    // Drop the growth slack: the nested tree is the peak of the scan's memory.
+    children.shrink_to_fit();
     ctx.progress.add_dir(node.size);
     for child in &children {
         node.size += child.node.size;
