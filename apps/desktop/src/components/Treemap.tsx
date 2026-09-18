@@ -151,6 +151,18 @@ function buildOption(cells: Cell[], parentSize: number): TreemapOption {
         right: 0,
         bottom: 0,
         sort: 'desc',
+        // The root level paints the gaps between cells; keep it transparent so they
+        // show the page background in both colour schemes.
+        levels: [
+          {
+            itemStyle: {
+              color: 'transparent',
+              borderColor: 'transparent',
+              borderWidth: 0,
+              gapWidth: 2,
+            },
+          },
+        ],
         itemStyle: { borderWidth: 0, gapWidth: 2, borderRadius: 3 },
         label: {
           show: true,
