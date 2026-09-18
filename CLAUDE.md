@@ -54,6 +54,9 @@ just fmt        apply formatters
 just ci         lint + test + build-web + e2e; CI adds a macOS `tauri build` smoke
 ```
 
+CI runs clippy on the latest stable Rust. If the local toolchain is older (Homebrew
+Rust ignores `rust-toolchain.toml`), run `just clippy-ci` (Docker) before pushing.
+
 CLI: `cargo run -q -p storage-monitor-cli -- scan [ROOT] --json [--save]`
 (defaults: the home folder, `--depth 2`, `--top 20`, `--threshold` 10 MiB).
 Rust tests for a single crate: `cargo test -p storage-monitor-core`.

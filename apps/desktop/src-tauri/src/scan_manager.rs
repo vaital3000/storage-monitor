@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use storage_monitor_core::paths;
 use storage_monitor_core::scan::{ScanOptions, ScanProgress, ScanResult, scan};
-use storage_monitor_core::snapshot::{Delta, Snapshot, SnapshotStore, deltas, top_growers};
+use storage_monitor_core::snapshot::{
+    DEFAULT_FILE_THRESHOLD, DEFAULT_KEEP, Delta, Snapshot, SnapshotStore, deltas, top_growers,
+};
 
 use crate::views::{ScanState, ScanStatus};
 
 /// Files smaller than this are left out of snapshots.
-const SNAPSHOT_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
 /// Snapshots kept in the store, across all roots.
-const SNAPSHOTS_KEPT: usize = 10;
 /// Growers computed when a scan finishes; the `top_growers` command takes a prefix.
 pub const GROWERS_KEPT: usize = 50;
 /// Default interval of the `scan:progress` events.
@@ -254,11 +254,11 @@ impl Finished {
             eprintln!("cannot load the previous snapshot: {err}");
             None
         });
-        let current = Snapshot::from_result(&result, SNAPSHOT_FILE_THRESHOLD);
+        let current = Snapshot::from_result(&result, DEFAULT_FILE_THRESHOLD);
         if let Err(err) = store.save(&current) {
             eprintln!("cannot save the snapshot: {err}");
         }
-        if let Err(err) = store.prune(SNAPSHOTS_KEPT) {
+        if let Err(err) = store.prune(DEFAULT_KEEP) {
             eprintln!("cannot prune the snapshots: {err}");
         }
         let growers = previous

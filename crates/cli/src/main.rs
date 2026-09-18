@@ -46,7 +46,7 @@ enum Command {
         #[arg(long)]
         save: bool,
         /// Smallest file kept in the snapshot, in bytes
-        #[arg(long, default_value_t = 10 * 1024 * 1024)]
+        #[arg(long, default_value_t = storage_monitor_core::snapshot::DEFAULT_FILE_THRESHOLD)]
         threshold: u64,
     },
 }

@@ -12,7 +12,7 @@ use storage_monitor_core::disk::disk_usage;
 use storage_monitor_core::paths;
 use storage_monitor_core::scan::{NodeKind, ScanOptions, ScanProgress, ScanResult, scan};
 use storage_monitor_core::snapshot::{
-    Delta, Snapshot, SnapshotStore, StoreError, deltas, top_growers,
+    DEFAULT_KEEP, Delta, Snapshot, SnapshotStore, StoreError, deltas, top_growers,
 };
 
 use crate::quiet_on_broken_pipe;
@@ -23,7 +23,6 @@ const EXIT_CANCELLED: u8 = 130;
 /// Exit code when `--save` could not store the snapshot; the report is printed anyway.
 const EXIT_SAVE_FAILED: u8 = 1;
 /// Snapshots kept in the store, across all roots.
-const SNAPSHOTS_KEPT: usize = 10;
 /// Growers listed in the report.
 const GROWERS_REPORTED: usize = 20;
 /// Interval of the progress lines on stderr.
@@ -113,7 +112,7 @@ fn save_snapshot(result: &ScanResult, threshold: u64) -> Result<(PathBuf, Vec<De
     let previous = store.latest_for(&result.root)?;
     let current = Snapshot::from_result(result, threshold);
     let path = store.save(&current)?;
-    store.prune(SNAPSHOTS_KEPT)?;
+    store.prune(DEFAULT_KEEP)?;
     let growers = previous
         .map(|p| top_growers(&deltas(&p, &current), GROWERS_REPORTED))
         .unwrap_or_default();
