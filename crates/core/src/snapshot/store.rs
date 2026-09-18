@@ -89,7 +89,7 @@ impl SnapshotStore {
             meta.path = snap_path;
             metas.push(meta);
         }
-        metas.sort_by(|a, b| b.taken_at.cmp(&a.taken_at));
+        metas.sort_by_key(|meta| std::cmp::Reverse(meta.taken_at));
         Ok(metas)
     }
 

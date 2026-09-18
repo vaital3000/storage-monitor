@@ -83,7 +83,7 @@ fn children_are_sorted_by_size_descending() {
         .map(|id| tree.get(id).unwrap().size)
         .collect();
     let mut sorted = sizes.clone();
-    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    sorted.sort_unstable_by_key(|size| std::cmp::Reverse(*size));
     assert_eq!(sizes, sorted);
     assert_eq!(
         &*tree.get(tree.children(Tree::ROOT).start).unwrap().name,
