@@ -1,17 +1,22 @@
-//! The stages a deletion goes through. This one only decides: it reads the filesystem and
-//! writes nothing, so a preview can be built, shown and thrown away at will.
+//! The stages a deletion goes through. [`preview`] only decides: it reads the filesystem
+//! and writes nothing, so a preview can be built, shown and thrown away at will.
+//! [`execute`] is the other one, and the only code in the app that destroys anything.
 //!
 //! Every entry of the plan comes back, in its place, whether or not it survived the checks
 //! — the dialog lists what the user selected next to what will happen to each row, and a
-//! silently shortened list would be a dialog that lies about the selection.
+//! silently shortened list would be a dialog that lies about the selection. The outcome
+//! keeps that shape one stage further, where it becomes the action log.
 
 use std::path::PathBuf;
 
 use crate::scan::NodeKind;
 use crate::system::{System, SystemError};
 
-use super::guards::{Limits, drop_nested};
-use super::model::{BlockReason, EntryStatus, Plan, PlanEntry, Preview, PreviewEntry};
+use super::guards::{Checked, Limits, drop_nested};
+use super::model::{
+    BlockReason, EntryOutcome, EntryResult, EntryStatus, Mode, Outcome, Plan, PlanEntry, Preview,
+    PreviewEntry,
+};
 
 /// Checks a plan without touching anything. Every entry keeps its place in the list, so
 /// the UI can show blocked ones with their reason.
@@ -123,26 +128,147 @@ fn check_entry(entry: &PlanEntry, limits: &Limits, sys: &dyn System) -> Verdict 
             },
             judged: checked.judged,
         },
-        // The guard judged where the path points, without insisting anything is there.
-        Err(SystemError::Missing(_)) => blocked(checked.path, BlockReason::Missing),
+        Err(err) => blocked(checked.path, reason_for(&err)),
+    }
+}
+
+/// What the port's refusal to describe an entry means for that entry: the one mapping both
+/// stages use, so that a dialog and the log after it cannot blame different things for one
+/// entry that never changed in between.
+///
+/// About [`System::symlink_metadata`] only. A deletion that fails is [`EntryResult::Failed`]
+/// with the port's own message, not a reason from here.
+fn reason_for(err: &SystemError) -> BlockReason {
+    match err {
+        // The guards judged where the path points, without insisting anything is there.
+        SystemError::Missing(_) => BlockReason::Missing,
         // The port refuses a path that is not absolute and in normal form, and `check` is
         // what produces that form — so this is a bug on this side of the port, not a state
         // the user can do anything about. `Malformed` is at least the truth about the path;
         // `Unreadable` below means "grant Full Disk Access", which would be an instruction
         // to go and fix the wrong thing.
-        Err(SystemError::Rejected { .. }) => blocked(checked.path, BlockReason::Malformed),
+        SystemError::Rejected { .. } => BlockReason::Malformed,
         // Permissions that changed under us, a loop, a variant added later: whatever it is,
         // nobody can look at this entry, and that is not one to delete on a guess.
-        Err(_) => blocked(checked.path, BlockReason::Unreadable),
+        _ => BlockReason::Unreadable,
+    }
+}
+
+/// Runs a checked preview: the one function in the app that deletes anything.
+///
+/// Blocked entries are reported as skipped and never touched. A failure does not stop the
+/// rest of the batch — the entries are independent, and giving up halfway would leave the
+/// user with a list where nothing says which half ran.
+///
+/// The guards run again on every ready entry, not only the kind comparison of the design.
+/// [`Preview`] has public fields and derives `Deserialize`, so one can be built without ever
+/// having passed them; re-checking here means a forged preview buys nothing, and every
+/// deletion is guarded where it happens instead of by a promise made upstream. A path the
+/// guards now refuse comes back as `Skipped` with the reason they gave.
+///
+/// In [`Mode::Trash`] the freed bytes are what *will* be freed once the Trash is emptied
+/// (ADR 0003); the number is the same and only the wording in the UI differs.
+pub fn execute(preview: &Preview, limits: &Limits, sys: &dyn System) -> Outcome {
+    // One instant for the whole batch, read before the first deletion: the log timestamps
+    // an action, not an entry, and this is when the action began.
+    let at = sys.now();
+    let mut entries: Vec<EntryOutcome> = Vec::with_capacity(preview.entries.len());
+    let mut freed_bytes = 0u64;
+    // No nesting pass here, deliberately. `preview` has already blocked every entry another
+    // one contains, and running `drop_nested` again would mean carrying the judged forms
+    // through this stage too — the form that must never be deleted, next to the one that
+    // must, one stage further from the comment that says so. What a missing pass costs is
+    // bounded: the entries are checked one by one, so a forged preview holding both an
+    // ancestor and its descendant still deletes nothing the guards refuse. Whichever comes
+    // first is removed, and the other is then `Missing` — unless the descendant came first,
+    // in which case its bytes are counted inside its ancestor's as well. A number in that
+    // preview's own log, wrong only for a preview that was already forged.
+    for entry in &preview.entries {
+        let outcome = run_entry(entry, preview.mode, limits, sys);
+        if let EntryResult::Removed { bytes } = &outcome.result {
+            // Saturating like `preview`: a wrong total is not worth a panic, least of all in
+            // the middle of a batch that is already deleting.
+            freed_bytes = freed_bytes.saturating_add(*bytes);
+        }
+        entries.push(outcome);
+    }
+    Outcome {
+        entries,
+        freed_bytes,
+        at,
+    }
+}
+
+/// One entry through the last checks and, if it survives them, the port.
+///
+/// The kind reported is the preview's throughout, which for anything that gets deleted is
+/// the kind the disk just confirmed — the comparison below is what makes those two the same
+/// value. For a blocked entry it is whatever the preview carried, and for six of the eight
+/// block reasons that is the plan's unverified claim (see [`PreviewEntry::kind`]): an
+/// unverified kind travels on into the action log, deliberately, because a row that is drawn
+/// needs an icon and the result beside it says how much the kind is worth.
+fn run_entry(entry: &PreviewEntry, mode: Mode, limits: &Limits, sys: &dyn System) -> EntryOutcome {
+    let skipped = |path: PathBuf, reason| EntryOutcome {
+        path,
+        kind: entry.kind,
+        result: EntryResult::Skipped { reason },
+    };
+    // Reported where the user left it, with the reason they were shown. Not re-checked
+    // either: the guards know nothing about the batch, so `Nested` would come back as
+    // `Missing` once its ancestor was gone — the same row with the wrong explanation.
+    if let EntryStatus::Blocked(reason) = entry.status {
+        return skipped(entry.path.clone(), reason);
+    }
+    // `Checked::path`, never `Checked::judged` — the same rule as in `check_entry`, and this
+    // is the call site where breaking it destroys something. `judged` is the resolved form:
+    // for a symlink the link itself, deliberately, but for everything else the name the disk
+    // has rather than the one the caller wrote. Deleting by it compiles, type-checks, passes
+    // clippy and passes this suite everywhere a volume does not fold two spellings into one
+    // directory — which is to say everywhere except macOS, where this app runs. So the field
+    // is dropped here, at the one point that still knows why, and the rest of the function
+    // has no name for it to reach for.
+    let Checked { path, judged: _ } = match limits.check(&entry.path) {
+        Ok(checked) => checked,
+        Err(reason) => return skipped(entry.path.clone(), reason),
+    };
+    let meta = match sys.symlink_metadata(&path) {
+        Ok(meta) => meta,
+        // Nothing here closes the window between this answer and the deletion below: an
+        // entry that vanishes inside it comes back as `Failed`, because the port was asked
+        // and answered. Only one that was already gone is `Skipped`.
+        Err(err) => return skipped(path, reason_for(&err)),
+    };
+    // What the preview showed the user is what they confirmed. A file where the dialog said
+    // directory is not that, whoever swapped it and whyever.
+    if NodeKind::from_metadata(&meta) != entry.kind {
+        return skipped(path, BlockReason::KindChanged);
+    }
+    let attempt = match mode {
+        Mode::Trash => sys.move_to_trash(&path),
+        Mode::Permanent => sys.remove(&path),
+    };
+    EntryOutcome {
+        path,
+        kind: entry.kind,
+        result: match attempt {
+            // The size the plan carried and the dialog promised. Re-reading it would mean
+            // walking a subtree that is no longer there.
+            Ok(()) => EntryResult::Removed { bytes: entry.size },
+            // `remove` is not atomic: a tree can be part-deleted and then fail, and this
+            // reports 0 bytes for gigabytes that are really gone. A deliberate lower bound —
+            // measuring the partial progress would mean walking what is left of a tree that
+            // is still being torn down, and the rescan that follows a batch splices in
+            // whatever survived either way.
+            Err(err) => EntryResult::Failed {
+                message: err.to_string(),
+            },
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `Mode` is named by the tests but not by the code above them; Task 4's `execute`
-    // matches on it and can drop this line.
-    use crate::action::Mode;
     use crate::scan::NodeKind;
     use crate::system::TestSystem;
     use chrono::{DateTime, Utc};
@@ -215,6 +341,75 @@ mod tests {
 
         fn now(&self) -> DateTime<Utc> {
             Utc::now()
+        }
+    }
+
+    /// What a port was handed, and by which call.
+    ///
+    /// The two forms `Limits::check` returns name one entry, so a batch that deleted by the
+    /// wrong one leaves the same disk behind: on a case-insensitive volume `Data` and `data`
+    /// open one directory. What the port was asked is the only witness of which of the two
+    /// the engine chose.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Deletion {
+        Trashed(PathBuf),
+        Removed(PathBuf),
+    }
+
+    impl Deletion {
+        /// For the assertions `Path` equality is too generous for: it compares
+        /// component-wise and calls `/a/link/` equal to `/a/link`.
+        fn path(&self) -> &Path {
+            match self {
+                Self::Trashed(path) | Self::Removed(path) => path,
+            }
+        }
+    }
+
+    /// A [`TestSystem`] that writes every deletion down before performing it — before, so
+    /// that a path the port itself refuses is recorded as well.
+    struct Recording<'a> {
+        inner: &'a TestSystem,
+        done: Mutex<Vec<Deletion>>,
+    }
+
+    impl<'a> Recording<'a> {
+        fn new(inner: &'a TestSystem) -> Self {
+            Self {
+                inner,
+                done: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn done(&self) -> Vec<Deletion> {
+            self.done.lock().expect("an unpoisoned record").clone()
+        }
+
+        fn record(&self, deletion: Deletion) {
+            self.done
+                .lock()
+                .expect("an unpoisoned record")
+                .push(deletion);
+        }
+    }
+
+    impl System for Recording<'_> {
+        fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError> {
+            self.inner.symlink_metadata(path)
+        }
+
+        fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
+            self.record(Deletion::Trashed(path.to_path_buf()));
+            self.inner.move_to_trash(path)
+        }
+
+        fn remove(&self, path: &Path) -> Result<(), SystemError> {
+            self.record(Deletion::Removed(path.to_path_buf()));
+            self.inner.remove(path)
+        }
+
+        fn now(&self) -> DateTime<Utc> {
+            self.inner.now()
         }
     }
 
@@ -675,5 +870,411 @@ mod tests {
              were read, and a `Nested` entry keeps what the disk said"
         );
         assert_eq!(checked.total_bytes, 100);
+    }
+
+    // From here on `execute`: the six of the plan first, then the ones that are not in it.
+
+    #[test]
+    fn trash_mode_moves_the_entries_to_the_trash() {
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"xxx").unwrap();
+        let p = plan(&sys, &["a.bin"], Mode::Trash);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let outcome = execute(&preview(&p, &limits, &sys), &limits, &sys);
+        assert_eq!(outcome.freed_bytes, 10);
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Removed { bytes: 10 }
+        ));
+        assert!(fs::symlink_metadata(sys.trash_dir().join("a.bin")).is_ok());
+        assert_eq!(outcome.at, sys.now());
+    }
+
+    #[test]
+    fn permanent_mode_deletes_without_the_trash() {
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"xxx").unwrap();
+        let p = plan(&sys, &["a.bin"], Mode::Permanent);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        execute(&preview(&p, &limits, &sys), &limits, &sys);
+        assert!(fs::symlink_metadata(sys.root().join("a.bin")).is_err());
+        assert_eq!(fs::read_dir(sys.trash_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn one_failing_entry_does_not_stop_the_batch() {
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        fs::write(sys.root().join("b.bin"), b"x").unwrap();
+        let p = plan(&sys, &["a.bin", "b.bin"], Mode::Permanent);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&p, &limits, &sys);
+        fs::remove_file(sys.root().join("a.bin")).unwrap(); // vanishes between the stages
+        let outcome = execute(&checked, &limits, &sys);
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::Missing
+            }
+        ));
+        assert!(matches!(
+            outcome.entries[1].result,
+            EntryResult::Removed { .. }
+        ));
+        assert_eq!(outcome.freed_bytes, 10, "only what was really deleted");
+    }
+
+    #[test]
+    fn an_entry_whose_kind_changed_is_skipped() {
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        let p = plan(&sys, &["a.bin"], Mode::Permanent);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&p, &limits, &sys);
+        fs::remove_file(sys.root().join("a.bin")).unwrap();
+        fs::create_dir(sys.root().join("a.bin")).unwrap(); // same name, now a directory
+        let outcome = execute(&checked, &limits, &sys);
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::KindChanged
+            }
+        ));
+        assert!(
+            sys.root().join("a.bin").is_dir(),
+            "the replacement is left alone"
+        );
+    }
+
+    #[test]
+    fn a_failing_deletion_is_reported_as_failed_not_skipped() {
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        fs::write(sys.root().join("b.bin"), b"x").unwrap();
+        let p = plan(&sys, &["a.bin", "b.bin"], Mode::Trash);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&p, &limits, &sys);
+        sys.fail_next(&sys.root().join("a.bin"));
+        let outcome = execute(&checked, &limits, &sys);
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Failed { .. }
+        ));
+        assert!(matches!(
+            outcome.entries[1].result,
+            EntryResult::Removed { .. }
+        ));
+        assert!(
+            fs::symlink_metadata(sys.root().join("a.bin")).is_ok(),
+            "a failure leaves the entry alone"
+        );
+        assert_eq!(outcome.freed_bytes, 10);
+    }
+
+    #[test]
+    fn blocked_entries_are_reported_but_never_touched() {
+        let sys = TestSystem::new();
+        let p = plan(&sys, &["gone.bin"], Mode::Trash);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let outcome = execute(&preview(&p, &limits, &sys), &limits, &sys);
+        assert_eq!(outcome.entries.len(), 1);
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::Missing
+            }
+        ));
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    // The rest are not in the plan.
+
+    #[test]
+    fn a_forged_preview_is_still_judged_by_the_guards() {
+        // `Preview` has public fields and derives `Deserialize`, so one can be built without
+        // ever having passed them. Every row here claims to be ready, and every one of them
+        // is a path the guards refuse.
+        let sys = TestSystem::new();
+        let denied = sys.root().join("denied");
+        fs::create_dir(&denied).unwrap();
+        let below_denied = denied.join("keep.bin");
+        fs::write(&below_denied, b"keep").unwrap();
+        // Outside the scan root but inside the temporary tree, so it is this code that has
+        // to refuse it: `TestSystem` would panic instead of deleting anything further out,
+        // and a test that passed because the double screamed would prove nothing.
+        let outside_root = sys.trash_dir().join("keep.bin");
+        fs::write(&outside_root, b"keep").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![denied.clone()]);
+        let forged = Preview {
+            entries: vec![
+                PreviewEntry {
+                    path: below_denied.clone(),
+                    kind: NodeKind::File,
+                    size: 10,
+                    status: EntryStatus::Ready,
+                },
+                PreviewEntry {
+                    path: outside_root.clone(),
+                    kind: NodeKind::File,
+                    size: 10,
+                    status: EntryStatus::Ready,
+                },
+                PreviewEntry {
+                    path: sys.root().to_path_buf(),
+                    kind: NodeKind::Dir,
+                    size: 10,
+                    status: EntryStatus::Ready,
+                },
+            ],
+            total_bytes: 30,
+            mode: Mode::Permanent,
+        };
+        let outcome = execute(&forged, &limits, &sys);
+        let results: Vec<EntryResult> = outcome.entries.iter().map(|e| e.result.clone()).collect();
+        assert_eq!(
+            results,
+            vec![
+                EntryResult::Skipped {
+                    reason: BlockReason::Denylisted
+                },
+                EntryResult::Skipped {
+                    reason: BlockReason::OutsideRoots
+                },
+                EntryResult::Skipped {
+                    reason: BlockReason::IsRoot
+                },
+            ],
+            "the reason the guards gave, not one of `execute`'s own"
+        );
+        assert_eq!(fs::read(&below_denied).unwrap(), b"keep");
+        assert_eq!(fs::read(&outside_root).unwrap(), b"keep");
+        assert!(fs::symlink_metadata(sys.root()).unwrap().is_dir());
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    #[test]
+    fn an_entry_the_preview_blocked_is_left_where_it_is() {
+        // The plan's blocked entry is one that is not there at all, which a batch that
+        // ignored the statuses would also leave alone — there is nothing to delete. This
+        // one is on disk and deletable-looking, and the status is all that stands in the
+        // way. The claimed kind is wrong on purpose, so the kinds below say where each
+        // value came from instead of agreeing by luck.
+        let sys = TestSystem::new();
+        let denied = sys.root().join("denied");
+        fs::create_dir(&denied).unwrap();
+        let keep = denied.join("keep.bin");
+        fs::write(&keep, b"keep").unwrap();
+        fs::write(sys.root().join("go.bin"), b"x").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![denied]);
+        let p = Plan {
+            entries: vec![
+                entry(keep.clone(), NodeKind::Symlink, 10),
+                entry(sys.root().join("go.bin"), NodeKind::File, 10),
+            ],
+            mode: Mode::Permanent,
+        };
+        let outcome = execute(&preview(&p, &limits, &sys), &limits, &sys);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::Denylisted
+            }
+        );
+        assert_eq!(fs::read(&keep).unwrap(), b"keep", "still there, untouched");
+        assert!(matches!(
+            outcome.entries[1].result,
+            EntryResult::Removed { bytes: 10 }
+        ));
+        assert!(fs::symlink_metadata(sys.root().join("go.bin")).is_err());
+        assert_eq!(outcome.freed_bytes, 10);
+        let kinds: Vec<NodeKind> = outcome.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![NodeKind::Symlink, NodeKind::File],
+            "a blocked row carries the plan's unverified claim on into the log; a deleted \
+             one carries what the disk said"
+        );
+    }
+
+    #[test]
+    fn a_row_skipped_at_execution_time_keeps_the_kind_the_dialog_showed() {
+        // The entry is a directory by the time the batch runs and the preview saw a file.
+        // Which of the two the outcome names is the difference between "the file you chose
+        // is not a file any more" and a line about a directory the user never selected —
+        // and this is the value the action log keeps.
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&plan(&sys, &["a.bin"], Mode::Trash), &limits, &sys);
+        assert_eq!(checked.entries[0].kind, NodeKind::File);
+        fs::remove_file(sys.root().join("a.bin")).unwrap();
+        fs::create_dir(sys.root().join("a.bin")).unwrap();
+        let outcome = execute(&checked, &limits, &sys);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::KindChanged
+            }
+        );
+        assert_eq!(
+            outcome.entries[0].kind,
+            NodeKind::File,
+            "what the preview showed, not what took its place"
+        );
+        assert_eq!(
+            fs::read_dir(sys.trash_dir()).unwrap().count(),
+            0,
+            "and what took its place is left where it is"
+        );
+    }
+
+    #[test]
+    fn a_nested_entry_is_skipped_for_the_reason_the_preview_gave() {
+        // `execute` runs the guards again and the guards know nothing about the batch, so an
+        // implementation that went by the paths and ignored the statuses would delete the
+        // ancestor and report the descendant as `Missing`: the same row with the wrong
+        // explanation, and a log that says an entry vanished when this app took it.
+        //
+        // Which is also why `execute` has no nesting pass of its own. The preview blocked
+        // the descendant already, and for a forged preview the worst a missing pass can do
+        // is count an ancestor's bytes twice in its own log — while a second `drop_nested`
+        // would mean carrying the judged forms through `execute` as well, where deleting one
+        // by mistake is a symlink's target instead of the symlink.
+        let sys = TestSystem::new();
+        fs::create_dir_all(sys.root().join("dir/inner")).unwrap();
+        let p = Plan {
+            entries: vec![
+                entry(sys.root().join("dir"), NodeKind::Dir, 100),
+                entry(sys.root().join("dir/inner"), NodeKind::Dir, 40),
+            ],
+            mode: Mode::Trash,
+        };
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let outcome = execute(&preview(&p, &limits, &sys), &limits, &sys);
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Removed { bytes: 100 }
+        ));
+        assert_eq!(
+            outcome.entries[1].result,
+            EntryResult::Skipped {
+                reason: BlockReason::Nested
+            }
+        );
+        assert_eq!(outcome.freed_bytes, 100, "one directory, counted once");
+        assert!(
+            fs::symlink_metadata(sys.root().join("dir")).is_err(),
+            "the ancestor went, and the descendant with it"
+        );
+    }
+
+    #[test]
+    fn a_symlink_is_deleted_as_a_link_in_the_form_the_port_demands() {
+        let sys = TestSystem::new();
+        let target = sys.root().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside.bin"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, sys.root().join("link")).unwrap();
+        // The caller wrote the separator and the guards stripped it. The port refuses
+        // anything else, but that is the second line of defence, not the assertion here:
+        // `remove("<root>/link/")` deletes the directory behind the link.
+        let p = plan(&sys, &["link/"], Mode::Permanent);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let port = Recording::new(&sys);
+        let outcome = execute(&preview(&p, &limits, &port), &limits, &port);
+        let done = port.done();
+        assert_eq!(done, vec![Deletion::Removed(sys.root().join("link"))]);
+        assert_eq!(
+            done[0].path().as_os_str(),
+            sys.root().join("link").as_os_str(),
+            "byte for byte: `Path` compares component-wise and calls `<root>/link/` equal \
+             to `<root>/link`"
+        );
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Removed { bytes: 10 }
+        ));
+        assert_eq!(outcome.entries[0].kind, NodeKind::Symlink);
+        assert!(fs::symlink_metadata(sys.root().join("link")).is_err());
+        assert_eq!(
+            fs::read(target.join("inside.bin")).unwrap(),
+            b"keep",
+            "the target of the link is untouched"
+        );
+    }
+
+    /// One directory on disk, deleted under the name the caller wrote. `Checked` carries
+    /// that name and, as `judged`, the one the disk has; on a volume where both open that
+    /// one directory a deletion by either leaves the same disk behind, so what the port was
+    /// handed is the only witness of which form the engine used. A symlink cannot stand in
+    /// for this — the guards judge one as written, which makes its two forms identical.
+    fn assert_the_port_is_asked_for(on_disk: &str, asked_as: &str) {
+        let sys = TestSystem::new();
+        fs::create_dir(sys.root().join(on_disk)).unwrap();
+        let asked = sys.root().join(asked_as);
+        if !asked.is_dir() {
+            // Case- and normalization-sensitive: the two names are two directories, the two
+            // forms of a `Checked` cannot differ, and asserting the duller outcome would let
+            // a green run read as coverage it does not have. CI runs these on Linux too.
+            eprintln!("skipped: {asked_as} is its own name on this volume");
+            return;
+        }
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let p = Plan {
+            entries: vec![entry(asked.clone(), NodeKind::Dir, 10)],
+            mode: Mode::Trash,
+        };
+        let port = Recording::new(&sys);
+        let outcome = execute(&preview(&p, &limits, &port), &limits, &port);
+        assert_eq!(
+            port.done(),
+            vec![Deletion::Trashed(asked.clone())],
+            "the spelling the caller wrote, not the one the rules judged"
+        );
+        assert!(matches!(
+            outcome.entries[0].result,
+            EntryResult::Removed { .. }
+        ));
+        assert_eq!(
+            outcome.entries[0].path, asked,
+            "and the log names what was handed to the port"
+        );
+        assert!(
+            fs::symlink_metadata(&asked).is_err(),
+            "the directory really left, under whichever of its names"
+        );
+    }
+
+    #[test]
+    fn the_port_is_asked_for_the_spelling_the_caller_wrote() {
+        assert_the_port_is_asked_for("Data", "Data");
+        assert_the_port_is_asked_for("Data", "data");
+        // No user error at all: the same name typed on macOS arrives in NFC from one source
+        // and in NFD from another, and APFS treats them as one directory.
+        assert_the_port_is_asked_for("caf\u{e9}", "cafe\u{301}");
+        assert_the_port_is_asked_for("cafe\u{301}", "caf\u{e9}");
+    }
+
+    #[test]
+    fn a_permanent_deletion_that_fails_keeps_the_entry_and_says_why() {
+        // The plan's failure test runs in `Trash` mode; the other call has to report its
+        // error too, and the message is what the user is shown.
+        let sys = TestSystem::new();
+        let file = sys.root().join("a.bin");
+        fs::write(&file, b"x").unwrap();
+        let p = plan(&sys, &["a.bin"], Mode::Permanent);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&p, &limits, &sys);
+        sys.fail_next(&file);
+        let outcome = execute(&checked, &limits, &sys);
+        let EntryResult::Failed { message } = &outcome.entries[0].result else {
+            panic!("expected a failure, got {:?}", outcome.entries[0].result);
+        };
+        assert!(
+            message.contains(&file.display().to_string()),
+            "the message names the entry, got {message:?}"
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"x", "and nothing was deleted");
+        assert_eq!(outcome.freed_bytes, 0);
     }
 }
