@@ -1968,3 +1968,56 @@ git commit -m "test(desktop): Explorer e2e with drill-down, deltas and screensho
 6. release-please opens `chore(main): release 0.2.0` (the `feat` commit bumps minor). Close/reopen it for CI, verify the diff (8 files), merge, watch `Release`, then download and check the assets like in phase 0; run the released app once on this Mac and scan the home folder for real; note the scan time and any errors in the plan's Outcome section.
 
 Exit criteria: scanning the home folder from the app shows a treemap and table with deltas on the second run; `storage-monitor scan --json --save` works from a terminal; `v0.2.0` assets are on GitHub.
+
+---
+
+## Outcome (2026-09-18)
+
+Phase 1 shipped as [`v0.2.0`](https://github.com/vaital3000/storage-monitor/releases/tag/v0.2.0)
+the day after the plan was written: PR #9 (26 commits, squash-merged) and the
+release PR #10. `release.yml` attached the universal `.dmg`, the CLI tarball and
+`checksums.txt`; all three were downloaded and verified (checksums, ad-hoc
+signature, `x86_64 arm64`, version 0.2.0).
+
+Real data, released CLI on the maintainer's Mac (14 threads): 3.71M files,
+583k directories, 323.5 GB allocated, 133 unreadable directories, 41,851 hard
+links deduplicated, 24.8 s wall, 1.48 GB peak RSS with `--save`. The second
+scan listed real growth (OrbStack data +3.4 GB, this project's debug build
++1.9 GB). The Explorer was verified in the browser (mock mode) and through
+nine Playwright tests; the released app was launched on the real home folder.
+
+Deviations from the plan text, all driven by reviews and folded into the code:
+
+- Core: `Node` is a 64 B compact layout (`Box<str>` name, `u32` file count,
+  private parent/child fields, contiguous children via BFS flatten, errors in a
+  side table); `tree.children(id)` is a `Range<NodeId>`, `tree.error(id)`,
+  `tree.parent(id)`. Hard links are attributed after flatten to the smallest
+  path (the plan's first-seen rule was non-deterministic and produced phantom
+  deltas). A dedicated rayon pool with 64 MiB worker stacks. The root is
+  normalized with `components()` and followed if it is a symlink; excludes were
+  already component-compared. `logical_size` is deduplicated like `size`.
+- Snapshots: entries in depth-first order (19% smaller files), atomic
+  temp+rename writes, tolerant `list()`, `prune()` also removes damaged,
+  orphan and tmp files, `format` in the sidecar, `latest_for(root)`,
+  `CodecError::Postcard`, shared `DEFAULT_KEEP` / `DEFAULT_FILE_THRESHOLD`.
+- CLI: `resolve_root` = absolute + component normalization (no canonicalize);
+  `park_timeout` ticker; `human_bytes` steps at 999.95; `--save` store
+  failures print the report plus a warning and exit 1; exit 130 for cancelled.
+- Desktop: `StatusEmitter` trait (events emitted under the manager lock, so
+  no progress can follow `scan:done`), `previous_sizes` built off-lock,
+  `with_snapshots_dir` for tests, cancelled scans not persisted, growers capped
+  at 50, capability `opener:allow-reveal-item-in-dir` instead of
+  `opener:default`.
+- Frontend: `generation` from a module-level counter, `retry: false` via the
+  QueryClient, disabled future sections, a third `partial` marker for
+  "N entries could not be read", `text-muted` utility for dark mode, darker
+  treemap ramps with outlined labels, transparent treemap gaps, dynamic import
+  of the mock in `main.tsx`, `window.__STORAGE_MONITOR_MOCK__` for Playwright,
+  `fixUnlisten` shim for an `@tauri-apps/api` mock bug.
+- Process: CI's stable Rust (1.98) flagged `unnecessary_sort_by` that the local
+  Homebrew 1.94 did not; `just clippy-ci` (Docker) now reproduces CI's clippy.
+
+Follow-ups recorded for later phases: firmlinks (`/Users`, `/Applications`)
+are treated as another volume when scanning `/` (relevant once roots are
+configurable); "Reveal in Finder" failures are only logged; the `style` commit
+type is not in the allowed list; `dirs` 6 and 7 both compile in.
