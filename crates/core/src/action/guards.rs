@@ -30,6 +30,14 @@ pub struct Checked {
     /// or one name in NFC and in NFD, are a single directory on a stock macOS volume and
     /// two different [`Path`]s: a batch that compared [`Self::path`] would promise their
     /// bytes twice and then fail to delete whichever came second.
+    ///
+    /// The symlink exception carries that gap with it, deliberately: two spellings of one
+    /// *symlink* resolve to nothing and so are not collapsed either. Both stay ready, and
+    /// once the first is gone the second is skipped as missing — while `total_bytes` does
+    /// not move, because the size a scan records for a symlink is its own allocated blocks,
+    /// which is 0. Resolving them instead would hand a link the identity of its target, and
+    /// selecting both would then block a deletion the user really did ask for. A cosmetic
+    /// row is the cheaper of the two mistakes.
     pub judged: PathBuf,
 }
 

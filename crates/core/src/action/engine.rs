@@ -104,6 +104,11 @@ fn check_entry(entry: &PlanEntry, limits: &Limits, sys: &dyn System) -> Verdict 
         // Without a normalized path the only honest thing to show is what was asked for.
         Err(reason) => return blocked(entry.path.clone(), reason),
     };
+    // `checked.path`, never `checked.judged`. Nothing enforces that: the two are both
+    // absolute, both in normal form, and name the same inode, so the substitution compiles,
+    // passes clippy and passes every test here — only a staged race could tell them apart.
+    // The reason is that the port must be asked about the form that will be deleted, so the
+    // kind it reports is the kind the re-validation before the deletion compares against.
     match sys.symlink_metadata(&checked.path) {
         Ok(meta) => Verdict::Ready {
             entry: PreviewEntry {
@@ -523,7 +528,14 @@ mod tests {
         let real = sys.root().join(on_disk);
         fs::create_dir(&real).unwrap();
         let aliased = sys.root().join(alias);
-        let one_directory = aliased.is_dir();
+        if !aliased.is_dir() {
+            // A case- and normalization-sensitive volume: two names, two directories, and
+            // nothing here for the rule to do. Asserting the duller outcome instead would
+            // let a green run on such a volume read as coverage it does not have — and CI
+            // runs the core tests on Linux as well as on macOS.
+            eprintln!("skipped: {alias} is its own name on this volume");
+            return;
+        }
         let p = Plan {
             entries: vec![
                 PlanEntry {
@@ -541,22 +553,11 @@ mod tests {
         };
         let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
         assert_eq!(checked.entries[0].status, EntryStatus::Ready);
-        if one_directory {
-            assert_eq!(
-                checked.entries[1].status,
-                EntryStatus::Blocked(BlockReason::Nested),
-                "{alias} opens the directory created as {on_disk} on this volume"
-            );
-        } else {
-            // A case- and normalization-sensitive volume: two names, and the second names
-            // nothing. The rule under test has nothing to do here, and the total is right
-            // for the duller reason.
-            assert_eq!(
-                checked.entries[1].status,
-                EntryStatus::Blocked(BlockReason::Missing),
-                "{alias} is its own name on this volume"
-            );
-        }
+        assert_eq!(
+            checked.entries[1].status,
+            EntryStatus::Blocked(BlockReason::Nested),
+            "{alias} opens the directory created as {on_disk} on this volume"
+        );
         assert_eq!(
             checked.total_bytes, 100,
             "one directory on disk, promised once"
