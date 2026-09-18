@@ -261,7 +261,9 @@ The `trash::macos` import and the `set_delete_method` call both need the `#[cfg(
 testing = ["dep:tempfile"]
 ```
 
-and move `tempfile` from `[dev-dependencies]` to an optional `[dependencies]` entry.
+and add `tempfile` as an optional `[dependencies]` entry. Keep the `[dev-dependencies]` one as
+well: `crates/core/tests/walker.rs` needs it with the feature off, and dropping it breaks
+`cargo test` with `unresolved import 'tempfile'`.
 
 **Step 6: Run the tests**
 
