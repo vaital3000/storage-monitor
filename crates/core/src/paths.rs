@@ -26,6 +26,15 @@ pub(crate) fn snapshots_dir_in(data_dir: &Path) -> PathBuf {
     data_dir.join("snapshots")
 }
 
+/// The append-only log of everything the app deleted.
+pub fn actions_log() -> PathBuf {
+    actions_log_in(&data_dir())
+}
+
+pub(crate) fn actions_log_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("actions.jsonl")
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
@@ -46,6 +55,15 @@ mod tests {
         assert_eq!(
             snapshots_dir_in(&dir),
             std::path::PathBuf::from("/tmp/sm-test-data/snapshots")
+        );
+    }
+
+    #[test]
+    fn the_actions_log_is_one_file_inside_the_data_dir() {
+        let dir = with_data_dir_override(Some("/tmp/sm-test-data"));
+        assert_eq!(
+            actions_log_in(&dir),
+            std::path::PathBuf::from("/tmp/sm-test-data/actions.jsonl")
         );
     }
 }
