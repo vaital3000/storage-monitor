@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod disk;
+pub mod paths;
 pub mod scan;
 pub mod snapshot;
 
