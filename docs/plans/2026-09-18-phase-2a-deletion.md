@@ -864,7 +864,7 @@ Several things follow from `Outcome` being the only input:
 - `append` calls `sync_all` before returning, so `Ok` means the bytes reached the disk rather than the kernel. One batch is one user gesture, so the cost is imperceptible, and it turns a full volume from "loses a record" into "reports an error".
 - The file is created `0o600`: it names every path the user has ever deleted.
 - **Every field added to `LogEntry` from here on carries `#[serde(default)]`.** The derived `Deserialize` requires every field, so adding one without it makes the whole existing history vanish from the Activity screen — no error, no count, just an empty list over a file full of records.
-- `tail` returns the entries **and how many lines it had to drop**, so the screen can say "3 damaged entries hidden" instead of quietly showing fewer rows than the user remembers deleting.
+- `tail` returns a `LogTail` — the entries **and how many lines it had to drop** — so the screen can say "3 damaged entries hidden" instead of quietly showing fewer rows than the user remembers deleting.
 - There is no batch identity on a line, deliberately: nothing in 2a groups rows, and the `serde(default)` rule above is what makes adding one later cheap rather than destructive. The line is the unit.
 
 **Step 4: Run the tests**
@@ -1244,7 +1244,7 @@ Run: `cargo test -p storage-monitor-desktop activity`
 
 ```rust
 #[tauri::command]
-pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Tail
+pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> LogTail
 ```
 
 Default limit 100. A read error returns an empty list and prints to stderr: the Activity screen must never be a dead end because a log line was damaged.
