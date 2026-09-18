@@ -128,7 +128,7 @@ fn wire_name(reason: BlockReason) -> Option<String> {
 /// What [`ActionLog::tail`] found at the end of the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Tail {
+pub struct LogTail {
     /// Newest first.
     pub entries: Vec<LogEntry>,
     /// How many lines of the stretch that was read could not be parsed, and are therefore
@@ -200,13 +200,19 @@ impl ActionLog {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.path)?;
-        if ends_mid_line(&mut file)? {
+        // Read access is wanted only for the end-of-file check. When it cannot be had — a
+        // mode the user set by hand — the file is opened append-only and the batch
+        // separates itself unconditionally: that form is equally correct, and what it costs
+        // is one blank line in a file almost nobody has. Failing here would cost the record
+        // of a deletion that has already happened, which is what this module exists for.
+        let (mut file, separate) = match open(&self.path, true) {
+            Ok(mut file) => {
+                let separate = ends_mid_line(&mut file);
+                (file, separate)
+            }
+            Err(_) => (open(&self.path, false)?, true),
+        };
+        if separate {
             lines.insert(0, '\n');
         }
         // One write for the whole batch: what keeps it together in the file.
@@ -222,17 +228,17 @@ impl ActionLog {
     /// damage. `damaged` counts only as far back as the read went, which is as far as
     /// `limit` entries reach. A file that is not there reads as nothing at all; any other
     /// error that stops the read is returned as the error it was.
-    pub fn tail(&self, limit: usize) -> io::Result<Tail> {
+    pub fn tail(&self, limit: usize) -> io::Result<LogTail> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Tail::default()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(LogTail::default()),
             Err(err) => return Err(err),
         };
         // Lossy rather than `read_to_string`: a write torn in the middle of a multi-byte
         // character would otherwise cost the whole read instead of one line. Borrowed, and
         // so free, for every file this writes itself.
         let text = String::from_utf8_lossy(&bytes);
-        let mut tail = Tail::default();
+        let mut tail = LogTail::default();
         for line in text.lines().rev() {
             if tail.entries.len() == limit {
                 break;
@@ -249,18 +255,44 @@ impl ActionLog {
     }
 }
 
+/// Opens the log for appending, creating it `0o600` — it names every path the user has ever
+/// deleted. `readable` also asks for the read access [`ends_mid_line`] needs; a mode only
+/// applies to a file this call creates, so one the user has chmod-ed keeps what they gave it.
+fn open(path: &Path, readable: bool) -> io::Result<File> {
+    OpenOptions::new()
+        .read(readable)
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
 /// Whether the file ends in the middle of a line, which is what a write cut short leaves
 /// behind. Asked through the handle that is about to append, so it describes the file as it
 /// is now; under `O_APPEND` that answer can only go stale in the harmless direction, since
 /// another writer can only add whole batches and the cost is one blank line.
-fn ends_mid_line(file: &mut File) -> io::Result<bool> {
+///
+/// An error — the length cannot be read, the byte cannot be — answers `true` for the same
+/// reason [`ActionLog::append`] falls back to opening the file append-only: a separator
+/// nobody needed is nothing, and a batch that does not reach the file is a deletion nobody
+/// can see.
+fn ends_mid_line(file: &mut File) -> bool {
+    match last_byte(file) {
+        Ok(Some(byte)) => byte != b'\n',
+        // Empty: there is no line to continue.
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+fn last_byte(file: &mut File) -> io::Result<Option<u8>> {
     if file.metadata()?.len() == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     file.seek(SeekFrom::End(-1))?;
     let mut last = [0u8; 1];
     file.read_exact(&mut last)?;
-    Ok(last[0] != b'\n')
+    Ok(Some(last[0]))
 }
 
 #[cfg(test)]
@@ -601,6 +633,11 @@ mod tests {
             "/h/written-second",
             "and the limit keeps the end of the file, not the latest `at`"
         );
+        // A choice, not an accident: prefixing the separator unconditionally on a non-empty
+        // file is equally correct — the blank line it leaves is skipped as a separator, not
+        // counted as damage — and `append` falls back to exactly that when it cannot read
+        // the file. This pins the other form, which keeps the file clean for a person
+        // reading it by hand. Flip this one assertion the day that trade looks wrong.
         assert_eq!(
             raw_lines(&path).len(),
             2,
@@ -810,6 +847,66 @@ mod tests {
         .unwrap();
         assert!(path.is_file());
         assert_eq!(log.tail(10).unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_read_back_is_still_appended_to() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions.jsonl");
+        let log = ActionLog::new(path.clone());
+        log.append(&batch(
+            Mode::Trash,
+            chrono::Utc::now(),
+            vec![outcome("/h/before", 1)],
+        ))
+        .unwrap();
+        let torn = raw_lines(&path).pop().unwrap();
+        append_raw(&path, &torn.as_bytes()[..torn.len() / 2]);
+        // A mode the user set by hand: the end-of-file check cannot be made at all. The
+        // deletion has already happened, so the batch has to reach the file anyway.
+        // (Running as root — the Linux CI container — the read simply succeeds and the
+        // same result comes out of the normal path.)
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        log.append(&batch(
+            Mode::Trash,
+            chrono::Utc::now(),
+            vec![outcome("/h/a", 1), outcome("/h/b", 2)],
+        ))
+        .expect("a log that cannot be read is still a log that must be written");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let read = log.tail(10).unwrap();
+        assert_eq!(
+            read.entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/h/b", "/h/a", "/h/before"],
+            "both new entries, and the torn line took nothing with it"
+        );
+        assert_eq!(read.damaged, 1);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_opened_at_all_is_an_error_and_not_a_shrug() {
+        let dir = tempfile::tempdir().unwrap();
+        // A path that is a directory: every way of opening it fails, for root as well as
+        // for anyone else, so this holds on the CI container too. The fallback that keeps
+        // an unreadable log writable must not turn this into a quiet `Ok`.
+        let log = ActionLog::new(dir.path().to_path_buf());
+        log.append(&batch(
+            Mode::Trash,
+            chrono::Utc::now(),
+            vec![outcome("/h/a", 1)],
+        ))
+        .expect_err("a deletion that could not be recorded has to say so");
+        assert!(
+            log.tail(10).is_err(),
+            "and a read that failed is not an empty log"
+        );
     }
 
     #[test]
