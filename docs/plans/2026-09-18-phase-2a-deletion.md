@@ -554,7 +554,7 @@ Expected: compile errors, `preview` is missing.
 pub fn preview(plan: &Plan, limits: &Limits, sys: &dyn System) -> Preview
 ```
 
-For each entry: run `check`; then `sys.symlink_metadata` (a `Missing` error becomes `Blocked(Missing)`) and record the kind the disk reports. Then apply `drop_nested` over the normalized paths of the entries that are still `Ready`, blocking the descendants with `Nested`. Sum `size` over `Ready` entries into `total_bytes`.
+For each entry: run `check`; then `sys.symlink_metadata` (a `Missing` error becomes `Blocked(Missing)`) and record the kind the disk reports, through `NodeKind::from_metadata` — the same classification the walker uses, so a socket or a fifo is `Other` here as well. Rolling a private `if is_dir { Dir } else { File }` instead would make every such entry fail re-validation with `KindChanged` forever. Then apply `drop_nested` over the normalized paths of the entries that are still `Ready`, blocking the descendants with `Nested`. Sum `size` over `Ready` entries into `total_bytes`.
 
 **Step 4: Run the tests**
 
@@ -632,6 +632,22 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
     }
 
     #[test]
+    fn a_failing_deletion_is_reported_as_failed_not_skipped() {
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        fs::write(sys.root().join("b.bin"), b"x").unwrap();
+        let p = plan(&sys, &["a.bin", "b.bin"], Mode::Trash);
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&p, &limits, &sys);
+        sys.fail_next(&sys.root().join("a.bin"));
+        let outcome = execute(&checked, &sys);
+        assert!(matches!(outcome.entries[0].result, EntryResult::Failed(_)));
+        assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
+        assert!(sys.root().join("a.bin").exists(), "a failure leaves the entry alone");
+        assert_eq!(outcome.freed_bytes, 10);
+    }
+
+    #[test]
     fn blocked_entries_are_reported_but_never_touched() {
         let sys = TestSystem::new();
         let p = plan(&sys, &["gone.bin"], Mode::Trash);
@@ -657,12 +673,14 @@ Expected: compile error, `execute` is missing.
 pub fn execute(preview: &Preview, sys: &dyn System) -> Outcome
 ```
 
-Per entry: `Blocked(reason)` → `Skipped(reason)`. `Ready` → re-read `symlink_metadata` (missing → `Skipped(Missing)`), compare the kind with the preview's (different → `Skipped(KindChanged)`), then `move_to_trash` or `remove` by mode; an error becomes `Failed(message)`. `freed_bytes` sums the `Removed` entries. `at` comes from `sys.now()`.
+Per entry: `Blocked(reason)` → `Skipped(reason)`. `Ready` → re-read `symlink_metadata` (missing → `Skipped(Missing)`), compare `NodeKind::from_metadata` with the preview's kind (different → `Skipped(KindChanged)`), then `move_to_trash` or `remove` by mode; an error becomes `Failed(message)`. `freed_bytes` sums the `Removed` entries. `at` comes from `sys.now()`.
+
+`remove` is not atomic: a tree can be part-deleted and then fail, which lands as `Failed` with 0 bytes even though gigabytes are gone. That is a deliberate lower bound — the tree still ends up correct, because Task 8 rescans the path either way and splices in whatever remains.
 
 **Step 4: Run the tests**
 
 Run: `cargo test -p storage-monitor-core action`
-Expected: 18 passed.
+Expected: 19 passed.
 
 **Step 5: Commit**
 
@@ -1103,7 +1121,9 @@ pub fn run_batch(
 ) -> Outcome
 ```
 
-It builds `Limits::for_scan_root(manager.root())`, turns the paths into a `Plan` (the kind and size come from the tree when it knows the path, otherwise `NodeKind::Other` and 0), runs `preview`, then `execute`, appends the outcome to the log, calls `manager.patch_paths` with the paths that were removed, and returns the outcome. A log failure is printed to stderr and does not fail the batch — the files are already gone.
+It builds `Limits::for_scan_root(manager.root())`, turns the paths into a `Plan` (the kind and size come from the tree when it knows the path, otherwise `NodeKind::Other` and 0), runs `preview`, then `execute`, appends the outcome to the log, patches the tree, and returns the outcome.
+
+Patch the paths of every entry that was `Removed` **or** `Failed`, not just the removed ones: a failed `remove` may have emptied most of a tree before it stopped, and the rescan is what makes the Explorer agree with the disk again. A log failure is printed to stderr and does not fail the batch — the files are already gone.
 
 `commands.rs`:
 

@@ -67,6 +67,24 @@ the Linux CI runners, which have no macOS Trash.
 entry immediately before deleting it (section 5). Without the indirection, the
 race between preview and execution cannot be reproduced in a test.
 
+Two invariants live in the port itself rather than only in the guards above it,
+because it is the single door through which deletion passes:
+
+- **Paths are absolute and normalized.** A path carrying a `..` component is
+  refused. `symlink_metadata` does not follow the last component, but the kernel
+  always resolves a trailing `..`, so `remove("/a/b/c/..")` would otherwise stat
+  `/a/b`, find a directory, and empty it — deleting siblings nobody named, and
+  reporting success.
+- **`remove` is not atomic.** `fs::remove_dir_all` can delete most of a tree and
+  then fail. The engine copes through the rescan of section 6; what the port
+  owes its caller is to say so rather than imply all-or-nothing.
+
+`TestSystem` enforces its own confinement: a path outside its temporary
+directory makes it panic rather than return an error, so a test written against
+a broken guard cannot quietly delete the developer's home folder. The comparison
+is component-wise and against canonicalized forms — on macOS a temp directory is
+`/var/folders/…` while its canonical form is `/private/var/folders/…`.
+
 ## 5. The action engine
 
 ```rust
