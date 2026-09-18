@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/vaital3000/storage-monitor/compare/v0.1.0...v0.2.0) (2026-09-18)
+
+
+### Features
+
+* scanner, snapshots and Explorer (phase 1) ([#9](https://github.com/vaital3000/storage-monitor/issues/9)) ([8aace8b](https://github.com/vaital3000/storage-monitor/commit/8aace8be68e1336ed0415913a30fc3c8052f3934))
+
 ## 0.1.0 (2026-09-17)
 
 
