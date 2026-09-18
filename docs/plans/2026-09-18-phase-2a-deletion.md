@@ -531,7 +531,15 @@ mod tests {
         Plan {
             entries: names
                 .iter()
-                .map(|n| PlanEntry { path: sys.root().join(n), kind: NodeKind::File, size: 10 })
+                .enumerate()
+                .map(|(i, n)| PlanEntry {
+                    path: sys.root().join(n),
+                    kind: NodeKind::File,
+                    // 10, 20, 30 ... so a total names exactly one entry: with equal sizes,
+                    // `freed_bytes == 10` over two entries is true even if the wrong one
+                    // was counted.
+                    size: (i as u64 + 1) * 10,
+                })
                 .collect(),
             mode,
         }
@@ -662,7 +670,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let outcome = execute(&checked, &limits, &sys);
         assert!(matches!(outcome.entries[0].result, EntryResult::Skipped { reason: BlockReason::Missing }));
         assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
-        assert_eq!(outcome.freed_bytes, 10, "only what was really deleted");
+        assert_eq!(outcome.freed_bytes, 20, "only what was really deleted");
     }
 
     #[test]
@@ -692,7 +700,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         assert!(matches!(outcome.entries[0].result, EntryResult::Failed { .. }));
         assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
         assert!(fs::symlink_metadata(sys.root().join("a.bin")).is_ok(), "a failure leaves the entry alone");
-        assert_eq!(outcome.freed_bytes, 10);
+        assert_eq!(outcome.freed_bytes, 20, "b.bin only — the second entry is the one that got through");
     }
 
     #[test]
