@@ -93,7 +93,7 @@ pub enum Mode { Trash, Permanent }
 pub struct PlanEntry { pub path: PathBuf, pub kind: NodeKind, pub size: u64 }
 pub struct Plan { pub entries: Vec<PlanEntry>, pub mode: Mode }
 
-pub enum BlockReason { OutsideRoots, Denylisted, IsRoot, Nested, Missing, KindChanged }
+pub enum BlockReason { OutsideRoots, Denylisted, IsRoot, Nested, Missing, Unreadable, KindChanged, Malformed }
 pub enum EntryStatus { Ready, Blocked(BlockReason) }
 pub struct PreviewEntry { pub path: PathBuf, pub kind: NodeKind, pub size: u64, pub status: EntryStatus }
 pub struct Preview { pub entries: Vec<PreviewEntry>, pub total_bytes: u64, pub mode: Mode }
@@ -110,14 +110,28 @@ Guards live in `guards.rs` as pure functions:
 - **Normalization.** The *parent* is canonicalized and the last component
   appended. Canonicalizing the whole path would resolve a symlink to its target
   and delete the wrong thing; a symlink is always removed as a link.
+- **What the rules judge.** The value above is what gets deleted, but it is not
+  what the rules below compare: its last component still carries whatever the
+  caller wrote. When the entry exists and is not a symlink, the rules judge its
+  canonical form instead. macOS is case-insensitive while path comparison is
+  byte-exact, so without this `library` walks past a denylist naming `Library`
+  and deletes the same directory.
 - **Allowed roots.** An entry must sit inside the scan root. The root itself and
   any of its ancestors are refused.
-- **Denylist.** `/`, `/System`, `/usr`, `/bin`, `/sbin`, `/Library`,
-  `~/Library`, and the home folder itself. A denied entry that *contains* the
-  scan root is dropped when the limits are built: the rule matches a path and
-  everything below it, so leaving `/` in would refuse every entry in every tree,
-  and leaving the home folder in would refuse the default scan. Neither is a
-  loss, because the root and its ancestors are already refused above.
+- **Denylist.** `/`, `/System`, `/usr`, `/bin`, `/sbin`, `/Library`, `/etc`,
+  `/var`, `/private`, `/Applications`, `~/Library`, and the home folder itself.
+  Each entry is held both fully canonicalized and with only its parent
+  canonicalized, so `/etc` — a symlink on macOS — refuses the link itself as
+  well as `/private/etc` beneath it.
+
+  A denied entry that *contains* the scan root is dropped when the limits are
+  built: the rule matches a path and everything below it, so leaving `/` in would
+  refuse every entry in every tree, and leaving the home folder in would refuse
+  the default scan. For an entry equal to the root nothing is lost, since the
+  root is already refused above. For an entry that strictly contains the root
+  something is: scanning `~/Library` makes its contents deletable. That is
+  deliberate — a root is what the user pointed at — and the place to warn about
+  it is the root picker in phase 2b.
 - **Nesting.** When a batch holds both `a/` and `a/b`, the descendant is
   dropped: otherwise its bytes are counted twice and its deletion fails with
   "no such file".
@@ -133,6 +147,19 @@ skipped when reading instead of failing the screen.
 
 In Trash mode `freed_bytes` is what *will* be freed once the Trash is emptied,
 and the UI says exactly that (ADR 0003).
+
+Two shapes were questioned in review and deliberately left as they are:
+
+- **`Failed` carries a bare message, not a classified error.** Nothing in 2a
+  branches on the cause; the Trash path cannot produce a structured one anyway,
+  since the crate behind it collapses every failure into a string. The app ships
+  as one binary, so giving the variant a `kind` in 2b costs one Rust enum and one
+  TypeScript type, with no released consumer to break.
+- **The wire types carry `PathBuf`, not `String`.** A path that is not valid
+  UTF-8 would fail to serialize *after* the files were already deleted. It cannot
+  arrive: every path reaching the engine comes from `Tree::path`, whose names are
+  already lossy `str`, or from the UI, which got them from there — which is the
+  same reason such a file cannot be deleted at all (section 6).
 
 ## 6. Patching the tree
 

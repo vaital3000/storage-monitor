@@ -305,13 +305,13 @@ mod tests {
         let file = dir.path().join("keep/a.bin");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, b"x").unwrap();
-        assert_eq!(check(&file, &limits(dir.path())).unwrap(), fs::canonicalize(&file).unwrap());
+        assert_eq!(limits(dir.path()).check(&file).unwrap(), fs::canonicalize(&file).unwrap());
     }
 
     #[test]
     fn the_scan_root_itself_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check(dir.path(), &limits(dir.path())), Err(BlockReason::IsRoot));
+        assert_eq!(limits(dir.path()).check(dir.path()), Err(BlockReason::IsRoot));
     }
 
     #[test]
@@ -319,7 +319,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("home/user");
         fs::create_dir_all(&root).unwrap();
-        assert_eq!(check(&dir.path().join("home"), &limits(&root)), Err(BlockReason::IsRoot));
+        assert_eq!(limits(&root).check(&dir.path().join("home")), Err(BlockReason::IsRoot));
     }
 
     #[test]
@@ -329,7 +329,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let outside = dir.path().join("elsewhere");
         fs::create_dir(&outside).unwrap();
-        assert_eq!(check(&outside, &limits(&root)), Err(BlockReason::OutsideRoots));
+        assert_eq!(limits(&root).check(&outside), Err(BlockReason::OutsideRoots));
     }
 
     #[test]
@@ -337,13 +337,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let inside = dir.path().join("Library/Caches/app");
         fs::create_dir_all(&inside).unwrap();
-        assert_eq!(check(&inside, &limits(dir.path())), Err(BlockReason::Denylisted));
+        assert_eq!(limits(dir.path()).check(&inside), Err(BlockReason::Denylisted));
     }
 
     #[test]
     fn a_missing_path_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check(&dir.path().join("gone/a.bin"), &limits(dir.path())), Err(BlockReason::Missing));
+        assert_eq!(limits(dir.path()).check(&dir.path().join("gone/a.bin")), Err(BlockReason::Missing));
     }
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         // The link lives inside the root, so it may be deleted; the target must not be
         // what the guard returns, or we would delete outside the root.
-        assert_eq!(check(&link, &limits(&root)).unwrap(), fs::canonicalize(&root).unwrap().join("link"));
+        assert_eq!(limits(&root).check(&link).unwrap(), fs::canonicalize(&root).unwrap().join("link"));
     }
 
     #[test]
@@ -367,16 +367,17 @@ mod tests {
         fs::create_dir_all(root.join("sub")).unwrap();
         let sneaky = root.join("sub/../../outside");
         fs::create_dir(dir.path().join("outside")).unwrap();
-        assert_eq!(check(&sneaky, &limits(&root)), Err(BlockReason::OutsideRoots));
+        assert_eq!(limits(&root).check(&sneaky), Err(BlockReason::OutsideRoots));
     }
 
     #[test]
     fn the_filesystem_root_is_refused() {
         // The port accepts "/": it is a well-formed absolute path and the port is not a
-        // policy layer. These two rules are the only thing between a batch and
-        // `remove_dir_all("/")`, so they get their own test.
+        // policy layer. Rule 1 is the only thing between a batch and `remove_dir_all("/")`
+        // — the denylist never gets a say, because `Limits::new` drops an entry that
+        // contains the root and "/" contains every root. Hence its own test.
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check(std::path::Path::new("/"), &limits(dir.path())), Err(BlockReason::Denylisted));
+        assert_eq!(limits(dir.path()).check(std::path::Path::new("/")), Err(BlockReason::Malformed));
     }
 
     #[test]
@@ -423,18 +424,26 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// `root` and `denied` are canonicalized here; paths that do not exist are kept as
-    /// given, since a denylist entry may be absent on this machine.
+    /// `root` is canonicalized here. Each denied entry is kept in two forms — fully
+    /// canonicalized, and with only its parent canonicalized — so a denied symlink such
+    /// as `/etc` refuses both the link itself and `/private/etc/...` below it. An entry
+    /// that does not exist on this machine is kept as given and simply never matches.
     pub fn new(root: PathBuf, denied: Vec<PathBuf>) -> Self { ... }
 
     /// The root plus the standard denylist of design section 9. `new` drops any denied
-    /// entry that contains the root — `/` always does, and the home folder does for the
-    /// default scan — otherwise rule 6 would refuse every path in the tree. Nothing is
-    /// lost: rule 4 already refuses the root and its ancestors, and rule 1 refuses `/`.
+    /// entry that contains the root, or rule 7 would refuse every path in the tree: `/`
+    /// contains every root, and the home folder contains the default one.
+    ///
+    /// This means a root *inside* a denied entry opens that entry up — scanning
+    /// `~/Library` makes its contents deletable. That is the policy: a root is something
+    /// the user pointed at deliberately. The root picker of phase 2b is where a warning
+    /// belongs, not here.
     pub fn for_scan_root(root: PathBuf) -> Self {
         let mut denied = vec![
             PathBuf::from("/"), PathBuf::from("/System"), PathBuf::from("/usr"),
             PathBuf::from("/bin"), PathBuf::from("/sbin"), PathBuf::from("/Library"),
+            PathBuf::from("/etc"), PathBuf::from("/var"), PathBuf::from("/private"),
+            PathBuf::from("/Applications"),
         ];
         if let Some(home) = crate::paths::home_dir() {
             denied.push(home.join("Library"));
@@ -444,8 +453,10 @@ impl Limits {
     }
 }
 
-/// Normalizes `path` and applies every rule. The returned path is what the engine deletes.
-pub fn check(path: &Path, limits: &Limits) -> Result<PathBuf, BlockReason> { ... }
+impl Limits {
+    /// Normalizes `path` and applies every rule. What it returns is what the engine deletes.
+    pub fn check(&self, path: &Path) -> Result<PathBuf, BlockReason> { ... }
+}
 
 /// Per entry, in input order: false when another entry in the list contains it.
 /// Of several copies of one path the first survives — read literally, the rule would
@@ -455,12 +466,13 @@ pub fn drop_nested(paths: &[PathBuf]) -> Vec<bool> { ... }
 
 `check` in order:
 
-1. `path.file_name()` is `None` → `Denylisted` (this is `/` or a trailing `..`).
-2. Canonicalize the parent. An error means the parent is gone → `Missing`.
+1. `path.file_name()` is `None` → `Malformed` (this is `/` or a trailing `..`).
+2. Canonicalize the parent. `ErrorKind::NotFound` → `Missing`; any other error → `Unreadable`. They are different things: a `chmod 000` parent is not a vanished one, and this app has a whole design about Full Disk Access — "nothing is there any more" would send the user chasing a ghost.
 3. `normalized = parent.join(file_name)`. Canonicalizing `path` itself would resolve a symlink to its target and delete the wrong thing.
-4. `normalized == root` or `root.starts_with(&normalized)` → `IsRoot`.
-5. `!normalized.starts_with(&root)` → `OutsideRoots`.
-6. Any denied `d` with `normalized == d || normalized.starts_with(d)` → `Denylisted`.
+4. Pick what the rules below judge: `lstat` the entry, and when it exists and is **not** a symlink, judge `normalized.canonicalize()`; otherwise judge `normalized`. Rules 5–7 then compare a path whose every component carries its on-disk spelling, while step 3's value is still what gets deleted. Without this the last component keeps whatever the caller wrote, and on a case-insensitive filesystem `library` walks past a denylist that names `Library`.
+5. judged `== root` or `root.starts_with(&judged)` → `IsRoot`.
+6. `!judged.starts_with(&root)` → `OutsideRoots`.
+7. Any denied `d` with `judged == d || judged.starts_with(d)` → `Denylisted`.
 
 `starts_with` on `Path` compares whole components, so `/h/ab` does not start with `/h/a`. Use it everywhere; never compare strings.
 
