@@ -4,11 +4,13 @@
 //! arena tree ([`scan`]), persisted snapshots and the growth deltas between them
 //! ([`snapshot`]), volume usage ([`disk`]) and the application's data locations
 //! ([`paths`]). Deleting and the clock go through the [`system`] port, so the code above
-//! it can be tested without touching the real machine. The module contract and the action
-//! engine arrive in later phases; see `docs/plans/2026-09-17-storage-monitor-design.md`.
+//! it can be tested without touching the real machine, and [`action`] holds what a
+//! deletion is and the rules that decide what may be touched at all. The module contract
+//! arrives in a later phase; see `docs/plans/2026-09-17-storage-monitor-design.md`.
 
 use serde::{Deserialize, Serialize};
 
+pub mod action;
 pub mod disk;
 pub mod paths;
 pub mod scan;
