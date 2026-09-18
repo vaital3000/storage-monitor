@@ -92,6 +92,8 @@ impl SnapshotStore {
         Ok(Snapshot::decode(&fs::read(path)?)?)
     }
 
+    /// The newest snapshot of any root; use [`SnapshotStore::latest_for`] to compare
+    /// scans of the same folder.
     pub fn latest(&self) -> Result<Option<Snapshot>, StoreError> {
         match self.list()?.first() {
             Some(meta) => Ok(Some(self.load(&meta.path)?)),
@@ -99,7 +101,16 @@ impl SnapshotStore {
         }
     }
 
-    /// Deletes everything but the `keep` newest snapshots; returns how many were removed.
+    /// The newest snapshot taken of `root` (compared as written, without canonicalization).
+    pub fn latest_for(&self, root: &Path) -> Result<Option<Snapshot>, StoreError> {
+        match self.list()?.into_iter().find(|meta| meta.root == root) {
+            Some(meta) => Ok(Some(self.load(&meta.path)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Deletes everything but the `keep` newest snapshots, counted across all roots (frequent
+    /// scans of one folder push out the snapshots of another); returns how many were removed.
     pub fn prune(&self, keep: usize) -> Result<usize, StoreError> {
         let list = self.list()?;
         let mut removed = 0;
@@ -119,15 +130,19 @@ mod tests {
     use crate::snapshot::model::{Snapshot, SnapshotEntry};
 
     fn snapshot(taken_at: chrono::DateTime<chrono::Utc>, total: u64) -> Snapshot {
+        snapshot_of("/home", taken_at, total)
+    }
+
+    fn snapshot_of(root: &str, taken_at: chrono::DateTime<chrono::Utc>, total: u64) -> Snapshot {
         Snapshot {
             format: super::super::model::SNAPSHOT_FORMAT,
             taken_at,
-            root: "/home".into(),
+            root: root.into(),
             total_bytes: total,
             file_count: 1,
             file_threshold: 0,
             entries: vec![SnapshotEntry {
-                path: "/home".into(),
+                path: root.into(),
                 kind: NodeKind::Dir,
                 size: total,
                 file_count: 1,
@@ -164,5 +179,25 @@ mod tests {
         let store = SnapshotStore::new(dir.path().join("missing"));
         assert!(store.list().unwrap().is_empty());
         assert!(store.latest().unwrap().is_none());
+        assert!(store.latest_for(Path::new("/home")).unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_for_picks_the_newest_snapshot_of_that_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path().join("snapshots"));
+        let t0 = chrono::Utc::now() - chrono::Duration::minutes(3);
+        store.save(&snapshot_of("/home", t0, 1)).unwrap();
+        store
+            .save(&snapshot_of("/work", t0 + chrono::Duration::minutes(1), 2))
+            .unwrap();
+        store
+            .save(&snapshot_of("/home", t0 + chrono::Duration::minutes(2), 3))
+            .unwrap();
+        assert_eq!(store.latest().unwrap().unwrap().total_bytes, 3);
+        let latest = |root: &str| store.latest_for(Path::new(root)).unwrap();
+        assert_eq!(latest("/home").unwrap().total_bytes, 3);
+        assert_eq!(latest("/work").unwrap().total_bytes, 2);
+        assert!(latest("/elsewhere").is_none());
     }
 }

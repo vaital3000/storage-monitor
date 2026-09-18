@@ -82,13 +82,15 @@ impl Ctx<'_> {
 pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult, ScanError> {
     let started = Instant::now();
     let started_at = Utc::now();
-    let root = &options.root;
-    let meta = fs::symlink_metadata(root).map_err(|source| ScanError::Root {
+    // Drop trailing slashes and `.` components (no canonicalization), so the paths derived
+    // from the root agree with the paths derived from its entries.
+    let root: PathBuf = options.root.components().collect();
+    let meta = fs::symlink_metadata(&root).map_err(|source| ScanError::Root {
         path: root.clone(),
         source,
     })?;
     if !meta.is_dir() {
-        return Err(ScanError::NotADirectory(root.clone()));
+        return Err(ScanError::NotADirectory(root));
     }
     let ctx = Ctx {
         options,
@@ -96,12 +98,12 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
         root_dev: meta.dev(),
     };
     let root_node = node_from_metadata(&root.to_string_lossy(), &meta);
-    let subtree = walk_dir(root, root_node, &ctx);
+    let subtree = walk_dir(&root, root_node, &ctx);
     let (mut tree, links) = subtree.flatten();
     let hardlinks_skipped = tree.attribute_hard_links(links);
     let snap = progress.snapshot();
     Ok(ScanResult {
-        root: root.clone(),
+        root,
         started_at,
         duration_ms: started.elapsed().as_millis() as u64,
         stats: ScanStats {

@@ -4,6 +4,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use storage_monitor_core::scan::{Node, NodeKind, ScanOptions, ScanProgress, Tree, scan};
+use storage_monitor_core::snapshot::{Snapshot, deltas, top_growers};
 use tempfile::TempDir;
 
 fn write(path: &Path, bytes: usize) {
@@ -310,6 +311,31 @@ fn progress_counters_match_final_stats() {
     assert_eq!(snap.dirs, result.stats.dirs);
     assert_eq!(snap.bytes, result.stats.bytes);
     assert_eq!(snap.bytes, result.tree.root().size);
+}
+
+#[test]
+fn root_with_a_trailing_slash_is_normalized() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("a/one.bin"), 1_000);
+    let slashed = PathBuf::from(format!("{}/", dir.path().display()));
+    let scan_now = || scan(&ScanOptions::new(slashed.clone()), &ScanProgress::default()).unwrap();
+    let first = scan_now();
+    assert_eq!(first.root, dir.path());
+    assert_eq!(&*first.tree.root().name, dir.path().to_str().unwrap());
+    let (a, _) = child(&first.tree, Tree::ROOT, "a");
+    assert_eq!(first.tree.path(a), dir.path().join("a"));
+
+    write(&dir.path().join("a/two.bin"), 50_000);
+    let second = scan_now();
+    let before = Snapshot::from_result(&first, u64::MAX);
+    let after = Snapshot::from_result(&second, u64::MAX);
+    let growers = top_growers(&deltas(&before, &after), 10);
+    let paths: Vec<&str> = growers.iter().map(|g| g.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![dir.path().join("a").to_str().unwrap()],
+        "the root's growth is explained by a, so the root itself is not listed"
+    );
 }
 
 #[test]
