@@ -27,7 +27,7 @@ export default function Sidebar({ page, onNavigate, versionLabel }: SidebarProps
                   onClick={available ? () => onNavigate(id) : undefined}
                   aria-current={selected ? 'page' : undefined}
                   title={available ? undefined : 'Coming in a later phase'}
-                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm focus-visible:outline-2 focus-visible:outline-blue-500 ${
+                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-base focus-visible:outline-2 focus-visible:outline-blue-500 ${
                     selected
                       ? 'bg-neutral-200/80 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-50'
                       : available
@@ -41,7 +41,7 @@ export default function Sidebar({ page, onNavigate, versionLabel }: SidebarProps
                     // The space keeps "soon" a separate word of the accessible name.
                     <>
                       {' '}
-                      <span className="text-xs text-neutral-500">soon</span>
+                      <span className="text-xs text-muted">soon</span>
                     </>
                   )}
                 </button>
@@ -50,7 +50,7 @@ export default function Sidebar({ page, onNavigate, versionLabel }: SidebarProps
           })}
         </ul>
       </nav>
-      <footer className="border-t border-neutral-200 px-3 py-2 text-xs text-neutral-500 dark:border-neutral-800">
+      <footer className="border-t border-neutral-200 px-3 py-2 text-xs text-muted dark:border-neutral-800">
         Storage Monitor <span data-testid="version">{versionLabel}</span>
       </footer>
     </aside>

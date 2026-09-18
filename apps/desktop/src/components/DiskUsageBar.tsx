@@ -16,7 +16,7 @@ export default function DiskUsageBar({ usage, scanned }: DiskUsageBarProps) {
   const covered = scanned === undefined ? 0 : share(Math.min(scanned, usage.used), usage.total);
   const summary = `${formatBytes(usage.used)} used of ${formatBytes(usage.total)}`;
   return (
-    <div data-testid="disk-usage" className="text-xs text-neutral-500 tabular-nums">
+    <div data-testid="disk-usage" className="text-xs text-muted tabular-nums">
       <div
         role="meter"
         aria-label="Disk usage"

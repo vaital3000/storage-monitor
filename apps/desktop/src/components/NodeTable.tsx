@@ -38,29 +38,80 @@ interface Column {
   label: string;
   numeric: boolean;
   sortable: boolean;
+  /** Width and horizontal padding, shared by the header and the cells of the column. */
   width: string;
+  padding: string;
   title?: string;
 }
 
 const MTIME_TITLE = 'Directory modification time, not the newest content';
 
-// Fixed widths for the numeric columns (about 490 px in total); the name column takes
-// the rest, at least 150 px at the window's minimum width of 900 px.
+const NAME_PADDING = 'pl-3 pr-1';
+const NUMERIC_PADDING = 'px-2';
+const ACTIONS_PADDING = 'px-1';
+
+// Fixed widths for the other columns (452 px in total), each sized for its widest value at
+// 13 px (`2026-09-18`, `100.0%`, `−999.9 MB`, `123,456`); the name column takes the rest:
+// 188 px at the window's minimum width of 900 px, which fits "Application Support" next
+// to its marker.
 const COLUMNS: readonly Column[] = [
-  { key: 'name', label: 'Name', numeric: false, sortable: true, width: 'w-auto' },
-  { key: 'size', label: 'Size', numeric: true, sortable: true, width: 'w-36' },
-  { key: 'percent', label: '%', numeric: true, sortable: false, width: 'w-14' },
-  { key: 'delta', label: 'Δ', numeric: true, sortable: true, width: 'w-24' },
-  { key: 'fileCount', label: 'Files', numeric: true, sortable: true, width: 'w-16' },
+  {
+    key: 'name',
+    label: 'Name',
+    numeric: false,
+    sortable: true,
+    width: 'w-auto',
+    padding: NAME_PADDING,
+  },
+  {
+    key: 'size',
+    label: 'Size',
+    numeric: true,
+    sortable: true,
+    width: 'w-30',
+    padding: NUMERIC_PADDING,
+  },
+  {
+    key: 'percent',
+    label: '%',
+    numeric: true,
+    sortable: false,
+    width: 'w-14',
+    padding: NUMERIC_PADDING,
+  },
+  {
+    key: 'delta',
+    label: 'Δ',
+    numeric: true,
+    sortable: true,
+    width: 'w-22',
+    padding: NUMERIC_PADDING,
+  },
+  {
+    key: 'fileCount',
+    label: 'Files',
+    numeric: true,
+    sortable: true,
+    width: 'w-16',
+    padding: NUMERIC_PADDING,
+  },
   {
     key: 'mtime',
     label: 'Modified',
     numeric: true,
     sortable: true,
     width: 'w-24',
+    padding: NUMERIC_PADDING,
     title: MTIME_TITLE,
   },
-  { key: 'actions', label: '', numeric: false, sortable: false, width: 'w-8' },
+  {
+    key: 'actions',
+    label: '',
+    numeric: false,
+    sortable: false,
+    width: 'w-7',
+    padding: ACTIONS_PADDING,
+  },
 ];
 
 /** The direction a column starts with: names read A to Z, numbers largest first. */
@@ -159,7 +210,7 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
       open();
     }
   };
-  const numeric = 'px-3 py-1.5 text-right whitespace-nowrap tabular-nums';
+  const numeric = `${NUMERIC_PADDING} py-1.5 text-right whitespace-nowrap tabular-nums`;
   return (
     <tr
       tabIndex={0}
@@ -172,8 +223,8 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
           : 'cursor-default hover:bg-neutral-50 dark:hover:bg-neutral-800/50'
       }`}
     >
-      <td className="max-w-0 px-3 py-1.5">
-        <div className="flex min-w-0 items-center gap-2">
+      <td className={`max-w-0 ${NAME_PADDING} py-1.5`}>
+        <div className="flex min-w-0 items-center gap-1.5">
           <KindIcon kind={child.kind} />
           <span className="truncate" title={child.name}>
             {child.name}
@@ -183,19 +234,19 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
       </td>
       <td className={numeric}>
         <div className="flex items-center justify-end gap-2">
-          <div className="h-1.5 w-12 shrink-0 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+          <div className="h-1.5 w-8 shrink-0 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
             <div className="h-full rounded-full bg-blue-500/70" style={{ width: `${barWidth}%` }} />
           </div>
           <span className="w-16">{formatBytes(child.size)}</span>
         </div>
       </td>
-      <td className={`${numeric} text-neutral-500`}>{formatPercent(child.size, parent.size)}</td>
+      <td className={`${numeric} text-muted`}>{formatPercent(child.size, parent.size)}</td>
       <td className={`${numeric} ${deltaClass(child.delta)}`}>{formatDelta(child.delta)}</td>
-      <td className={`${numeric} text-neutral-500`}>{child.fileCount.toLocaleString('en-US')}</td>
-      <td className={`${numeric} text-neutral-500`} title={isDir ? MTIME_TITLE : undefined}>
+      <td className={`${numeric} text-muted`}>{child.fileCount.toLocaleString('en-US')}</td>
+      <td className={`${numeric} text-muted`} title={isDir ? MTIME_TITLE : undefined}>
         {formatDate(child.mtime)}
       </td>
-      <td className="px-1 py-1.5">
+      <td className={`${ACTIONS_PADDING} py-1.5`}>
         <button
           type="button"
           aria-label="Reveal in Finder"
@@ -205,7 +256,7 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
             onReveal(path);
           }}
           onKeyDown={(event) => event.stopPropagation()}
-          className="rounded p-0.5 text-neutral-400 opacity-0 group-hover:opacity-100 hover:text-neutral-700 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-neutral-200"
+          className="rounded p-0.5 text-muted opacity-35 group-hover:opacity-100 group-focus-visible:opacity-100 hover:text-neutral-700 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-neutral-200"
         >
           <SquareArrowOutUpRight className="size-3.5" />
         </button>
@@ -262,8 +313,8 @@ export default function NodeTable({
 
   return (
     <div className="overflow-hidden rounded-lg border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900">
-      <table className="w-full table-fixed border-collapse text-sm">
-        <thead className="bg-neutral-50 text-xs dark:bg-neutral-800/60">
+      <table className="w-full table-fixed border-collapse text-base">
+        <thead className="bg-neutral-50 text-sm dark:bg-neutral-800/60">
           <tr>
             {COLUMNS.map((column) => {
               const active = column.sortable && sort.key === column.key;
@@ -275,7 +326,7 @@ export default function NodeTable({
                   aria-sort={
                     active ? (sort.direction === 'asc' ? 'ascending' : 'descending') : undefined
                   }
-                  className={`${column.width} px-3 py-1.5 font-medium text-neutral-500 ${
+                  className={`${column.width} ${column.padding} py-1.5 font-medium text-muted ${
                     column.numeric ? 'text-right' : 'text-left'
                   }`}
                 >
@@ -317,14 +368,14 @@ export default function NodeTable({
         ) : (
           <tbody>
             <tr className="border-t border-neutral-100 dark:border-neutral-800">
-              <td colSpan={COLUMNS.length} className="px-3 py-8 text-center text-neutral-500">
+              <td colSpan={COLUMNS.length} className="px-3 py-8 text-center text-muted">
                 {node.error === null ? 'Empty folder' : describeNodeError(node.error).title}
               </td>
             </tr>
           </tbody>
         )}
       </table>
-      <p className="border-t border-neutral-100 px-3 py-1.5 text-xs text-neutral-500 dark:border-neutral-800">
+      <p className="border-t border-neutral-100 px-3 py-1.5 text-xs text-muted dark:border-neutral-800">
         {countLabel(node.childrenTotal, 'item')}
         {node.truncated && `, showing the first ${node.children.length.toLocaleString('en-US')}`}
       </p>

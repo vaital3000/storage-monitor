@@ -13,6 +13,8 @@ vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 interface Cell {
   name: string;
   value: number;
+  itemStyle: { color: string };
+  label?: { color: string; textBorderWidth: number };
   [key: string]: unknown;
 }
 
@@ -22,7 +24,12 @@ interface Series {
   nodeClick: unknown;
   roam: unknown;
   breadcrumb: { show: boolean };
-  label: { formatter: (params: unknown) => string };
+  label: {
+    color: string;
+    textBorderColor: string;
+    textBorderWidth: number;
+    formatter: (params: unknown) => string;
+  };
 }
 
 interface Option {
@@ -57,6 +64,42 @@ function series(): Series {
   const option = lastChart().lastOption() as Option;
   expect(option.series).toHaveLength(1);
   return option.series[0];
+}
+
+/** Relative luminance of `#fff` or of an `hsl(h s% l%)` colour, as WCAG 2 defines it. */
+function luminance(color: string): number {
+  if (color === '#fff') return 1;
+  const match = /^hsl\(([\d.]+) ([\d.]+)% ([\d.]+)%\)$/.exec(color);
+  if (match === null) throw new Error(`not an hsl colour: ${color}`);
+  const [h, s, l] = match.slice(1).map((part) => Number(part) / (part === match[1] ? 1 : 100));
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  const sectors = [
+    [c, x, 0],
+    [x, c, 0],
+    [0, c, x],
+    [0, x, c],
+    [x, 0, c],
+    [c, 0, x],
+  ];
+  const [r, g, b] = sectors[Math.floor(h / 60) % 6].map((v) => v + m);
+  const linear = (v: number) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+}
+
+/** WCAG 2 contrast ratio between two colours, 1 to 21. */
+function contrast(a: string, b: string): number {
+  const [light, dark] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (light + 0.05) / (dark + 0.05);
+}
+
+/** Thirty directories and thirty files with interleaved sizes: sixty cells, no "Other". */
+function mixed(): ChildView[] {
+  return Array.from({ length: 30 }, (_, i) => [
+    child(i + 1, `dir-${i + 1}`, (60 - 2 * i) * GB),
+    child(100 + i, `file-${i + 1}`, (59 - 2 * i) * GB, { kind: 'file', hasChildren: false }),
+  ]).flat();
 }
 
 /** Stand-in for the browser's ResizeObserver: records instances so a test can fire them. */
@@ -97,6 +140,24 @@ describe('Treemap', () => {
     const other = s.data[60];
     expect(other.name).toBe('Other (10 items)');
     expect(other.value).toBe((10 + 9 + 8 + 7 + 6 + 5 + 4 + 3 + 2 + 1) * GB);
+    expect(contrast(s.label.color, other.itemStyle.color)).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it('keeps the white labels readable: an outline, and at least 4.5:1 on every cell', () => {
+    render(<Treemap items={mixed()} parentSize={2000 * GB} onSelect={() => undefined} />);
+    const s = series();
+    expect(s.data).toHaveLength(60);
+    expect(s.label).toMatchObject({
+      color: '#fff',
+      textBorderColor: 'rgba(0,0,0,0.35)',
+      textBorderWidth: 2,
+    });
+    for (const cell of s.data) {
+      expect(contrast('#fff', cell.itemStyle.color), cell.name).toBeGreaterThanOrEqual(4.5);
+    }
+    // Directories run blue-grey, files a warm grey: told apart by hue, not by lightness.
+    expect(s.data[0].itemStyle.color).toMatch(/^hsl\(215 /);
+    expect(s.data[1].itemStyle.color).toMatch(/^hsl\(30 /);
   });
 
   it('draws every child when there are 60 or fewer, largest first, skipping empty ones', () => {
@@ -144,6 +205,14 @@ describe('Treemap', () => {
       s.label.formatter({ name: cell.name, value: cell.value, data: cell });
     expect(label(s.data[0])).toBe(`Library\n${formatBytes(95.4 * GB)}`);
     expect(label(s.data[1])).toBe(`🔒 Mail\n${formatBytes(1.2 * GB)}`);
+    // The unreadable cell stays light, so its label is dark and drops the outline.
+    expect(s.data[0].label).toBeUndefined();
+    const unreadable = s.data[1].label;
+    expect(unreadable).toMatchObject({ textBorderWidth: 0 });
+    expect(contrast(unreadable!.color, s.data[1].itemStyle.color)).toBeGreaterThanOrEqual(4.5);
+    expect(luminance(s.data[1].itemStyle.color)).toBeGreaterThan(
+      luminance(s.data[0].itemStyle.color),
+    );
   });
 
   it('paints a partially read directory like any other, without a lock', () => {

@@ -16,14 +16,14 @@ export default function EmptyState({ root, error, onScan }: EmptyStateProps) {
       <HardDrive className="size-10 text-neutral-400" strokeWidth={1.5} />
       <h2 className="text-xl font-semibold">Scan your home folder</h2>
       {error === undefined ? (
-        <p className="font-mono text-sm text-neutral-500">{root ?? '…'}</p>
+        <p className="font-mono text-sm text-muted">{root ?? '…'}</p>
       ) : (
         <p className="font-mono text-sm break-words text-red-700 dark:text-red-300">{error}</p>
       )}
       <Button variant="primary" onClick={onScan} className="mt-2">
         Scan
       </Button>
-      <p className="max-w-md text-sm text-neutral-500">
+      <p className="max-w-md text-sm text-muted">
         Scans the home folder. Some folders in Library need Full Disk Access; they are reported, not
         skipped.
       </p>

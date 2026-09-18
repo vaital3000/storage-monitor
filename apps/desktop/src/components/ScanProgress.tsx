@@ -14,7 +14,7 @@ const CURRENT_PATH_WIDTH = 72;
 function Stat({ label, value, testId }: { label: string; value: string; testId?: string }) {
   return (
     <div>
-      <dt className="text-xs text-neutral-500">{label}</dt>
+      <dt className="text-xs text-muted">{label}</dt>
       <dd data-testid={testId} className="text-lg font-semibold">
         {value}
       </dd>
@@ -32,10 +32,7 @@ export default function ScanProgress({ status, cancelling, onCancel }: ScanProgr
           <p role="status" className="text-lg font-semibold">
             Scanning…
           </p>
-          <p
-            className="truncate font-mono text-xs text-neutral-500"
-            title={status.root ?? undefined}
-          >
+          <p className="truncate font-mono text-xs text-muted" title={status.root ?? undefined}>
             {status.root}
           </p>
         </div>
@@ -57,7 +54,7 @@ export default function ScanProgress({ status, cancelling, onCancel }: ScanProgr
       </dl>
       <p
         data-testid="scan-current-path"
-        className="mt-4 truncate font-mono text-xs text-neutral-500"
+        className="mt-4 truncate font-mono text-xs text-muted"
         title={status.currentPath}
       >
         {shortenPath(status.currentPath, CURRENT_PATH_WIDTH)}

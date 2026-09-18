@@ -125,11 +125,12 @@ test('marks an unreadable directory with a lock and a skipped volume with an inf
   await expect(row(page, 'Library').getByRole('img')).toHaveCount(0);
 });
 
-test('reveals a row in Finder from the button that appears on hover', async ({ page }) => {
+test('reveals a row in Finder from the button that shows fully on hover', async ({ page }) => {
   await scan(page);
   const downloads = row(page, 'Downloads');
   const reveal = downloads.getByRole('button', { name: 'Reveal in Finder' });
-  await expect(reveal).toHaveCSS('opacity', '0');
+  // Visible at rest as an affordance, fully opaque on the hovered row.
+  await expect(reveal).toHaveCSS('opacity', '0.35');
   await downloads.hover();
   await expect(reveal).toHaveCSS('opacity', '1');
 

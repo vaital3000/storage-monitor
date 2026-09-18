@@ -75,7 +75,7 @@ function ResultHeader({ status, disk, onRescan }: ResultHeaderProps) {
         <h2 className="truncate text-xl font-semibold" title={root}>
           {basename(root)}
         </h2>
-        <p data-testid="scan-summary" className="text-sm text-neutral-500 tabular-nums">
+        <p data-testid="scan-summary" className="text-sm text-muted tabular-nums">
           {formatBytes(status.bytes)} · {countLabel(status.files, 'file')} ·{' '}
           {countLabel(status.dirs, 'folder')} · scanned in {formatDuration(status.durationMs)}
           {status.errors > 0 && ` · ${countLabel(status.errors, 'read error')}`}
@@ -86,9 +86,7 @@ function ResultHeader({ status, disk, onRescan }: ResultHeaderProps) {
           </p>
         )}
         {previous !== null && (
-          <p className="mt-1 text-xs text-neutral-500">
-            Δ compares with the snapshot of {previous}.
-          </p>
+          <p className="mt-1 text-xs text-muted">Δ compares with the snapshot of {previous}.</p>
         )}
       </div>
       <div className="flex items-center gap-4">
@@ -179,7 +177,7 @@ export default function ExplorerPage() {
   }, []);
 
   if (!scan.ready) {
-    return <p className="p-6 text-sm text-neutral-500">Loading…</p>;
+    return <p className="p-6 text-sm text-muted">Loading…</p>;
   }
   if (status.state === 'idle') {
     return (
@@ -232,7 +230,7 @@ export default function ExplorerPage() {
           <Button onClick={() => open(ROOT_ID)}>Back to the top</Button>
         </div>
       ) : (
-        <p className="text-sm text-neutral-500">Loading…</p>
+        <p className="text-sm text-muted">Loading…</p>
       )}
     </div>
   );

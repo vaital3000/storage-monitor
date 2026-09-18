@@ -38,8 +38,11 @@ type Cell = SeriesDatum & {
 /** Cells drawn individually; the rest is one "Other" cell so labels stay readable. */
 export const TREEMAP_LIMIT = 60;
 const HEIGHT_CLASS = 'h-80';
-const OTHER_COLOR = 'hsl(0 0% 70%)';
+// Fills are dark enough for the white labels at 4.5:1 (the tests measure it); the
+// unreadable cell stays light and carries a dark label without the outline instead.
+const OTHER_COLOR = 'hsl(0 0% 45%)';
 const UNREADABLE_COLOR = 'hsl(215 18% 78%)';
+const UNREADABLE_LABEL = { color: 'hsl(215 25% 22%)', textBorderWidth: 0 };
 
 interface TreemapProps {
   /** The children of the directory on screen, in any order. */
@@ -59,8 +62,8 @@ function cellColor(child: ChildView, rank: number, count: number): string {
   if (unreadable(child.error)) return UNREADABLE_COLOR;
   const t = count > 1 ? rank / (count - 1) : 0;
   return child.kind === 'dir'
-    ? `hsl(215 32% ${(44 + t * 18).toFixed(1)}%)`
-    : `hsl(30 8% ${(56 + t * 12).toFixed(1)}%)`;
+    ? `hsl(215 32% ${(36 + t * 12).toFixed(1)}%)`
+    : `hsl(30 8% ${(40 + t * 5).toFixed(1)}%)`;
 }
 
 function buildCells(items: readonly ChildView[]): Cell[] {
@@ -75,6 +78,7 @@ function buildCells(items: readonly ChildView[]): Cell[] {
     delta: child.delta,
     error: child.error,
     itemStyle: { color: cellColor(child, rank, top.length) },
+    label: unreadable(child.error) ? UNREADABLE_LABEL : undefined,
     cursor: child.kind === 'dir' ? 'pointer' : 'default',
   }));
   if (rest.length > 0) {
@@ -153,6 +157,9 @@ function buildOption(cells: Cell[], parentSize: number): TreemapOption {
           position: 'insideTopLeft',
           padding: 6,
           color: '#fff',
+          // A dark outline keeps the label legible on the lighter cells and over the gaps.
+          textBorderColor: 'rgba(0,0,0,0.35)',
+          textBorderWidth: 2,
           fontSize: 12,
           lineHeight: 16,
           overflow: 'truncate',
@@ -224,7 +231,7 @@ export default function Treemap({ items, parentSize, onSelect }: TreemapProps) {
     >
       <div ref={container} data-testid="treemap" className="h-full w-full" />
       {cells.length === 0 && (
-        <p className="absolute inset-0 flex items-center justify-center text-sm text-neutral-500">
+        <p className="absolute inset-0 flex items-center justify-center text-sm text-muted">
           Nothing to show
         </p>
       )}
