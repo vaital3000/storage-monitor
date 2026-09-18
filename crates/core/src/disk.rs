@@ -5,6 +5,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Space on the volume that contains a path.
+///
+/// `used = total - free` is the container-level figure: on APFS all volumes of a container
+/// (System, VM, Preboot, the data volume) share one pool, so `used` includes them and can
+/// exceed what a scan of the data volume finds. `available` is what the user can still
+/// write; `free` also includes the blocks reserved for the superuser.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskUsage {
@@ -14,9 +20,11 @@ pub struct DiskUsage {
     pub available: u64,
     /// Bytes free overall (`f_bfree`).
     pub free: u64,
+    /// `total - free`.
     pub used: u64,
 }
 
+/// Usage of the volume that contains `path`.
 pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
     let stat = nix::sys::statvfs::statvfs(path).map_err(io::Error::from)?;
     let frag = stat.fragment_size() as u64;
@@ -40,8 +48,9 @@ mod tests {
     fn usage_of_the_temp_dir_is_consistent() {
         let usage = disk_usage(std::env::temp_dir().as_path()).unwrap();
         assert!(usage.total > 0);
-        assert!(usage.available <= usage.total);
-        assert_eq!(usage.used + usage.free, usage.total);
+        assert!(usage.free <= usage.total, "{usage:?}");
+        assert!(usage.available <= usage.free, "{usage:?}");
+        assert!(usage.used <= usage.total, "{usage:?}");
     }
 
     #[test]

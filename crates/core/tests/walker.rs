@@ -20,7 +20,8 @@ fn fixture() -> TempDir {
     write(&root.join("docs/notes/a.md"), 100);
     write(&root.join("docs/notes/b.md"), 200);
     write(&root.join(".hidden/secret.bin"), 50);
-    write(&root.join("big.bin"), 20_000);
+    // Larger than docs/ even where directories occupy a 4 KiB block each (ext4).
+    write(&root.join("big.bin"), 40_000);
     fs::create_dir_all(root.join("empty")).unwrap();
     dir
 }
@@ -41,7 +42,7 @@ fn scans_a_tree_with_logical_sizes_counts_and_kinds() {
 
     assert_eq!(&*tree.root().name, dir.path().to_string_lossy().as_ref());
     assert_eq!(tree.root().kind, NodeKind::Dir);
-    assert_eq!(tree.root().logical_size, 3_000 + 100 + 200 + 50 + 20_000);
+    assert_eq!(tree.root().logical_size, 3_000 + 100 + 200 + 50 + 40_000);
     assert!(
         tree.root().size >= tree.root().logical_size,
         "allocated size counts whole blocks"
@@ -60,7 +61,7 @@ fn scans_a_tree_with_logical_sizes_counts_and_kinds() {
     assert!(!tree.has_children(empty_id));
     let (_, big) = child(tree, Tree::ROOT, "big.bin");
     assert_eq!(big.kind, NodeKind::File);
-    assert_eq!(big.logical_size, 20_000);
+    assert_eq!(big.logical_size, 40_000);
 
     assert_eq!(result.stats.files, 5);
     assert_eq!(result.stats.dirs, 5, "root, docs, notes, .hidden, empty");
