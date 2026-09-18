@@ -136,8 +136,9 @@ fn check_entry(entry: &PlanEntry, limits: &Limits, sys: &dyn System) -> Verdict 
 /// stages use, so that a dialog and the log after it cannot blame different things for one
 /// entry that never changed in between.
 ///
-/// About [`System::symlink_metadata`] only. A deletion that fails is [`EntryResult::Failed`]
-/// with the port's own message, not a reason from here.
+/// About [`System::symlink_metadata`] only. A deletion that fails is answered in `run_entry`
+/// instead: the port's own message in [`EntryResult::Failed`], or `Skipped` when the error
+/// says the entry was already gone and so nothing was destroyed.
 fn reason_for(err: &SystemError) -> BlockReason {
     match err {
         // The guards judged where the path points, without insisting anything is there.
@@ -166,8 +167,18 @@ fn reason_for(err: &SystemError) -> BlockReason {
 /// deletion is guarded where it happens instead of by a promise made upstream. A path the
 /// guards now refuse comes back as `Skipped` with the reason they gave.
 ///
+/// An entry that goes away while the batch runs is `Skipped { reason: Missing }` and not a
+/// failure, whichever side of the last look it goes away on: this app destroyed nothing, and
+/// both windows of that race are one syscall apart.
+///
 /// In [`Mode::Trash`] the freed bytes are what *will* be freed once the Trash is emptied
 /// (ADR 0003); the number is the same and only the wording in the UI differs.
+///
+/// There is no cancellation seam, deliberately, in phase 2a. A batch runs to its end, and a
+/// single `remove` of a 50 GB tree is one call into the port that nothing here can interrupt
+/// — a caller on a worker thread cannot offer a Stop button that does anything. The place to
+/// add one is the port, not this loop, and it is not needed until a module deletes thousands
+/// of entries at once.
 pub fn execute(preview: &Preview, limits: &Limits, sys: &dyn System) -> Outcome {
     // One instant for the whole batch, read before the first deletion: the log timestamps
     // an action, not an entry, and this is when the action began.
@@ -183,6 +194,12 @@ pub fn execute(preview: &Preview, limits: &Limits, sys: &dyn System) -> Outcome 
     // first is removed, and the other is then `Missing` — unless the descendant came first,
     // in which case its bytes are counted inside its ancestor's as well. A number in that
     // preview's own log, wrong only for a preview that was already forged.
+    //
+    // If that ever changes — a nesting pass here, or anything else that needs `judged` in
+    // this stage — write the newtype that day: a `Judged(PathBuf)` the port cannot be handed
+    // at all. Today the two forms are told apart only by a volume that folds two spellings
+    // into one name, which is every Mac and no Linux runner; the moment `judged` is in scope
+    // next to the deletion, that is too thin a thread to hang it on.
     for entry in &preview.entries {
         let outcome = run_entry(entry, preview.mode, limits, sys);
         if let EntryResult::Removed { bytes } = &outcome.result {
@@ -192,10 +209,21 @@ pub fn execute(preview: &Preview, limits: &Limits, sys: &dyn System) -> Outcome 
         }
         entries.push(outcome);
     }
+    // The one invariant a reader of the log depends on, and one public field plus
+    // `Deserialize` away from being representable: the total is the entries, nothing else.
+    debug_assert_eq!(
+        freed_bytes,
+        entries.iter().fold(0u64, |sum, entry| match entry.result {
+            EntryResult::Removed { bytes } => sum.saturating_add(bytes),
+            _ => sum,
+        }),
+        "freed_bytes must be the sum over the removed entries"
+    );
     Outcome {
         entries,
         freed_bytes,
         at,
+        mode: preview.mode,
     }
 }
 
@@ -233,9 +261,6 @@ fn run_entry(entry: &PreviewEntry, mode: Mode, limits: &Limits, sys: &dyn System
     };
     let meta = match sys.symlink_metadata(&path) {
         Ok(meta) => meta,
-        // Nothing here closes the window between this answer and the deletion below: an
-        // entry that vanishes inside it comes back as `Failed`, because the port was asked
-        // and answered. Only one that was already gone is `Skipped`.
         Err(err) => return skipped(path, reason_for(&err)),
     };
     // What the preview showed the user is what they confirmed. A file where the dialog said
@@ -254,6 +279,14 @@ fn run_entry(entry: &PreviewEntry, mode: Mode, limits: &Limits, sys: &dyn System
             // The size the plan carried and the dialog promised. Re-reading it would mean
             // walking a subtree that is no longer there.
             Ok(()) => EntryResult::Removed { bytes: entry.size },
+            // The entry went away in the syscall between the check above and this one. The
+            // app reports what it did, and it did nothing: `Skipped`, exactly as for an
+            // entry that was already gone when the batch reached it. Those two windows are
+            // one syscall apart and neither is a fault, so a red row saying "no longer
+            // exists" would alarm a user about a race that cost them nothing.
+            Err(SystemError::Missing(_)) => EntryResult::Skipped {
+                reason: BlockReason::Missing,
+            },
             // `remove` is not atomic: a tree can be part-deleted and then fail, and this
             // reports 0 bytes for gigabytes that are really gone. A deliberate lower bound —
             // measuring the partial progress would mean walking what is left of a tree that
@@ -271,24 +304,25 @@ mod tests {
     use super::*;
     use crate::scan::NodeKind;
     use crate::system::TestSystem;
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, TimeDelta, Utc};
     use std::fs::{self, Metadata};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     /// A port that cannot look at anything, records what it was asked about, and screams if
-    /// asked to delete.
+    /// asked to delete. Both stages use it: an entry neither of them can describe is one
+    /// neither of them may delete, and the scream is how a test says so.
     ///
     /// `Limits::check` stats the entry too, so on a real filesystem it reports anything but
-    /// "not found" before the preview ever gets to look. What is left for the preview to
-    /// meet is a race — the entry was readable a syscall ago and is not now — and a race is
-    /// not a thing to reproduce with `chmod`.
+    /// "not found" before either stage gets to look. What is left for them to meet is a race
+    /// — the entry was readable a syscall ago and is not now — and a race is not a thing to
+    /// reproduce with `chmod`.
     struct Failing {
         /// What `symlink_metadata` answers. A function, because which `SystemError` arrives
         /// is the whole point of two of the tests below.
         error: fn(&Path) -> SystemError,
         /// Every path the port was asked about, in order. Without it a test can only check
-        /// what `preview` stored, never what it went and looked at.
+        /// what the stage stored, never what it went and looked at.
         asked: Mutex<Vec<PathBuf>>,
     }
 
@@ -332,11 +366,17 @@ mod tests {
         }
 
         fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
-            unreachable!("a preview asked to trash {}", path.display());
+            unreachable!(
+                "this port never deletes, and was asked to trash {}",
+                path.display()
+            );
         }
 
         fn remove(&self, path: &Path) -> Result<(), SystemError> {
-            unreachable!("a preview asked to remove {}", path.display());
+            unreachable!(
+                "this port never deletes, and was asked to remove {}",
+                path.display()
+            );
         }
 
         fn now(&self) -> DateTime<Utc> {
@@ -366,10 +406,21 @@ mod tests {
         }
     }
 
-    /// A [`TestSystem`] that writes every deletion down before performing it — before, so
-    /// that a path the port itself refuses is recorded as well.
+    /// How far [`Recording`] moves the clock on each deletion.
+    fn tick() -> TimeDelta {
+        TimeDelta::seconds(1)
+    }
+
+    /// A [`TestSystem`] that writes down every path it is asked about and every deletion —
+    /// the deletion before performing it, so that a path the port itself refuses is recorded
+    /// as well — and moves the clock by [`tick`] as it deletes.
+    ///
+    /// The clock is the point of the last part: `TestSystem`'s own stands still, so
+    /// `outcome.at == sys.now()` holds for every instant the port could produce and asserts
+    /// nothing at all. Under this one the two ends of a batch are different instants.
     struct Recording<'a> {
         inner: &'a TestSystem,
+        stats: Mutex<Vec<PathBuf>>,
         done: Mutex<Vec<Deletion>>,
     }
 
@@ -377,8 +428,15 @@ mod tests {
         fn new(inner: &'a TestSystem) -> Self {
             Self {
                 inner,
+                stats: Mutex::new(Vec::new()),
                 done: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Every path the port was asked to describe, in order — the preview's questions
+        /// first, then the batch's.
+        fn stats(&self) -> Vec<PathBuf> {
+            self.stats.lock().expect("an unpoisoned record").clone()
         }
 
         fn done(&self) -> Vec<Deletion> {
@@ -390,11 +448,16 @@ mod tests {
                 .lock()
                 .expect("an unpoisoned record")
                 .push(deletion);
+            self.inner.advance(tick());
         }
     }
 
     impl System for Recording<'_> {
         fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError> {
+            self.stats
+                .lock()
+                .expect("an unpoisoned record")
+                .push(path.to_path_buf());
             self.inner.symlink_metadata(path)
         }
 
@@ -413,14 +476,60 @@ mod tests {
         }
     }
 
+    /// A [`TestSystem`] in which one entry disappears in the syscall between the last look
+    /// and the deletion — the narrower of the two windows of that race, and the only way to
+    /// reach it, since nothing a test can do from outside fits between two calls.
+    struct Vanishing<'a> {
+        inner: &'a TestSystem,
+        when: PathBuf,
+    }
+
+    impl<'a> Vanishing<'a> {
+        fn new(inner: &'a TestSystem, when: PathBuf) -> Self {
+            Self { inner, when }
+        }
+
+        fn take_it(&self, path: &Path) {
+            if path == self.when {
+                // One of the two applies and the other fails; which is not the point.
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    impl System for Vanishing<'_> {
+        fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError> {
+            self.inner.symlink_metadata(path)
+        }
+
+        fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
+            self.take_it(path);
+            self.inner.move_to_trash(path)
+        }
+
+        fn remove(&self, path: &Path) -> Result<(), SystemError> {
+            self.take_it(path);
+            self.inner.remove(path)
+        }
+
+        fn now(&self) -> DateTime<Utc> {
+            self.inner.now()
+        }
+    }
+
+    /// Sizes rise with the position — 10, 20, 30 — so that a total over a batch names one
+    /// entry and not just a count of them. With every entry at 10, `freed_bytes == 10` is as
+    /// true of the entry that was deleted as of the one that was not.
     fn plan(sys: &TestSystem, names: &[&str], mode: Mode) -> Plan {
         Plan {
             entries: names
                 .iter()
-                .map(|n| PlanEntry {
+                .enumerate()
+                .map(|(i, n)| PlanEntry {
                     path: sys.root().join(n),
                     kind: NodeKind::File,
-                    size: 10,
+                    size: 10 * (i as u64 + 1),
                 })
                 .collect(),
             mode,
@@ -728,6 +837,19 @@ mod tests {
             // nothing here for the rule to do. Asserting the duller outcome instead would
             // let a green run on such a volume read as coverage it does not have — and CI
             // runs the core tests on Linux as well as on macOS.
+            //
+            // On macOS it is not a volume property any more, it is a broken fixture: every
+            // stock Mac folds case, and the case-sensitive variant of APFS still folds
+            // normalization. Silence there would turn the strongest test in this file into
+            // a no-op that still reports `ok`.
+            // `assert!(!cfg!(…))` is what this wants to be, and clippy refuses an
+            // assertion whose value is a constant.
+            if cfg!(target_os = "macos") {
+                panic!(
+                    "{alias} is its own name here: this volume folds neither case nor \
+                     normalization, and the aliasing rules are untested on it"
+                );
+            }
             eprintln!("skipped: {alias} is its own name on this volume");
             return;
         }
@@ -902,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn one_failing_entry_does_not_stop_the_batch() {
+    fn an_entry_that_vanished_between_the_stages_does_not_stop_the_batch() {
         let sys = TestSystem::new();
         fs::write(sys.root().join("a.bin"), b"x").unwrap();
         fs::write(sys.root().join("b.bin"), b"x").unwrap();
@@ -921,7 +1043,7 @@ mod tests {
             outcome.entries[1].result,
             EntryResult::Removed { .. }
         ));
-        assert_eq!(outcome.freed_bytes, 10, "only what was really deleted");
+        assert_eq!(outcome.freed_bytes, 20, "only what was really deleted");
     }
 
     #[test]
@@ -941,7 +1063,9 @@ mod tests {
             }
         ));
         assert!(
-            sys.root().join("a.bin").is_dir(),
+            fs::symlink_metadata(sys.root().join("a.bin"))
+                .unwrap()
+                .is_dir(),
             "the replacement is left alone"
         );
     }
@@ -968,7 +1092,7 @@ mod tests {
             fs::symlink_metadata(sys.root().join("a.bin")).is_ok(),
             "a failure leaves the entry alone"
         );
-        assert_eq!(outcome.freed_bytes, 10);
+        assert_eq!(outcome.freed_bytes, 20);
     }
 
     #[test]
@@ -1069,7 +1193,7 @@ mod tests {
         let p = Plan {
             entries: vec![
                 entry(keep.clone(), NodeKind::Symlink, 10),
-                entry(sys.root().join("go.bin"), NodeKind::File, 10),
+                entry(sys.root().join("go.bin"), NodeKind::File, 20),
             ],
             mode: Mode::Permanent,
         };
@@ -1083,10 +1207,13 @@ mod tests {
         assert_eq!(fs::read(&keep).unwrap(), b"keep", "still there, untouched");
         assert!(matches!(
             outcome.entries[1].result,
-            EntryResult::Removed { bytes: 10 }
+            EntryResult::Removed { bytes: 20 }
         ));
         assert!(fs::symlink_metadata(sys.root().join("go.bin")).is_err());
-        assert_eq!(outcome.freed_bytes, 10);
+        assert_eq!(
+            outcome.freed_bytes, 20,
+            "the entry that went, not the one that was refused"
+        );
         let kinds: Vec<NodeKind> = outcome.entries.iter().map(|e| e.kind).collect();
         assert_eq!(
             kinds,
@@ -1094,6 +1221,303 @@ mod tests {
             "a blocked row carries the plan's unverified claim on into the log; a deleted \
              one carries what the disk said"
         );
+    }
+
+    #[test]
+    fn a_symlink_that_became_a_directory_is_skipped() {
+        // The transition the re-check exists for, and the only one where the loss has no
+        // bound: the row promises a symlink and the 0 bytes a scan records for one, and by
+        // the time the batch runs that name is a real directory with a tree under it.
+        // Deleting it would destroy all of it and write `Removed { bytes: 0 }` in the log,
+        // under the kind the user confirmed — so the log would not even say what went.
+        let sys = TestSystem::new();
+        let target = sys.root().join("target");
+        fs::create_dir(&target).unwrap();
+        let swapped = sys.root().join("swapped");
+        std::os::unix::fs::symlink(&target, &swapped).unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let p = Plan {
+            entries: vec![entry(swapped.clone(), NodeKind::Symlink, 0)],
+            mode: Mode::Permanent,
+        };
+        let checked = preview(&p, &limits, &sys);
+        assert_eq!(checked.entries[0].kind, NodeKind::Symlink);
+        fs::remove_file(&swapped).unwrap();
+        let deep = swapped.join("one/two");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("precious.bin"), b"keep").unwrap();
+        let outcome = execute(&checked, &limits, &sys);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::KindChanged
+            }
+        );
+        assert_eq!(
+            fs::read(deep.join("precious.bin")).unwrap(),
+            b"keep",
+            "the tree that took the name is untouched, all the way down"
+        );
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    #[test]
+    fn a_directory_that_became_a_symlink_is_skipped() {
+        // The other direction. Deleting the link would free none of the bytes the dialog
+        // promised, leave the directory the user meant where it was, and say `Removed`.
+        let sys = TestSystem::new();
+        let swapped = sys.root().join("swapped");
+        fs::create_dir(&swapped).unwrap();
+        let elsewhere = sys.root().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let p = Plan {
+            entries: vec![entry(swapped.clone(), NodeKind::Dir, 100)],
+            mode: Mode::Trash,
+        };
+        let checked = preview(&p, &limits, &sys);
+        assert_eq!(checked.entries[0].kind, NodeKind::Dir);
+        fs::remove_dir(&swapped).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &swapped).unwrap();
+        let outcome = execute(&checked, &limits, &sys);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::KindChanged
+            }
+        );
+        assert!(
+            fs::symlink_metadata(&swapped).unwrap().is_symlink(),
+            "the link that took the name is left alone"
+        );
+        assert_eq!(fs::read_dir(sys.trash_dir()).unwrap().count(), 0);
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    #[test]
+    fn a_file_that_became_a_symlink_is_skipped() {
+        // The transition a comparison of "is it a directory?" cannot see: neither form is
+        // one, so such a check would call them equal and delete the link — freeing nothing,
+        // while the log claims the file's bytes and the file is still somewhere on the disk.
+        let sys = TestSystem::new();
+        let swapped = sys.root().join("a.bin");
+        fs::write(&swapped, b"x").unwrap();
+        let other = sys.root().join("other.bin");
+        fs::write(&other, b"keep").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&plan(&sys, &["a.bin"], Mode::Permanent), &limits, &sys);
+        assert_eq!(checked.entries[0].kind, NodeKind::File);
+        fs::remove_file(&swapped).unwrap();
+        std::os::unix::fs::symlink(&other, &swapped).unwrap();
+        let outcome = execute(&checked, &limits, &sys);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::KindChanged
+            }
+        );
+        assert!(
+            fs::symlink_metadata(&swapped).unwrap().is_symlink(),
+            "the link that took the name is left alone"
+        );
+        assert_eq!(fs::read(&other).unwrap(), b"keep");
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_looked_at_when_the_batch_runs_is_not_called_gone() {
+        // The same rule as one stage earlier, now in the stage that deletes: `Missing` sends
+        // a user hunting for a ghost while `Unreadable` sends them to Full Disk Access, and
+        // only one of them is true. The double's deletion methods are `unreachable!`, which
+        // is the other half of the assertion — an entry nobody can describe is not deleted.
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&plan(&sys, &["a.bin"], Mode::Permanent), &limits, &sys);
+        let port = Failing::unreadable();
+        let outcome = execute(&checked, &limits, &port);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::Unreadable
+            }
+        );
+        assert_eq!(
+            port.asked(),
+            vec![sys.root().join("a.bin")],
+            "and it asked about the path it would have deleted"
+        );
+        assert_eq!(fs::read(sys.root().join("a.bin")).unwrap(), b"x");
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    #[test]
+    fn a_path_the_port_refuses_when_the_batch_runs_is_malformed_not_unreadable() {
+        // `Rejected` is a bug on this side of the port, not a permission the user can grant.
+        // One `Err(_)` away from being collapsed into one of the other two, in the stage
+        // where the row it produces is the only record of what happened.
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let checked = preview(&plan(&sys, &["a.bin"], Mode::Trash), &limits, &sys);
+        let outcome = execute(&checked, &limits, &Failing::rejecting());
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::Malformed
+            }
+        );
+        assert_eq!(fs::read(sys.root().join("a.bin")).unwrap(), b"x");
+        assert_eq!(outcome.freed_bytes, 0);
+    }
+
+    #[test]
+    fn an_entry_that_vanishes_inside_the_deletion_is_skipped_not_failed() {
+        // The narrower window of the same race: the check above saw the entry, and it was
+        // gone one syscall later. The app destroyed nothing, so it reports that it did
+        // nothing — the same word as for an entry that was already gone when the batch
+        // reached it. A red row reading "no longer exists" would alarm a user about a race
+        // that cost them nothing.
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        fs::write(sys.root().join("b.bin"), b"x").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let p = plan(&sys, &["a.bin", "b.bin"], Mode::Trash);
+        let checked = preview(&p, &limits, &sys);
+        let port = Vanishing::new(&sys, sys.root().join("a.bin"));
+        let outcome = execute(&checked, &limits, &port);
+        assert_eq!(
+            outcome.entries[0].result,
+            EntryResult::Skipped {
+                reason: BlockReason::Missing
+            }
+        );
+        assert!(matches!(
+            outcome.entries[1].result,
+            EntryResult::Removed { bytes: 20 }
+        ));
+    }
+
+    #[test]
+    fn an_entry_that_vanished_inside_the_deletion_frees_nothing() {
+        // The other half: not a failure, and not a removal either. Counting it would put
+        // bytes in the log for an entry this app never touched.
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        fs::write(sys.root().join("b.bin"), b"x").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let p = plan(&sys, &["a.bin", "b.bin"], Mode::Trash);
+        let checked = preview(&p, &limits, &sys);
+        let port = Vanishing::new(&sys, sys.root().join("a.bin"));
+        let outcome = execute(&checked, &limits, &port);
+        assert_eq!(
+            outcome.freed_bytes, 20,
+            "the bytes of the entry that really went, and only those"
+        );
+        assert_eq!(
+            fs::read_dir(sys.trash_dir()).unwrap().count(),
+            1,
+            "and nothing of the vanished one reached the Trash"
+        );
+    }
+
+    #[test]
+    fn the_batch_is_timestamped_when_it_began() {
+        // Under `TestSystem` alone the clock stands still, so `outcome.at == sys.now()` is
+        // true of every instant there is. This port moves it as it deletes, which is what
+        // makes the assertion an assertion: `at` is the start of the batch, the key the
+        // Activity screen sorts by, and not whenever the last tree finished coming down.
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        fs::write(sys.root().join("b.bin"), b"x").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let started = sys.now();
+        let port = Recording::new(&sys);
+        let p = plan(&sys, &["a.bin", "b.bin"], Mode::Trash);
+        let outcome = execute(&preview(&p, &limits, &port), &limits, &port);
+        assert_eq!(
+            sys.now(),
+            started + tick() * 2,
+            "the clock did move under it"
+        );
+        assert_eq!(
+            outcome.at, started,
+            "and the batch is stamped with the instant it began"
+        );
+    }
+
+    #[test]
+    fn the_stat_and_the_deletion_both_use_the_path_the_guards_returned_now() {
+        // The preview stored `<root>/dir/a.bin`; between the stages `dir` becomes a link to
+        // another directory, so the guards — which resolve parents — answer a different path
+        // for the same spelling. Everything after them has to use that answer: the stat that
+        // decides, the deletion that acts, and the row that records it. Deleting where the
+        // guards last looked is the whole point of re-checking; staying on the preview's
+        // path would delete somewhere they did not.
+        let sys = TestSystem::new();
+        fs::create_dir(sys.root().join("dir")).unwrap();
+        fs::write(sys.root().join("dir/a.bin"), b"stale").unwrap();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let port = Recording::new(&sys);
+        let checked = preview(&plan(&sys, &["dir/a.bin"], Mode::Permanent), &limits, &port);
+        assert_eq!(checked.entries[0].path, sys.root().join("dir/a.bin"));
+        fs::create_dir(sys.root().join("other")).unwrap();
+        let fresh = sys.root().join("other/a.bin");
+        fs::write(&fresh, b"fresh").unwrap();
+        fs::remove_dir_all(sys.root().join("dir")).unwrap();
+        std::os::unix::fs::symlink(sys.root().join("other"), sys.root().join("dir")).unwrap();
+        let outcome = execute(&checked, &limits, &port);
+        assert_eq!(
+            port.stats(),
+            vec![sys.root().join("dir/a.bin"), fresh.clone()],
+            "the preview asked about its own path, the batch about the one it re-checked"
+        );
+        assert_eq!(port.done(), vec![Deletion::Removed(fresh.clone())]);
+        assert_eq!(
+            outcome.entries[0].path, fresh,
+            "and the row names what was deleted, not what the preview held"
+        );
+        assert!(fs::symlink_metadata(&fresh).is_err());
+    }
+
+    #[test]
+    fn an_empty_preview_is_an_empty_outcome() {
+        // What the command gets when the user clears the selection: no rows, no bytes, and
+        // still a timestamp and a mode, because the log takes whole outcomes.
+        let sys = TestSystem::new();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        let outcome = execute(
+            &Preview {
+                entries: vec![],
+                total_bytes: 0,
+                mode: Mode::Permanent,
+            },
+            &limits,
+            &sys,
+        );
+        assert!(outcome.entries.is_empty());
+        assert_eq!(outcome.freed_bytes, 0);
+        assert_eq!(outcome.mode, Mode::Permanent);
+        assert_eq!(outcome.at, sys.now());
+    }
+
+    #[test]
+    fn the_mode_of_the_preview_is_the_mode_of_the_outcome() {
+        // `Removed` is two different facts — moved and recoverable, or gone — and a row of
+        // the action log is read long after the dialog that produced it. Both directions are
+        // pinned, as for the preview: an outcome that always said `Trash` would satisfy one.
+        let sys = TestSystem::new();
+        let limits = Limits::new(sys.root().to_path_buf(), vec![]);
+        for mode in [Mode::Trash, Mode::Permanent] {
+            fs::write(sys.root().join("a.bin"), b"x").unwrap();
+            let checked = preview(&plan(&sys, &["a.bin"], mode), &limits, &sys);
+            let outcome = execute(&checked, &limits, &sys);
+            assert!(matches!(
+                outcome.entries[0].result,
+                EntryResult::Removed { .. }
+            ));
+            assert_eq!(outcome.mode, mode);
+        }
     }
 
     #[test]
@@ -1216,6 +1640,18 @@ mod tests {
             // Case- and normalization-sensitive: the two names are two directories, the two
             // forms of a `Checked` cannot differ, and asserting the duller outcome would let
             // a green run read as coverage it does not have. CI runs these on Linux too.
+            //
+            // Not on macOS, though — see the note in `assert_one_directory_counted_once`.
+            // This is the one test that tells `Checked::path` from `Checked::judged`, and a
+            // Mac where it quietly does nothing is a Mac with no such test at all.
+            // `assert!(!cfg!(…))` is what this wants to be, and clippy refuses an
+            // assertion whose value is a constant.
+            if cfg!(target_os = "macos") {
+                panic!(
+                    "{asked_as} is its own name here: this volume folds neither case nor \
+                     normalization, and the aliasing rules are untested on it"
+                );
+            }
             eprintln!("skipped: {asked_as} is its own name on this volume");
             return;
         }

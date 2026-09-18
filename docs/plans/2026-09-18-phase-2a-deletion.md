@@ -768,8 +768,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = ActionLog::new(dir.path().join("actions.jsonl"));
         let at = chrono::Utc::now();
-        log.append(Mode::Trash, at, &[outcome("/h/a", 10)]).unwrap();
-        log.append(Mode::Permanent, at, &[outcome("/h/b", 20), outcome("/h/c", 30)]).unwrap();
+        log.append(&batch(Mode::Trash, at, vec![outcome("/h/a", 10)])).unwrap();
+        log.append(&batch(Mode::Permanent, at, vec![outcome("/h/b", 20), outcome("/h/c", 30)])).unwrap();
         let entries = log.tail(10).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].path, "/h/c");
@@ -783,7 +783,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = ActionLog::new(dir.path().join("actions.jsonl"));
         for i in 0..5 {
-            log.append(Mode::Trash, chrono::Utc::now(), &[outcome(&format!("/h/{i}"), 1)]).unwrap();
+            log.append(&batch(Mode::Trash, chrono::Utc::now(), vec![outcome(&format!("/h/{i}"), 1)])).unwrap();
         }
         let entries = log.tail(2).unwrap();
         assert_eq!(entries.len(), 2);
@@ -795,7 +795,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("actions.jsonl");
         let log = ActionLog::new(path.clone());
-        log.append(Mode::Trash, chrono::Utc::now(), &[outcome("/h/a", 1)]).unwrap();
+        log.append(&batch(Mode::Trash, chrono::Utc::now(), vec![outcome("/h/a", 1)])).unwrap();
         std::fs::write(&path, format!("{{ truncated\n{}", std::fs::read_to_string(&path).unwrap())).unwrap();
         assert_eq!(log.tail(10).unwrap().len(), 1);
     }
@@ -816,7 +816,7 @@ mod tests {
             kind: NodeKind::File,
             result: EntryResult::Failed { message: "permission denied".into() },
         };
-        log.append(Mode::Trash, chrono::Utc::now(), &[entry]).unwrap();
+        log.append(&batch(Mode::Trash, chrono::Utc::now(), vec![entry])).unwrap();
         let read = &log.tail(1).unwrap()[0];
         assert_eq!(read.bytes, 0);
         assert!(matches!(read.result, LogResult::Failed));
@@ -1370,7 +1370,7 @@ Wording, in English as everywhere in the UI:
 
 - Trash: "Items move to the Trash. Space is freed when you empty it."
 - Permanent: "Items are deleted immediately. This cannot be undone."
-- Result view: "Moved 12 items to the Trash · 4.3 GB" or "Deleted 12 items · 4.3 GB", plus "Show in Trash" for the Trash mode — never "Put Back", which macOS may not offer (design section 11).
+- Result view: "Moved 12 items to the Trash · 4.3 GB" or "Deleted 12 items · 4.3 GB", plus "Show in Trash" for the Trash mode — never "Put Back", which macOS may not offer (design section 11). That button opens the Trash folder, not a single entry: `move_to_trash` returns nothing and the crate behind it gives no post-move URL on macOS, so an `Outcome` has nowhere to carry one. Do not wire up a per-item reveal.
 
 **Step 4: Run the tests and commit**
 

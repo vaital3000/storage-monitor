@@ -99,7 +99,7 @@ pub struct PreviewEntry { pub path: PathBuf, pub kind: NodeKind, pub size: u64, 
 pub struct Preview { pub entries: Vec<PreviewEntry>, pub total_bytes: u64, pub mode: Mode }
 
 pub enum EntryResult { Removed { bytes: u64 }, Failed { message: String }, Skipped { reason: BlockReason } }
-pub struct Outcome { pub entries: Vec<EntryOutcome>, pub freed_bytes: u64, pub at: DateTime<Utc> }
+pub struct Outcome { pub entries: Vec<EntryOutcome>, pub freed_bytes: u64, pub at: DateTime<Utc>, pub mode: Mode }
 ```
 
 `plan → preview → execute`, as in design section 9. `preview` has no side
@@ -150,6 +150,16 @@ Guards live in `guards.rs` as pure functions:
   a forged preview buys nothing. Then `symlink_metadata` again: the kind must
   still match the plan, or the entry becomes `Skipped { reason: KindChanged }`. A changed
   size is fine — the disk keeps living.
+
+`Outcome` carries the mode because `Removed` means two different things without
+it: *moved, recoverable, nothing freed yet* in Trash mode, *gone* in Permanent.
+A log line has to be readable on its own.
+
+An entry that disappears between the re-validation and the deletion is reported
+as `Skipped { reason: Missing }`, not as a failure. The app deleted nothing and
+nothing is wrong, so a red row saying "no longer exists" would alarm the user
+about a benign race — and it makes both windows of that race, one syscall apart,
+report the same thing.
 
 A failing entry does not abort the batch. Every entry, successful or not, is
 appended to `~/Library/Application Support/storage-monitor/actions.jsonl`

@@ -158,9 +158,22 @@ pub struct Outcome {
     pub entries: Vec<EntryOutcome>,
     /// Bytes of the entries that were really removed. In [`Mode::Trash`] this is what will
     /// be freed once the Trash is emptied, and the UI says exactly that (ADR 0003).
+    ///
+    /// A lower bound in one direction and an upper bound in the other, both by design. A
+    /// tree that was part-deleted before something failed contributes nothing, since
+    /// [`EntryResult::Failed`] carries no bytes. And a scan attributes hard-linked data to
+    /// the lexicographically smallest path: deleting that one reports its full size here
+    /// while the data lives on under the other links, so the volume gives back less than
+    /// this number says. [`Preview::total_bytes`] promises the same figure beforehand; this
+    /// is the one the user reads afterwards, which is the worse place to be surprised.
     pub freed_bytes: u64,
     /// When the batch ran, from `System::now`.
     pub at: DateTime<Utc>,
+    /// How the entries left, mirroring [`Preview::mode`]. Without it [`EntryResult::Removed`]
+    /// means two different things — *moved, recoverable, nothing freed yet* in
+    /// [`Mode::Trash`], *gone* in [`Mode::Permanent`] — and a line of the action log has to
+    /// be readable on its own, long after the dialog that produced it.
+    pub mode: Mode,
 }
 
 #[cfg(test)]
@@ -270,6 +283,7 @@ mod tests {
             }],
             freed_bytes: 10,
             at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            mode: Mode::Permanent,
         };
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(
@@ -282,6 +296,9 @@ mod tests {
                 }],
                 "freedBytes": 10,
                 "at": "2023-11-14T22:13:20Z",
+                // Not `trash`: a log line that cannot say whether the bytes are gone or
+                // merely moved is a log line nobody can read.
+                "mode": "permanent",
             })
         );
         assert_eq!(serde_json::from_value::<Outcome>(json).unwrap(), outcome);
