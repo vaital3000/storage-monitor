@@ -140,8 +140,14 @@ Guards live in `guards.rs` as pure functions:
   it is the root picker in phase 2b.
 - **Nesting.** When a batch holds both `a/` and `a/b`, the descendant is
   dropped: otherwise its bytes are counted twice and its deletion fails with
-  "no such file".
-- **Re-validation at execution time.** `symlink_metadata` again: the kind must
+  "no such file". Entries are compared by their *resolved* form, not by the one
+  that will be deleted — two spellings of one directory (`Data` and `data`, or
+  `café` in NFC and NFD, which needs no user error) are byte-different and would
+  otherwise both survive and promise the same megabytes twice.
+- **Re-validation at execution time.** The guards run again, not just a kind
+  comparison: `Preview` has public fields and derives `Deserialize`, so one can be
+  built without ever passing them, and re-checking at the point of deletion means
+  a forged preview buys nothing. Then `symlink_metadata` again: the kind must
   still match the plan, or the entry becomes `Skipped { reason: KindChanged }`. A changed
   size is fine — the disk keeps living.
 

@@ -456,8 +456,20 @@ impl Limits {
 }
 
 impl Limits {
-    /// Normalizes `path` and applies every rule. What it returns is what the engine deletes.
-    pub fn check(&self, path: &Path) -> Result<PathBuf, BlockReason> { ... }
+    /// Normalizes `path` and applies every rule.
+    pub fn check(&self, path: &Path) -> Result<Checked, BlockReason> { ... }
+}
+
+/// A path that passed the rules, in the two forms the engine needs.
+pub struct Checked {
+    /// What gets deleted: the parent resolved, the last component exactly as written, so a
+    /// symlink is removed as a link.
+    pub path: PathBuf,
+    /// What the rules judged: fully resolved when the entry exists and is not a symlink.
+    /// Comparisons between entries belong here — two spellings of one directory (`Data` and
+    /// `data` on a case-insensitive volume, `café` in NFC and NFD) share it and differ in
+    /// `path`.
+    pub judged: PathBuf,
 }
 
 /// Per entry, in input order: false when another entry in the list contains it.
@@ -531,11 +543,11 @@ mod tests {
         fs::write(sys.root().join("a.bin"), b"x").unwrap();
         let mut p = plan(&sys, &["a.bin", "gone.bin"], Mode::Trash);
         p.entries[1].size = 999;
-        let preview = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
-        assert_eq!(preview.entries[0].status, EntryStatus::Ready);
-        assert_eq!(preview.entries[1].status, EntryStatus::Blocked(BlockReason::Missing));
-        assert_eq!(preview.total_bytes, 10, "a blocked entry contributes nothing");
-        assert_eq!(preview.mode, Mode::Trash);
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[0].status, EntryStatus::Ready);
+        assert_eq!(checked.entries[1].status, EntryStatus::Blocked(BlockReason::Missing));
+        assert_eq!(checked.total_bytes, 10, "a blocked entry contributes nothing");
+        assert_eq!(checked.mode, Mode::Trash);
     }
 
     #[test]
@@ -549,9 +561,9 @@ mod tests {
             ],
             mode: Mode::Permanent,
         };
-        let preview = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
-        assert_eq!(preview.entries[1].status, EntryStatus::Blocked(BlockReason::Nested));
-        assert_eq!(preview.total_bytes, 100, "the child's bytes are not counted twice");
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[1].status, EntryStatus::Blocked(BlockReason::Nested));
+        assert_eq!(checked.total_bytes, 100, "the child's bytes are not counted twice");
     }
 
     #[test]
@@ -561,7 +573,8 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let p = plan(&sys, &["a.bin"], Mode::Permanent);
         preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
-        assert!(file.exists());
+        // Not `exists`, which follows a symlink — the same idiom `system/test.rs` uses.
+        assert!(fs::symlink_metadata(&file).is_ok());
         assert_eq!(fs::read_dir(sys.trash_dir()).unwrap().count(), 0);
     }
 
@@ -570,8 +583,8 @@ mod tests {
         let sys = TestSystem::new();
         fs::create_dir(sys.root().join("a.bin")).unwrap();
         let p = plan(&sys, &["a.bin"], Mode::Trash); // planned as a File
-        let preview = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
-        assert_eq!(preview.entries[0].kind, NodeKind::Dir);
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[0].kind, NodeKind::Dir);
     }
 }
 ```
@@ -589,7 +602,7 @@ Expected: compile errors, `preview` is missing.
 pub fn preview(plan: &Plan, limits: &Limits, sys: &dyn System) -> Preview
 ```
 
-For each entry: run `limits.check(path)`, which already reports `Missing`, `Unreadable` and `Malformed` as well as the three placement reasons; then `sys.symlink_metadata` on what it returned (a `Missing` error becomes `Blocked(Missing)`) and record the kind the disk reports, through `NodeKind::from_metadata` — the same classification the walker uses, so a socket or a fifo is `Other` here as well. Rolling a private `if is_dir { Dir } else { File }` instead would make every such entry fail re-validation with `KindChanged` forever. Then apply `drop_nested` over the normalized paths of the entries that are still `Ready`, blocking the descendants with `Nested`. Sum `size` over `Ready` entries into `total_bytes`.
+For each entry: run `limits.check(path)`, which already reports `Missing`, `Unreadable` and `Malformed` as well as the three placement reasons; then `sys.symlink_metadata` on what it returned (a `Missing` error becomes `Blocked(Missing)`) and record the kind the disk reports, through `NodeKind::from_metadata` — the same classification the walker uses, so a socket or a fifo is `Other` here as well. Rolling a private `if is_dir { Dir } else { File }` instead would make every such entry fail re-validation with `KindChanged` forever. Then apply `drop_nested` over the **judged** paths of the entries that are still `Ready`, blocking the descendants with `Nested`. Judged, not normalized: the normalized form keeps the caller's spelling of the last component, and `drop_nested` compares byte-exact per component, so `Data` and `data` on a case-insensitive volume — or `café` in NFC and NFD, which needs no user error at all — would both stay ready and `total_bytes` would promise the same megabytes twice. Sum `size` over `Ready` entries into `total_bytes`.
 
 **Step 4: Run the tests**
 
@@ -619,7 +632,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         fs::write(sys.root().join("a.bin"), b"xxx").unwrap();
         let p = plan(&sys, &["a.bin"], Mode::Trash);
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
-        let outcome = execute(&preview(&p, &limits, &sys), &sys);
+        let outcome = execute(&preview(&p, &limits, &sys), &limits, &sys);
         assert_eq!(outcome.freed_bytes, 10);
         assert!(matches!(outcome.entries[0].result, EntryResult::Removed { bytes: 10 }));
         assert!(sys.trash_dir().join("a.bin").exists());
@@ -632,7 +645,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         fs::write(sys.root().join("a.bin"), b"xxx").unwrap();
         let p = plan(&sys, &["a.bin"], Mode::Permanent);
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
-        execute(&preview(&p, &limits, &sys), &sys);
+        execute(&preview(&p, &limits, &sys), &limits, &sys);
         assert!(!sys.root().join("a.bin").exists());
         assert_eq!(fs::read_dir(sys.trash_dir()).unwrap().count(), 0);
     }
@@ -646,7 +659,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
         let checked = preview(&p, &limits, &sys);
         fs::remove_file(sys.root().join("a.bin")).unwrap(); // vanishes between the stages
-        let outcome = execute(&checked, &sys);
+        let outcome = execute(&checked, &limits, &sys);
         assert!(matches!(outcome.entries[0].result, EntryResult::Skipped { reason: BlockReason::Missing }));
         assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
         assert_eq!(outcome.freed_bytes, 10, "only what was really deleted");
@@ -661,7 +674,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let checked = preview(&p, &limits, &sys);
         fs::remove_file(sys.root().join("a.bin")).unwrap();
         fs::create_dir(sys.root().join("a.bin")).unwrap(); // same name, now a directory
-        let outcome = execute(&checked, &sys);
+        let outcome = execute(&checked, &limits, &sys);
         assert!(matches!(outcome.entries[0].result, EntryResult::Skipped { reason: BlockReason::KindChanged }));
         assert!(sys.root().join("a.bin").is_dir(), "the replacement is left alone");
     }
@@ -675,7 +688,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
         let checked = preview(&p, &limits, &sys);
         sys.fail_next(&sys.root().join("a.bin"));
-        let outcome = execute(&checked, &sys);
+        let outcome = execute(&checked, &limits, &sys);
         assert!(matches!(outcome.entries[0].result, EntryResult::Failed { .. }));
         assert!(matches!(outcome.entries[1].result, EntryResult::Removed { .. }));
         assert!(sys.root().join("a.bin").exists(), "a failure leaves the entry alone");
@@ -687,7 +700,7 @@ git add crates/core && git commit -m "feat(core): preview a deletion plan agains
         let sys = TestSystem::new();
         let p = plan(&sys, &["gone.bin"], Mode::Trash);
         let limits = Limits::new(sys.root().to_path_buf(), vec![]);
-        let outcome = execute(&preview(&p, &limits, &sys), &sys);
+        let outcome = execute(&preview(&p, &limits, &sys), &limits, &sys);
         assert_eq!(outcome.entries.len(), 1);
         assert!(matches!(outcome.entries[0].result, EntryResult::Skipped { reason: BlockReason::Missing }));
         assert_eq!(outcome.freed_bytes, 0);
@@ -705,8 +718,10 @@ Expected: compile error, `execute` is missing.
 ```rust
 /// Runs a checked preview. Blocked entries are reported as skipped; a failure does not
 /// stop the rest of the batch.
-pub fn execute(preview: &Preview, sys: &dyn System) -> Outcome
+pub fn execute(preview: &Preview, limits: &Limits, sys: &dyn System) -> Outcome
 ```
+
+`execute` takes the limits and re-runs `check` on every ready entry, not only the kind comparison. `Preview` has public fields and derives `Deserialize`, so one can be built without ever passing the guards; re-checking here means a forged preview buys nothing, and the deletion is guarded at the point where it happens rather than by a promise made upstream. A path that now fails becomes `Skipped` with the reason the guards gave.
 
 Per entry: `Blocked(reason)` → `Skipped { reason }`. `Ready` → re-read `symlink_metadata` (missing → `Skipped { reason: Missing }`), compare `NodeKind::from_metadata` with the preview's kind (different → `Skipped { reason: KindChanged }`), then `move_to_trash` or `remove` by mode; an error becomes `Failed { message }`. `freed_bytes` sums the `Removed` entries. `at` comes from `sys.now()`.
 
