@@ -274,7 +274,13 @@ impl Subtree {
 
     /// Nodes in this subtree, itself included.
     pub fn count(&self) -> usize {
-        1 + self.children.iter().map(Subtree::count).sum::<usize>()
+        let mut total = 0;
+        let mut stack = vec![self];
+        while let Some(subtree) = stack.pop() {
+            total += 1;
+            stack.extend(&subtree.children);
+        }
+        total
     }
 
     /// Moves the nodes into an arena in breadth-first order (see [`Tree`]). Also returns

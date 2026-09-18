@@ -1,3 +1,8 @@
+//! Live counters shared between a running scan and its observers.
+//!
+//! The counters are approximate while the scan runs (hard-linked data is counted under
+//! every link until the tree is flattened); the final numbers are in `ScanStats`.
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

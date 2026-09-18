@@ -1,3 +1,10 @@
+//! Parallel directory walker.
+//!
+//! [`scan`] walks a root on a dedicated rayon pool, one task per directory, and builds a
+//! nested [`Subtree`] that is then flattened into a [`Tree`]. It never follows symlinks,
+//! stays on the root's volume by default, records unreadable directories as errors instead
+//! of failing and attributes hard-linked data to one path.
+
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -9,6 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use super::progress::ScanProgress;
 use super::tree::{Node, NodeKind, Subtree, Tree};
+
+/// The walk recurses once per directory level, and `PATH_MAX` allows about 2000 levels on
+/// Linux (500 on macOS). A level costs up to 17 KiB of stack in debug builds (rayon's
+/// frames included), far beyond the default 2 MiB; the reservation is virtual, pages are
+/// committed only when a deep tree touches them.
+const WORKER_STACK_SIZE: usize = 64 << 20;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -38,6 +51,8 @@ pub enum ScanError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot start the scan workers: {0}")]
+    Workers(#[from] rayon::ThreadPoolBuildError),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +113,13 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
         root_dev: meta.dev(),
     };
     let root_node = node_from_metadata(&root.to_string_lossy(), &meta);
-    let subtree = walk_dir(&root, root_node, &ctx);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .stack_size(WORKER_STACK_SIZE)
+        .build()?;
+    let subtree = pool.install(|| walk_dir(&root, root_node, &ctx));
+    // Read before flattening: a cancel that arrives while a complete tree is being
+    // flattened must not label it as partial.
+    let cancelled = progress.is_cancelled();
     let (mut tree, links) = subtree.flatten();
     let hardlinks_skipped = tree.attribute_hard_links(links);
     let snap = progress.snapshot();
@@ -113,7 +134,7 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
             errors: snap.errors,
             hardlinks_skipped,
         },
-        cancelled: snap.cancelled,
+        cancelled,
         tree,
     })
 }
@@ -121,26 +142,26 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
 fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
     ctx.progress.enter(path);
     if ctx.progress.is_cancelled() {
-        return Subtree::new(node);
+        ctx.progress.add_dir(node.size);
+        return unread(node, "scan cancelled");
     }
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(err) => {
             ctx.progress.add_error();
             ctx.progress.add_dir(node.size);
-            let mut subtree = Subtree::new(node);
-            subtree.error = Some(err.to_string().into());
-            return subtree;
+            return unread(node, &err.to_string());
         }
     };
 
     let mut dirs: Vec<(PathBuf, Node)> = Vec::new();
     let mut leaves: Vec<Subtree> = Vec::new();
+    let mut unreadable = 0u64;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
-                ctx.progress.add_error();
+                unreadable += 1;
                 continue;
             }
         };
@@ -148,7 +169,7 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
         let meta = match fs::symlink_metadata(&child_path) {
             Ok(meta) => meta,
             Err(_) => {
-                ctx.progress.add_error();
+                unreadable += 1;
                 continue;
             }
         };
@@ -159,9 +180,7 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
             }
             if ctx.options.same_device && meta.dev() != ctx.root_dev {
                 ctx.progress.add_dir(child.size);
-                let mut subtree = Subtree::new(child);
-                subtree.error = Some("skipped: different volume".into());
-                leaves.push(subtree);
+                leaves.push(unread(child, "skipped: different volume"));
                 continue;
             }
             dirs.push((child_path, child));
@@ -188,7 +207,22 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
         node.logical_size += child.node.logical_size;
         node.file_count += child.node.file_count;
     }
-    Subtree::with_children(node, children)
+    let mut subtree = Subtree::with_children(node, children);
+    if unreadable > 0 {
+        for _ in 0..unreadable {
+            ctx.progress.add_error();
+        }
+        let noun = if unreadable == 1 { "entry" } else { "entries" };
+        subtree.error = Some(format!("{unreadable} {noun} could not be read").into());
+    }
+    subtree
+}
+
+/// A directory whose entries could not be listed.
+fn unread(node: Node, error: &str) -> Subtree {
+    let mut subtree = Subtree::new(node);
+    subtree.error = Some(error.into());
+    subtree
 }
 
 fn node_from_metadata(name: &str, meta: &Metadata) -> Node {

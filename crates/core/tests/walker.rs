@@ -299,6 +299,94 @@ fn cancelled_scan_stops_early_and_says_so() {
     let result = scan(&ScanOptions::new(dir.path().to_path_buf()), &progress).unwrap();
     assert!(result.cancelled);
     assert!(!result.tree.has_children(Tree::ROOT));
+    assert_eq!(result.tree.error(Tree::ROOT), Some("scan cancelled"));
+}
+
+#[test]
+fn cancelled_scan_keeps_bytes_consistent_with_the_root() {
+    let dir = fixture();
+    let progress = ScanProgress::default();
+    progress.cancel();
+    let result = scan(&ScanOptions::new(dir.path().to_path_buf()), &progress).unwrap();
+    assert_eq!(result.stats.bytes, result.tree.root().size);
+    assert_eq!(
+        result.stats.dirs, 1,
+        "the root is still counted as a visited directory"
+    );
+}
+
+#[test]
+fn partially_readable_directories_record_how_many_entries_failed() {
+    if unsafe { libc_geteuid() } == 0 {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let dir = fixture();
+    let pair = dir.path().join("pair");
+    write(&pair.join("inside.bin"), 10);
+    write(&pair.join("other.bin"), 10);
+    let single = dir.path().join("single");
+    write(&single.join("only.bin"), 10);
+    // Readable but not searchable: the names are listed, their metadata is not.
+    for d in [&pair, &single] {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    let result = scan(
+        &ScanOptions::new(dir.path().to_path_buf()),
+        &ScanProgress::default(),
+    );
+    for d in [&pair, &single] {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let result = result.unwrap();
+    let (pair_id, pair_node) = child(&result.tree, Tree::ROOT, "pair");
+    assert_eq!(
+        result.tree.error(pair_id),
+        Some("2 entries could not be read")
+    );
+    assert_eq!(pair_node.file_count, 0);
+    let (single_id, _) = child(&result.tree, Tree::ROOT, "single");
+    assert_eq!(
+        result.tree.error(single_id),
+        Some("1 entry could not be read")
+    );
+    assert_eq!(result.stats.errors, 3);
+    assert_eq!(
+        result.stats.files, 5,
+        "the rest of the tree is still scanned"
+    );
+}
+
+#[test]
+fn deep_trees_do_not_overflow_the_stack() {
+    // Nest directories until the OS refuses the path: about 480 levels on macOS and
+    // 2000 on Linux, more than the default 2 MiB worker stacks accommodate. Every level
+    // also has a second, empty directory so the parallel machinery is on the stack at
+    // each level, as in a real tree.
+    let dir = tempfile::tempdir().unwrap();
+    let mut path = dir.path().to_path_buf();
+    let mut depth = 0u64;
+    while fs::create_dir(path.join("d")).is_ok() {
+        fs::create_dir(path.join("e")).unwrap();
+        path.push("d");
+        depth += 1;
+    }
+    assert!(depth > 100, "only {depth} levels could be created");
+    let result = scan(
+        &ScanOptions::new(dir.path().to_path_buf()),
+        &ScanProgress::default(),
+    );
+    // Delete the chain bottom-up before anything can fail: remove_dir_all recurses per
+    // level as well and would overflow the test thread on its way out.
+    for _ in 0..depth {
+        fs::remove_dir(&path).unwrap();
+        path.pop();
+        fs::remove_dir(path.join("e")).unwrap();
+    }
+    let result = result.unwrap();
+    assert_eq!(result.stats.dirs, 2 * depth + 1);
+    assert_eq!(result.stats.errors, 0);
+    assert!(result.tree.errors().is_empty());
 }
 
 #[test]
