@@ -38,11 +38,12 @@ pub enum SystemError {
 
 /// Deleting, reading an entry without following it, and the clock.
 ///
-/// Every path must be **absolute and free of `.` and `..` components**, the way a scan
-/// produces them; anything else is [`SystemError::Rejected`] and nothing is touched. The
-/// rule is not pedantry: the kernel resolves a trailing `..` before the syscall sees it,
-/// so `remove("/a/b/c/..")` would delete the contents of `/a/b` — siblings the caller
-/// never named — and report success.
+/// Every path must be **absolute and in normal form**, the way a scan produces them: no
+/// `..`, and byte for byte what `Path::components` rebuilds, so no trailing separator, no
+/// `.` and no repeated separator. Anything else is [`SystemError::Rejected`] and nothing
+/// is touched. The rule is not pedantry — the kernel reads the path the caller wrote, and
+/// both endings name something other than the entry they seem to: `remove("/a/b/c/..")`
+/// deletes the contents of `/a/b`, and `remove("/a/link/")` deletes what `link` points at.
 pub trait System: Send + Sync {
     /// Metadata that does not follow symlinks.
     fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError>;
@@ -71,9 +72,18 @@ fn check_path(path: &Path) -> Result<(), SystemError> {
     }
     if path
         .components()
-        .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+        .any(|part| matches!(part, Component::ParentDir))
     {
-        return reject("the path contains `.` or `..`");
+        return reject("the path contains `..`");
+    }
+    // Byte comparison, not `==`: `Path` compares component-wise and calls `/a/b/` and
+    // `/a/b` equal, which is exactly the difference that matters. `components()` drops a
+    // trailing separator, a trailing `.` and a repeated one, but the raw string is what
+    // reaches the syscall, and POSIX resolves a last component written as a directory by
+    // following it — so `remove("/a/link/")` deletes what the link points at.
+    let normal: PathBuf = path.components().collect();
+    if normal.as_os_str() != path.as_os_str() {
+        return reject("the path is not in normal form");
     }
     Ok(())
 }

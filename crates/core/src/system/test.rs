@@ -155,6 +155,8 @@ impl System for TestSystem {
                 message: INJECTED.to_owned(),
             });
         }
+        // A safety net, not a live branch: only `/` has no file name by now, and it does
+        // not get past `assert_confined`.
         let name = path.file_name().ok_or_else(|| SystemError::Trash {
             path: path.to_path_buf(),
             message: "the path has no file name".to_owned(),
@@ -191,6 +193,24 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// A symlink inside `root` pointing at a directory outside the temporary tree, with a
+    /// file in it. The shape in which a path that looks confined deletes something else.
+    fn door_to_the_outside(sys: &TestSystem) -> (TempDir, PathBuf, PathBuf) {
+        let outside = tempfile::tempdir().unwrap();
+        let precious = outside.path().join("precious.bin");
+        fs::write(&precious, b"keep").unwrap();
+        let door = sys.root().join("door");
+        std::os::unix::fs::symlink(outside.path(), &door).unwrap();
+        (outside, door, precious)
+    }
+
+    /// Appends raw bytes to a path, which `PathBuf::join` and friends would normalize.
+    fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut raw = path.to_path_buf().into_os_string();
+        raw.push(suffix);
+        PathBuf::from(raw)
+    }
+
     #[test]
     fn trash_moves_the_entry_into_the_trash_dir() {
         let sys = TestSystem::new();
@@ -211,6 +231,17 @@ mod tests {
         }
         let names = fs::read_dir(sys.trash_dir()).unwrap().count();
         assert_eq!(names, 2, "the second entry must not overwrite the first");
+    }
+
+    #[test]
+    fn trash_moves_a_directory_with_its_contents() {
+        let sys = TestSystem::new();
+        let dir = sys.root().join("tree");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("f.bin"), b"x").unwrap();
+        sys.move_to_trash(&dir).unwrap();
+        assert!(fs::symlink_metadata(&dir).is_err());
+        assert_eq!(fs::read(sys.trash_dir().join("tree/f.bin")).unwrap(), b"x");
     }
 
     #[test]
@@ -334,6 +365,30 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_separator_is_rejected() {
+        let sys = TestSystem::new();
+        let (_outside, door, precious) = door_to_the_outside(&sys);
+        // A last component written as a directory is resolved as one, which follows the
+        // link: both of these would delete the directory outside the temporary tree.
+        let err = sys.remove(&with_suffix(&door, "/")).unwrap_err();
+        assert!(matches!(err, SystemError::Rejected { .. }), "got {err:?}");
+        let err = sys.move_to_trash(&with_suffix(&door, "/")).unwrap_err();
+        assert!(matches!(err, SystemError::Rejected { .. }), "got {err:?}");
+        assert_eq!(fs::read(&precious).unwrap(), b"keep");
+        assert!(fs::symlink_metadata(&door).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn a_trailing_dot_is_rejected() {
+        let sys = TestSystem::new();
+        let (_outside, door, precious) = door_to_the_outside(&sys);
+        let err = sys.remove(&with_suffix(&door, "/.")).unwrap_err();
+        assert!(matches!(err, SystemError::Rejected { .. }), "got {err:?}");
+        assert_eq!(fs::read(&precious).unwrap(), b"keep");
+        assert!(fs::symlink_metadata(&door).unwrap().is_symlink());
+    }
+
+    #[test]
     fn a_relative_path_is_rejected() {
         let sys = TestSystem::new();
         let err = sys.remove(Path::new("relative-only.bin")).unwrap_err();
@@ -363,17 +418,19 @@ mod tests {
     #[test]
     fn escaping_through_a_symlinked_parent_panics_too() {
         let sys = TestSystem::new();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let file = elsewhere.path().join("precious.bin");
-        fs::write(&file, b"keep").unwrap();
-        let door = sys.root().join("door");
-        std::os::unix::fs::symlink(elsewhere.path(), &door).unwrap();
+        let (_outside, door, precious) = door_to_the_outside(&sys);
         let escaped = door.join("precious.bin");
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = sys.remove(&escaped);
-        }));
-        assert!(panicked.is_err(), "the path resolves outside the temp dir");
-        assert_eq!(fs::read(&file).unwrap(), b"keep");
+        }))
+        .expect_err("the path resolves outside the temporary directory");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<not a string>");
+        assert!(message.contains("refuses to touch"), "got {message:?}");
+        assert_eq!(fs::read(&precious).unwrap(), b"keep");
     }
 
     #[test]

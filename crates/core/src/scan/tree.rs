@@ -404,6 +404,24 @@ mod tests {
     }
 
     #[test]
+    fn kinds_come_from_metadata_that_did_not_follow_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        // A socket is neither a file nor a directory; the action engine has to see it as
+        // `Other` both when it scans and when it re-checks before deleting.
+        let socket = dir.path().join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let kind = |path: &Path| NodeKind::from_metadata(&std::fs::symlink_metadata(path).unwrap());
+        assert_eq!(kind(dir.path()), NodeKind::Dir);
+        assert_eq!(kind(&file), NodeKind::File);
+        assert_eq!(kind(&link), NodeKind::Symlink);
+        assert_eq!(kind(&socket), NodeKind::Other);
+    }
+
+    #[test]
     fn flatten_assigns_parents_and_children() {
         let tree = sample();
         assert_eq!(tree.len(), 5);
