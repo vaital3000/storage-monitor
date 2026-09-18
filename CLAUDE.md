@@ -12,15 +12,28 @@ modules for developer artifacts. The full design is in
 ## Layout
 
 ```
-crates/core/              Rust library: all logic lives here (scanner, modules, actions)
+crates/core/              Rust library: all logic lives here (scanner, snapshots, modules, actions)
+  src/scan/               parallel walker (walker.rs), arena tree (tree.rs), live counters (progress.rs)
+  src/snapshot/           persisted snapshots: model.rs (format), store.rs (files), delta.rs (growers)
+  src/disk.rs             volume usage through statvfs
+  src/paths.rs            data dir (STORAGE_MONITOR_DATA_DIR), snapshots dir, home dir
 crates/modules/<id>/      One crate per cleanup module (from phase 3 on)
 crates/cli/               `storage-monitor` binary, thin wrapper over core, JSON output
 apps/desktop/src-tauri/   Tauri commands and app state, thin wrapper over core
+  src/scan_manager.rs     the one scan per window: worker thread, progress events, snapshot
+  src/views.rs            camelCase payloads that cross IPC (ScanStatus, NodeView)
+  src/commands.rs         Tauri commands over the manager and core
 apps/desktop/src/         React UI. Backend calls only through src/lib/ipc.ts
-apps/desktop/src/mocks/   IPC mocks used by unit tests, e2e and `just dev-web`
+  lib/                    ipc.ts (typed commands and events), format.ts, nodeErrors.ts, pages.ts
+  hooks/                  useScan: the scan state machine fed by scan:progress and scan:done
+  pages/                  ExplorerPage and the placeholder of the sections of later phases
+  components/             app shell, NodeTable, Treemap (ECharts), Breadcrumbs, ScanProgress
+  mocks/                  IPC mock and the /Users/demo fixture (unit tests, e2e, `just dev-web`)
+  test/                   Vitest setup, render helper with a QueryClient, ECharts stand-in
 apps/desktop/e2e/         Playwright tests against the mocked UI
 docs/adr/                 Architecture decision records
 docs/plans/               Designs and implementation plans
+docs/images/              Screenshots embedded in README.md
 ```
 
 Dependency direction: `core` ← `modules` ← `cli` / `desktop`. Core never
@@ -33,7 +46,7 @@ Prerequisites: Rust stable (see `rust-toolchain.toml`), Node 22+, pnpm 10, `just
 ```
 just setup      install JS deps and the Playwright browser
 just dev        run the desktop app
-just dev-web    run the UI in a browser with mocked IPC (fastest UI loop)
+just dev-web    run the UI in a browser with mocked IPC (fastest UI loop): the Explorer over the fixture
 just test       cargo test + vitest
 just e2e        Playwright against the mocked UI
 just lint       fmt --check, clippy -D warnings, tsc, eslint, prettier --check
@@ -41,8 +54,25 @@ just fmt        apply formatters
 just ci         lint + test + build-web + e2e; CI adds a macOS `tauri build` smoke
 ```
 
+CI runs clippy on the latest stable Rust. If the local toolchain is older (Homebrew
+Rust ignores `rust-toolchain.toml`), run `just clippy-ci` (Docker) before pushing.
+
+CLI: `cargo run -q -p storage-monitor-cli -- scan [ROOT] --json [--save]`
+(defaults: the home folder, `--depth 2`, `--top 20`, `--threshold` 10 MiB).
 Rust tests for a single crate: `cargo test -p storage-monitor-core`.
 One vitest file: `pnpm --filter @storage-monitor/desktop test src/App.test.tsx`.
+
+## Data
+
+Snapshots live in `~/Library/Application Support/storage-monitor/snapshots/`;
+`STORAGE_MONITOR_DATA_DIR` overrides the data dir (tests set it). A completed scan
+writes `<stamp>.snap` (postcard + lz4 payload) and `<stamp>.json` (sidecar for
+listing): every directory plus files of 10 MiB or more, keyed by absolute path.
+The last 10 snapshots are kept across all roots; `SnapshotStore::latest_for(root)`
+pairs a scan with the previous snapshot of the same root for the deltas. The
+desktop app saves a snapshot after every completed scan, the CLI on `scan --save`;
+both use the same store. Cancelled scans are not persisted. Format details:
+`docs/adr/0004-snapshot-format.md`.
 
 ## Workflow
 
@@ -55,8 +85,9 @@ One vitest file: `pnpm --filter @storage-monitor/desktop test src/App.test.tsx`.
 - Every module ships with fixtures for external commands (`gh`, `docker`,
   `xcrun`) replayed through the fake `System` (design section 6.3, arrives
   with the module framework in phase 2); tests must pass on Linux.
-- UI changes: add or update a Playwright test and attach the `home.png`
-  screenshot that `just e2e` writes under `apps/desktop/test-results/` to the PR.
+- UI changes: add or update a Playwright test and attach the `explorer.png`
+  (and `home.png`) screenshots that `just e2e` writes under
+  `apps/desktop/test-results/` to the PR.
 
 ## Definition of Done
 
@@ -77,12 +108,38 @@ One vitest file: `pnpm --filter @storage-monitor/desktop test src/App.test.tsx`.
   `#[serde(rename_all = "camelCase")]`; TypeScript interfaces in
   `src/lib/ipc.ts` mirror them in camelCase. Every new command gets a handler
   in `src/mocks/ipc.ts`.
+- Tree queries are keyed by the scan generation (`useScan().generation`) with
+  `staleTime: Infinity`: a rescan refetches, an older result stays cached until then.
+- `StatusEmitter::emit` runs while the manager lock is held: an implementation
+  must never call back into `ScanManager`.
+- Sizes are allocated bytes (`st_blocks * 512`), formatted 1000-based
+  (`formatBytes` in the UI, `human_bytes` in the CLI).
+- Hard-linked data is attributed to the lexicographically smallest path; the
+  other links report 0 bytes.
 - CLI output: write through a locked `stdout` and treat `BrokenPipe` as a
   quiet exit, so `storage-monitor ... --json | head` never panics.
 - Before the first destructive command ships, set a Content Security Policy
-  in `tauri.conf.json` (it is `null` in phase 0).
+  in `tauri.conf.json` (still `null` after phase 1).
 - Do not add dependencies for something the standard library or an existing
   dependency already does.
+
+## Testing
+
+- Mock mode: `vite --mode mock` loads `.env.mock` (`VITE_MOCK_IPC=1`) and
+  `main.tsx` calls `installIpcMock()`, which answers every command from the
+  fixture rooted at `/Users/demo` and simulates a scan through the same events as
+  the real manager. Unit tests call `installIpcMock()` themselves and run the
+  simulated scan with `setMockScanDelay(0)` (`src/test/setup.ts`); Playwright
+  keeps the browser pace and reaches the mock through
+  `window.__STORAGE_MONITOR_MOCK__`.
+- Playwright serves the mock on port 1430 and writes `explorer.png`,
+  `explorer-dark.png` and `home.png` under `apps/desktop/test-results/`, which
+  it wipes on every run.
+- Rust walker tests (`crates/core/tests/walker.rs`) build temp trees: hard
+  links, sparse files, permission-denied and partially readable directories,
+  symlinks, deep nesting.
+- Desktop manager tests use `ScanManager::with_snapshots_dir(tempdir)` and the
+  CLI tests set `STORAGE_MONITOR_DATA_DIR`, so no test touches the real store.
 
 ## Release
 

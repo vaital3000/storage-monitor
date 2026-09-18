@@ -50,5 +50,9 @@ build-web:
 build:
     pnpm --filter @storage-monitor/desktop tauri build
 
+# Clippy with the stable toolchain CI uses (needs Docker); core and cli only
+clippy-ci:
+    docker run --rm -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/tmp/target -e CARGO_HOME=/tmp/cargo rust:latest cargo clippy --workspace --exclude storage-monitor-desktop --all-targets -- -D warnings
+
 # Everything CI runs, except the macOS `tauri build` smoke
 ci: lint test build-web e2e

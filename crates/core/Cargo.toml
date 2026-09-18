@@ -11,3 +11,13 @@ authors.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+postcard = { workspace = true }
+lz4_flex = { workspace = true }
+nix = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

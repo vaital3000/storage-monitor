@@ -1,10 +1,17 @@
 //! Core library of Storage Monitor.
 //!
-//! Phase 0 exposes only application metadata. The scanner, the module
-//! contract and the action engine arrive in later phases; see
+//! Everything the desktop app and the CLI share: the parallel directory scanner and its
+//! arena tree ([`scan`]), persisted snapshots and the growth deltas between them
+//! ([`snapshot`]), volume usage ([`disk`]) and the application's data locations
+//! ([`paths`]). The module contract and the action engine arrive in later phases; see
 //! `docs/plans/2026-09-17-storage-monitor-design.md`.
 
 use serde::{Deserialize, Serialize};
+
+pub mod disk;
+pub mod paths;
+pub mod scan;
+pub mod snapshot;
 
 /// Human-readable product name.
 pub const APP_NAME: &str = "Storage Monitor";
