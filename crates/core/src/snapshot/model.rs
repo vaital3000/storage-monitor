@@ -44,11 +44,15 @@ pub enum CodecError {
 }
 
 impl Snapshot {
-    /// Every directory plus files whose allocated size is at least `file_threshold`.
+    /// Every directory plus files whose allocated size is at least `file_threshold`,
+    /// depth first (children largest first, as in the tree): a subtree's entries share
+    /// their path prefix and sit next to each other, which compresses well.
     pub fn from_result(result: &ScanResult, file_threshold: u64) -> Self {
         let tree: &Tree = &result.tree;
         let mut entries = Vec::new();
-        for (id, node) in tree.iter() {
+        let mut stack = vec![Tree::ROOT];
+        while let Some(id) = stack.pop() {
+            let node = tree.get(id).expect("ids on the stack come from the tree");
             let keep = node.kind == NodeKind::Dir || node.size >= file_threshold;
             if keep {
                 entries.push(SnapshotEntry {
@@ -59,6 +63,8 @@ impl Snapshot {
                     mtime: node.mtime,
                 });
             }
+            // Reversed, so the first child is the next one popped.
+            stack.extend(tree.children(id).rev());
         }
         Self {
             format: SNAPSHOT_FORMAT,
@@ -138,6 +144,41 @@ mod tests {
         );
         assert_eq!(snap.file_threshold, 1_000);
         assert_eq!(snap.format, SNAPSHOT_FORMAT);
+    }
+
+    #[test]
+    fn entries_are_in_depth_first_order() {
+        // Arena order is breadth first (/r, d1, f, d2, big1, big2); the snapshot lists a
+        // subtree in one run so its shared prefixes sit next to each other.
+        let (tree, _) = Subtree::with_children(
+            node("/r", NodeKind::Dir, 750),
+            vec![
+                Subtree::with_children(
+                    node("d2", NodeKind::Dir, 200),
+                    vec![Subtree::new(node("big2", NodeKind::File, 200))],
+                ),
+                Subtree::new(node("f", NodeKind::File, 250)),
+                Subtree::with_children(
+                    node("d1", NodeKind::Dir, 300),
+                    vec![Subtree::new(node("big1", NodeKind::File, 300))],
+                ),
+            ],
+        )
+        .flatten();
+        let result = ScanResult {
+            root: "/r".into(),
+            started_at: chrono::Utc::now(),
+            duration_ms: 1,
+            stats: ScanStats::default(),
+            cancelled: false,
+            tree,
+        };
+        let snap = Snapshot::from_result(&result, 0);
+        let paths: Vec<&str> = snap.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/r", "/r/d1", "/r/d1/big1", "/r/f", "/r/d2", "/r/d2/big2"]
+        );
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Parallel directory walker.
 //!
 //! [`scan`] walks a root on a dedicated rayon pool, one task per directory, and builds a
-//! nested [`Subtree`] that is then flattened into a [`Tree`]. It never follows symlinks,
-//! stays on the root's volume by default, records unreadable directories as errors instead
-//! of failing and attributes hard-linked data to one path.
+//! nested [`Subtree`] that is then flattened into a [`Tree`]. It follows the root when the
+//! root itself is a symlink (`/tmp` on macOS) but never a symlink below it, stays on the
+//! root's volume by default, records unreadable directories as errors instead of failing
+//! and attributes hard-linked data to one path.
 
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
@@ -91,16 +92,17 @@ impl Ctx<'_> {
     }
 }
 
-/// Scans `options.root` in parallel. Never follows symlinks, stays on the root's volume,
-/// counts hard-linked data once (under the smallest path) and records unreadable
-/// directories instead of failing.
+/// Scans `options.root` in parallel. Follows the root itself when it is a symlink, never
+/// a symlink below it; stays on the root's volume, counts hard-linked data once (under
+/// the smallest path) and records unreadable directories instead of failing.
 pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult, ScanError> {
     let started = Instant::now();
     let started_at = Utc::now();
     // Drop trailing slashes and `.` components (no canonicalization), so the paths derived
     // from the root agree with the paths derived from its entries.
     let root: PathBuf = options.root.components().collect();
-    let meta = fs::symlink_metadata(&root).map_err(|source| ScanError::Root {
+    // `metadata` follows a symlinked root; the entries below use `symlink_metadata`.
+    let meta = fs::metadata(&root).map_err(|source| ScanError::Root {
         path: root.clone(),
         source,
     })?;

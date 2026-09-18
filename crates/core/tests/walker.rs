@@ -141,6 +141,8 @@ fn hard_links_are_counted_once() {
         "the smaller path keeps the data"
     );
     assert_eq!(two.size, 0, "the other link contributes nothing");
+    assert_eq!(two.logical_size, 0);
+    assert_eq!(result.tree.root().logical_size, 8_192);
     assert_eq!(result.stats.hardlinks_skipped, 1);
     // The root directory's own blocks count toward its size (0 on APFS, 4096 on ext4).
     assert_eq!(result.tree.root().size, allocated(root) + one.size);
@@ -171,8 +173,15 @@ fn hard_links_across_directories_belong_to_the_smallest_path() {
         "a/z.bin < b/a.bin"
     );
     assert_eq!(link.size, 0);
+    assert_eq!(link.logical_size, 0);
     assert_eq!(a_node.size, allocated(&root.join("a")) + z.size);
     assert_eq!(b_node.size, allocated(&root.join("b")) + small.size);
+    assert_eq!(a_node.logical_size, 8_192);
+    assert_eq!(
+        b_node.logical_size, 4_096,
+        "the logical size of the loser leaves b as well"
+    );
+    assert_eq!(tree.root().logical_size, 8_192 + 4_096);
     assert_eq!(
         tree.root().size,
         allocated(root) + a_node.size + b_node.size
@@ -290,6 +299,19 @@ fn excluded_directories_are_skipped() {
         .collect();
     assert!(!names.contains(&"docs"));
     assert_eq!(result.stats.files, 2);
+}
+
+#[test]
+fn excludes_are_normalized_like_the_root() {
+    let dir = fixture();
+    let mut options = ScanOptions::new(dir.path().to_path_buf());
+    options
+        .excludes
+        .push(PathBuf::from(format!("{}/docs/", dir.path().display())));
+    options.excludes.push(dir.path().join("./.hidden"));
+    let result = scan(&options, &ScanProgress::default()).unwrap();
+    assert_eq!(names(&result.tree, Tree::ROOT), vec!["big.bin", "empty"]);
+    assert_eq!(result.stats.files, 1);
 }
 
 #[test]
@@ -428,11 +450,33 @@ fn root_with_a_trailing_slash_is_normalized() {
 }
 
 #[test]
+fn symlinked_root_is_followed_and_keeps_its_own_path() {
+    let dir = fixture();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("link");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    let result = scan(&ScanOptions::new(link.clone()), &ScanProgress::default()).unwrap();
+    assert_eq!(result.root, link);
+    assert_eq!(&*result.tree.root().name, link.to_str().unwrap());
+    assert_eq!(result.tree.root().kind, NodeKind::Dir);
+    assert_eq!(result.stats.files, 5);
+    assert_eq!(result.stats.dirs, 5);
+    let (docs, _) = child(&result.tree, Tree::ROOT, "docs");
+    assert_eq!(result.tree.path(docs), link.join("docs"));
+}
+
+#[test]
 fn root_must_be_a_directory() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("file.txt");
     write(&file, 1);
-    assert!(scan(&ScanOptions::new(file), &ScanProgress::default()).is_err());
+    assert!(scan(&ScanOptions::new(file.clone()), &ScanProgress::default()).is_err());
+    let file_link = dir.path().join("file-link");
+    std::os::unix::fs::symlink(&file, &file_link).unwrap();
+    assert!(scan(&ScanOptions::new(file_link), &ScanProgress::default()).is_err());
+    let dangling = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+    assert!(scan(&ScanOptions::new(dangling), &ScanProgress::default()).is_err());
     assert!(
         scan(
             &ScanOptions::new(PathBuf::from("/definitely/missing")),

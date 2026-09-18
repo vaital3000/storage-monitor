@@ -165,11 +165,11 @@ impl Tree {
     }
 
     /// Counts hard-linked data once. Among the nodes sharing a `(dev, ino)` the one with
-    /// the smallest path keeps its size; the others drop to 0 and every ancestor shrinks by
-    /// the same amount, so the outcome does not depend on the order in which the walker met
-    /// the links. Sibling ranges whose order changed are sorted again (children keep
-    /// pointing at their parents, errors follow their nodes). Returns how many nodes were
-    /// zeroed.
+    /// the smallest path keeps its sizes; the others drop to 0 (allocated and logical) and
+    /// every ancestor shrinks by the same amounts, so the outcome does not depend on the
+    /// order in which the walker met the links. Sibling ranges whose order changed are
+    /// sorted again (children keep pointing at their parents, errors follow their nodes).
+    /// Returns how many nodes were zeroed.
     pub(crate) fn attribute_hard_links(&mut self, links: Vec<(u64, u64, NodeId)>) -> u64 {
         let mut links: Vec<((u64, u64), PathBuf, NodeId)> = links
             .into_iter()
@@ -190,10 +190,14 @@ impl Tree {
         }
         let mut dirty = vec![false; self.nodes.len()];
         for &id in &losers {
-            let size = std::mem::take(&mut self.nodes[id as usize].size);
+            let loser = &mut self.nodes[id as usize];
+            let size = std::mem::take(&mut loser.size);
+            let logical_size = std::mem::take(&mut loser.logical_size);
             let mut current = id;
             while let Some(parent) = self.parent(current) {
-                self.nodes[parent as usize].size -= size;
+                let ancestor = &mut self.nodes[parent as usize];
+                ancestor.size -= size;
+                ancestor.logical_size -= logical_size;
                 dirty[parent as usize] = true;
                 current = parent;
             }
@@ -498,6 +502,7 @@ mod tests {
         assert_eq!(tree.attribute_hard_links(links), 1);
 
         assert_eq!(tree.root().size, 17);
+        assert_eq!(tree.root().logical_size, 17, "logical bytes follow");
         assert_eq!(
             names(&tree, tree.children(Tree::ROOT)),
             vec!["a", "c.bin", "b"]
@@ -506,12 +511,14 @@ mod tests {
         let b = tree.children(Tree::ROOT).nth(2).unwrap();
         assert_eq!(tree.get(a).unwrap().size, 8);
         assert_eq!(tree.get(b).unwrap().size, 4);
+        assert_eq!(tree.get(b).unwrap().logical_size, 4);
         assert_eq!(tree.error(a), None);
         assert_eq!(tree.error(b), Some("1 entry could not be read"));
         assert_eq!(tree.errors().len(), 1);
         assert_eq!(names(&tree, tree.children(b)), vec!["s.bin", "a.bin"]);
         let a_link = tree.children(b).nth(1).unwrap();
         assert_eq!(tree.get(a_link).unwrap().size, 0);
+        assert_eq!(tree.get(a_link).unwrap().logical_size, 0);
         assert_eq!(tree.parent(a_link), Some(b));
         assert_eq!(tree.path(a_link), PathBuf::from("/r/b/a.bin"));
         let z = tree.children(a).next().unwrap();
