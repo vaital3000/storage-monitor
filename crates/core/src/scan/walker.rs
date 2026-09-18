@@ -1,9 +1,6 @@
-use std::collections::HashSet;
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -46,10 +43,14 @@ pub enum ScanError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanStats {
+    /// Entries that are not directories (files, symlinks, devices).
     pub files: u64,
     pub dirs: u64,
+    /// Allocated bytes of the whole tree; equals the root node's `size`.
     pub bytes: u64,
+    /// Directories and entries that could not be read.
     pub errors: u64,
+    /// Further links to data already counted under another path.
     pub hardlinks_skipped: u64,
 }
 
@@ -67,26 +68,17 @@ struct Ctx<'a> {
     options: &'a ScanOptions,
     progress: &'a ScanProgress,
     root_dev: u64,
-    seen_inodes: Mutex<HashSet<(u64, u64)>>,
-    hardlinks_skipped: AtomicU64,
 }
 
 impl Ctx<'_> {
     fn is_excluded(&self, path: &Path) -> bool {
         self.options.excludes.iter().any(|e| e == path)
     }
-
-    /// True the first time an inode is seen; false for later hard links to it.
-    fn first_sighting(&self, dev: u64, ino: u64) -> bool {
-        self.seen_inodes
-            .lock()
-            .map(|mut set| set.insert((dev, ino)))
-            .unwrap_or(true)
-    }
 }
 
 /// Scans `options.root` in parallel. Never follows symlinks, stays on the root's volume,
-/// counts hard-linked data once and records unreadable directories instead of failing.
+/// counts hard-linked data once (under the smallest path) and records unreadable
+/// directories instead of failing.
 pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult, ScanError> {
     let started = Instant::now();
     let started_at = Utc::now();
@@ -102,12 +94,11 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
         options,
         progress,
         root_dev: meta.dev(),
-        seen_inodes: Mutex::new(HashSet::new()),
-        hardlinks_skipped: AtomicU64::new(0),
     };
     let root_node = node_from_metadata(&root.to_string_lossy(), &meta);
     let subtree = walk_dir(root, root_node, &ctx);
-    let (tree, _) = subtree.flatten();
+    let (mut tree, links) = subtree.flatten();
+    let hardlinks_skipped = tree.attribute_hard_links(links);
     let snap = progress.snapshot();
     Ok(ScanResult {
         root: root.clone(),
@@ -116,9 +107,9 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
         stats: ScanStats {
             files: snap.files,
             dirs: snap.dirs,
-            bytes: snap.bytes,
+            bytes: tree.root().size,
             errors: snap.errors,
-            hardlinks_skipped: ctx.hardlinks_skipped.load(Ordering::Relaxed),
+            hardlinks_skipped,
         },
         cancelled: snap.cancelled,
         tree,
@@ -159,7 +150,7 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
                 continue;
             }
         };
-        let mut child = node_from_metadata(&entry.file_name().to_string_lossy(), &meta);
+        let child = node_from_metadata(&entry.file_name().to_string_lossy(), &meta);
         if meta.is_dir() {
             if ctx.is_excluded(&child_path) {
                 continue;
@@ -173,12 +164,12 @@ fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
             }
             dirs.push((child_path, child));
         } else {
-            if meta.nlink() > 1 && !ctx.first_sighting(meta.dev(), meta.ino()) {
-                child.size = 0;
-                ctx.hardlinks_skipped.fetch_add(1, Ordering::Relaxed);
-            }
             ctx.progress.add_file(child.size);
-            leaves.push(Subtree::new(child));
+            let mut leaf = Subtree::new(child);
+            if meta.nlink() > 1 {
+                leaf.hardlink = Some((meta.dev(), meta.ino()));
+            }
+            leaves.push(leaf);
         }
     }
 

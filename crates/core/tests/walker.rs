@@ -110,6 +110,16 @@ fn symlinks_are_recorded_but_never_followed() {
     assert_eq!(result.stats.files, 7, "symlinks count as entries");
 }
 
+fn allocated(path: &Path) -> u64 {
+    fs::symlink_metadata(path).unwrap().blocks() * 512
+}
+
+fn names(tree: &Tree, parent: u32) -> Vec<&str> {
+    tree.children(parent)
+        .map(|id| &*tree.get(id).unwrap().name)
+        .collect()
+}
+
 #[test]
 fn hard_links_are_counted_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,14 +134,95 @@ fn hard_links_are_counted_once() {
     let (_, one) = child(&result.tree, Tree::ROOT, "one.bin");
     let (_, two) = child(&result.tree, Tree::ROOT, "two.bin");
     assert_eq!(
-        one.size + two.size,
-        one.size.max(two.size),
-        "one of the links contributes 0"
+        one.size,
+        allocated(&root.join("one.bin")),
+        "the smaller path keeps the data"
     );
+    assert_eq!(two.size, 0, "the other link contributes nothing");
     assert_eq!(result.stats.hardlinks_skipped, 1);
     // The root directory's own blocks count toward its size (0 on APFS, 4096 on ext4).
-    let root_own = fs::symlink_metadata(root).unwrap().blocks() * 512;
-    assert_eq!(result.tree.root().size, root_own + one.size.max(two.size));
+    assert_eq!(result.tree.root().size, allocated(root) + one.size);
+    assert_eq!(result.stats.bytes, result.tree.root().size);
+}
+
+#[test]
+fn hard_links_across_directories_belong_to_the_smallest_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(&root.join("a/z.bin"), 8_192);
+    write(&root.join("b/small.bin"), 4_096);
+    fs::hard_link(root.join("a/z.bin"), root.join("b/a.bin")).unwrap();
+    let result = scan(
+        &ScanOptions::new(root.to_path_buf()),
+        &ScanProgress::default(),
+    )
+    .unwrap();
+    let tree = &result.tree;
+    let (a, a_node) = child(tree, Tree::ROOT, "a");
+    let (b, b_node) = child(tree, Tree::ROOT, "b");
+    let (_, z) = child(tree, a, "z.bin");
+    let (_, link) = child(tree, b, "a.bin");
+    let (_, small) = child(tree, b, "small.bin");
+    assert_eq!(
+        z.size,
+        allocated(&root.join("a/z.bin")),
+        "a/z.bin < b/a.bin"
+    );
+    assert_eq!(link.size, 0);
+    assert_eq!(a_node.size, allocated(&root.join("a")) + z.size);
+    assert_eq!(b_node.size, allocated(&root.join("b")) + small.size);
+    assert_eq!(
+        tree.root().size,
+        allocated(root) + a_node.size + b_node.size
+    );
+    assert_eq!(result.stats.bytes, tree.root().size);
+    assert_eq!(result.stats.hardlinks_skipped, 1);
+    // Listings reflect the attribution: a outranks b, the emptied link sinks to the end.
+    assert_eq!(names(tree, Tree::ROOT), vec!["a", "b"]);
+    assert_eq!(names(tree, b), vec!["small.bin", "a.bin"]);
+}
+
+#[test]
+fn hard_link_attribution_is_deterministic() {
+    // 64 links in 8 directories walked by several threads: which link a worker meets
+    // first varies between runs, the attributed sizes must not.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(&root.join("d0/f0.bin"), 8_192);
+    for d in 0..8 {
+        fs::create_dir_all(root.join(format!("d{d}"))).unwrap();
+        for f in 0..8 {
+            if (d, f) != (0, 0) {
+                fs::hard_link(root.join("d0/f0.bin"), root.join(format!("d{d}/f{f}.bin"))).unwrap();
+            }
+        }
+    }
+    let listing = || {
+        let result = scan(
+            &ScanOptions::new(root.to_path_buf()),
+            &ScanProgress::default(),
+        )
+        .unwrap();
+        let sizes: Vec<(PathBuf, u64)> = result
+            .tree
+            .iter()
+            .map(|(id, node)| (result.tree.path(id), node.size))
+            .collect();
+        (sizes, result.stats)
+    };
+    let (sizes, stats) = listing();
+    assert_eq!(stats.hardlinks_skipped, 63);
+    let data = allocated(&root.join("d0/f0.bin"));
+    let winner = root.join("d0/f0.bin");
+    for (path, size) in &sizes {
+        if path.extension().is_some() {
+            let expected = if *path == winner { data } else { 0 };
+            assert_eq!(*size, expected, "{}", path.display());
+        }
+    }
+    for _ in 1..5 {
+        assert_eq!(listing(), (sizes.clone(), stats.clone()));
+    }
 }
 
 #[test]

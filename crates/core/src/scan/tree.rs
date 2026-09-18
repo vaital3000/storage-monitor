@@ -6,7 +6,7 @@
 //! Directory errors are rare and live in a side table.
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -162,6 +162,87 @@ impl Tree {
     /// Every recorded error, sorted by id.
     pub fn errors(&self) -> &[(NodeId, Box<str>)] {
         &self.errors
+    }
+
+    /// Counts hard-linked data once. Among the nodes sharing a `(dev, ino)` the one with
+    /// the smallest path keeps its size; the others drop to 0 and every ancestor shrinks by
+    /// the same amount, so the outcome does not depend on the order in which the walker met
+    /// the links. Sibling ranges whose order changed are sorted again (children keep
+    /// pointing at their parents, errors follow their nodes). Returns how many nodes were
+    /// zeroed.
+    pub(crate) fn attribute_hard_links(&mut self, links: Vec<(u64, u64, NodeId)>) -> u64 {
+        let mut links: Vec<((u64, u64), PathBuf, NodeId)> = links
+            .into_iter()
+            .map(|(dev, ino, id)| ((dev, ino), self.path(id), id))
+            .collect();
+        links.sort_unstable();
+        let mut losers = Vec::new();
+        let mut previous = None;
+        for (key, _, id) in links {
+            if previous == Some(key) {
+                losers.push(id);
+            } else {
+                previous = Some(key);
+            }
+        }
+        if losers.is_empty() {
+            return 0;
+        }
+        let mut dirty = vec![false; self.nodes.len()];
+        for &id in &losers {
+            let size = std::mem::take(&mut self.nodes[id as usize].size);
+            let mut current = id;
+            while let Some(parent) = self.parent(current) {
+                self.nodes[parent as usize].size -= size;
+                dirty[parent as usize] = true;
+                current = parent;
+            }
+        }
+        // Deeper ranges first: a node moves only when its parent's range is sorted, and by
+        // then the range it owns (marked under its old id) has already been handled.
+        let mut moved = HashMap::new();
+        for id in (0..self.nodes.len()).rev() {
+            if dirty[id] {
+                self.resort_children(id as NodeId, &mut moved);
+            }
+        }
+        if !moved.is_empty() {
+            for (id, _) in &mut self.errors {
+                if let Some(new) = moved.get(id) {
+                    *id = *new;
+                }
+            }
+            self.errors.sort_by_key(|(id, _)| *id);
+        }
+        losers.len() as u64
+    }
+
+    /// Sorts the children of `parent` again after their sizes changed, recording every
+    /// node that changed id in `moved` (old id to new id).
+    fn resort_children(&mut self, parent: NodeId, moved: &mut HashMap<NodeId, NodeId>) {
+        let range = self.children(parent);
+        let (start, end) = (range.start as usize, range.end as usize);
+        let block = &mut self.nodes[start..end];
+        if block.is_sorted_by(|a, b| by_size_then_name(a, b).is_le()) {
+            return;
+        }
+        // Both sorts are stable and use the same comparator, so afterwards `block[new]`
+        // is the former `block[perm[new]]`.
+        let mut perm: Vec<usize> = (0..block.len()).collect();
+        perm.sort_by(|&a, &b| by_size_then_name(&block[a], &block[b]));
+        block.sort_by(by_size_then_name);
+        for (new, &old) in perm.iter().enumerate() {
+            if new != old {
+                moved.insert((start + old) as NodeId, (start + new) as NodeId);
+            }
+        }
+        for id in start..end {
+            let first = self.nodes[id].first_child as usize;
+            let count = self.nodes[id].child_count as usize;
+            for child in &mut self.nodes[first..first + count] {
+                child.parent = id as NodeId;
+            }
+        }
     }
 }
 
@@ -386,6 +467,61 @@ mod tests {
         let (tree, links) = subtree.flatten();
         assert_eq!(tree.len(), 4);
         assert_eq!(links, vec![(1, 42, 1), (1, 42, 2)]);
+    }
+
+    #[test]
+    fn hard_links_go_to_the_smallest_path_and_siblings_are_resorted() {
+        // /r
+        //   a/  z.bin (8, inode 7)             winner: /r/a/z.bin sorts before /r/b/a.bin
+        //   b/  a.bin (8, inode 7), s.bin (4)  b carries an error that must follow it when it moves
+        //   c.bin (5)
+        let mut z = leaf("z.bin", 8);
+        z.hardlink = Some((1, 7));
+        let mut a_link = leaf("a.bin", 8);
+        a_link.hardlink = Some((1, 7));
+        let mut b = dir("b", 12, vec![a_link, leaf("s.bin", 4)]);
+        b.error = Some("1 entry could not be read".into());
+        let (mut tree, links) =
+            dir("/r", 25, vec![dir("a", 8, vec![z]), b, leaf("c.bin", 5)]).flatten();
+        assert_eq!(
+            names(&tree, tree.children(Tree::ROOT)),
+            vec!["b", "a", "c.bin"]
+        );
+        assert_eq!(tree.error(1), Some("1 entry could not be read"));
+
+        assert_eq!(tree.attribute_hard_links(links), 1);
+
+        assert_eq!(tree.root().size, 17);
+        assert_eq!(
+            names(&tree, tree.children(Tree::ROOT)),
+            vec!["a", "c.bin", "b"]
+        );
+        let a = tree.children(Tree::ROOT).next().unwrap();
+        let b = tree.children(Tree::ROOT).nth(2).unwrap();
+        assert_eq!(tree.get(a).unwrap().size, 8);
+        assert_eq!(tree.get(b).unwrap().size, 4);
+        assert_eq!(tree.error(a), None);
+        assert_eq!(tree.error(b), Some("1 entry could not be read"));
+        assert_eq!(tree.errors().len(), 1);
+        assert_eq!(names(&tree, tree.children(b)), vec!["s.bin", "a.bin"]);
+        let a_link = tree.children(b).nth(1).unwrap();
+        assert_eq!(tree.get(a_link).unwrap().size, 0);
+        assert_eq!(tree.parent(a_link), Some(b));
+        assert_eq!(tree.path(a_link), PathBuf::from("/r/b/a.bin"));
+        let z = tree.children(a).next().unwrap();
+        assert_eq!(tree.get(z).unwrap().size, 8);
+        assert_eq!(tree.parent(z), Some(a));
+        assert_eq!(tree.path(z), PathBuf::from("/r/a/z.bin"));
+    }
+
+    #[test]
+    fn attribution_without_duplicates_changes_nothing() {
+        let mut only = leaf("only.bin", 8);
+        only.hardlink = Some((1, 7));
+        let (mut tree, links) = dir("/r", 8, vec![only]).flatten();
+        assert_eq!(tree.attribute_hard_links(links), 0);
+        assert_eq!(tree.root().size, 8);
+        assert_eq!(tree.attribute_hard_links(Vec::new()), 0);
     }
 
     #[test]
