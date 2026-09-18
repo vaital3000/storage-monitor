@@ -22,8 +22,8 @@ const SNAPSHOT_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
 /// Snapshots kept in the store, across all roots.
 const SNAPSHOTS_KEPT: usize = 10;
 /// Growers computed when a scan finishes; the `top_growers` command takes a prefix.
-const GROWERS_KEPT: usize = 50;
-/// Interval of the `scan:progress` events.
+pub const GROWERS_KEPT: usize = 50;
+/// Default interval of the `scan:progress` events.
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 pub const PROGRESS_EVENT: &str = "scan:progress";
@@ -46,6 +46,7 @@ impl StatusEmitter for tauri::AppHandle {
 pub struct ScanManager {
     inner: Arc<Mutex<Inner>>,
     snapshots_dir: PathBuf,
+    progress_interval: Duration,
 }
 
 #[derive(Default)]
@@ -80,7 +81,15 @@ impl ScanManager {
         Self {
             inner: Arc::default(),
             snapshots_dir,
+            progress_interval: PROGRESS_INTERVAL,
         }
+    }
+
+    /// Emits `scan:progress` every `interval` instead of [`PROGRESS_INTERVAL`].
+    #[cfg(test)]
+    fn with_progress_interval(mut self, interval: Duration) -> Self {
+        self.progress_interval = interval;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -99,28 +108,35 @@ impl ScanManager {
 
     /// Starts a scan of `root` on a worker thread. The status is emitted as
     /// `scan:progress` every [`PROGRESS_INTERVAL`] while the scan runs and once as
-    /// `scan:done` when it is over, whatever the outcome.
+    /// `scan:done` when it is over, whatever the outcome. Both events are emitted
+    /// while the manager is locked, so nothing follows `scan:done`.
     pub fn start(
         &self,
         emitter: Arc<dyn StatusEmitter>,
         root: PathBuf,
     ) -> Result<ScanStatus, String> {
-        let (progress, generation) = {
+        let (progress, generation, previous) = {
             let mut inner = self.lock();
             if inner.state == ScanState::Running {
                 return Err("a scan is already running".to_owned());
             }
             let progress = Arc::new(ScanProgress::default());
-            *inner = Inner {
-                state: ScanState::Running,
-                generation: inner.generation + 1,
-                root: Some(root.clone()),
-                progress: Arc::clone(&progress),
-                started: Some(Instant::now()),
-                ..Inner::default()
-            };
-            (progress, inner.generation)
+            let generation = inner.generation + 1;
+            let previous = std::mem::replace(
+                &mut *inner,
+                Inner {
+                    state: ScanState::Running,
+                    generation,
+                    root: Some(root.clone()),
+                    progress: Arc::clone(&progress),
+                    started: Some(Instant::now()),
+                    ..Inner::default()
+                },
+            );
+            (progress, generation, previous)
         };
+        // The previous tree can be hundreds of megabytes: free it outside the lock.
+        drop(previous);
         let worker = {
             let manager = self.clone();
             let emitter = Arc::clone(&emitter);
@@ -171,51 +187,52 @@ impl ScanManager {
         Some(f(&result, previous.as_deref()))
     }
 
-    /// The largest growers since the previous snapshot, at most `limit` of them.
+    /// The largest growers since the previous snapshot, at most `limit` of the
+    /// [`GROWERS_KEPT`] computed when the scan finished.
     pub fn growers(&self, limit: usize) -> Vec<Delta> {
         self.lock().growers.iter().take(limit).cloned().collect()
     }
 
     /// Body of the worker thread: a panic anywhere in the scan or the store becomes a
-    /// `Failed` state, so the manager can never be stuck in `Running`.
+    /// `Failed` state, so the manager can never be stuck in `Running`. The scan and the
+    /// store run unlocked; `scan:done` is emitted under the lock, so a ticker that wakes
+    /// up afterwards finds the scan over and stays quiet.
     fn run(&self, root: PathBuf, progress: &ScanProgress, emitter: &dyn StatusEmitter) {
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
             scan(&ScanOptions::new(root), progress)
                 .map(|result| Finished::persist(result, &self.snapshots_dir))
         }));
-        let status = {
-            let mut inner = self.lock();
-            match outcome {
-                Ok(Ok(finished)) => inner.complete(finished),
-                Ok(Err(err)) => inner.fail(err.to_string()),
-                Err(payload) => inner.fail(panic_message(&*payload)),
-            }
-            inner.status()
-        };
-        emitter.emit(DONE_EVENT, &status);
+        let mut inner = self.lock();
+        match outcome {
+            Ok(Ok(finished)) => inner.complete(finished),
+            Ok(Err(err)) => inner.fail(err.to_string()),
+            Err(payload) => inner.fail(panic_message(&*payload)),
+        }
+        emitter.emit(DONE_EVENT, &inner.status());
     }
 
-    /// Body of the progress thread: emits the status every [`PROGRESS_INTERVAL`] while
-    /// the scan of `generation` runs.
+    /// Body of the progress thread: emits the status every `progress_interval` while the
+    /// scan of `generation` runs. The status is emitted under the lock, so no progress
+    /// event can follow `scan:done`; the emitter never re-enters the manager.
     fn tick(&self, generation: u64, emitter: &dyn StatusEmitter) {
         loop {
-            thread::sleep(PROGRESS_INTERVAL);
-            let status = {
-                let inner = self.lock();
-                if inner.generation != generation || inner.state != ScanState::Running {
-                    return;
-                }
-                inner.status()
-            };
-            emitter.emit(PROGRESS_EVENT, &status);
+            thread::sleep(self.progress_interval);
+            let inner = self.lock();
+            if inner.generation != generation || inner.state != ScanState::Running {
+                return;
+            }
+            emitter.emit(PROGRESS_EVENT, &inner.status());
         }
     }
 }
 
-/// A scan that ran to its end, with what the snapshot store knew about its root.
+/// A scan that ran to its end, with what the snapshot store knew about its root. Built
+/// on the worker thread, outside the lock, so installing it is cheap.
 struct Finished {
     result: ScanResult,
-    previous: Option<Snapshot>,
+    previous_taken_at: Option<DateTime<Utc>>,
+    /// Sizes by path of the previous snapshot of the same root.
+    previous_sizes: Option<Arc<HashMap<String, u64>>>,
     growers: Vec<Delta>,
 }
 
@@ -227,7 +244,8 @@ impl Finished {
         if result.cancelled {
             return Self {
                 result,
-                previous: None,
+                previous_taken_at: None,
+                previous_sizes: None,
                 growers: Vec::new(),
             };
         }
@@ -249,7 +267,8 @@ impl Finished {
             .unwrap_or_default();
         Self {
             result,
-            previous,
+            previous_taken_at: previous.as_ref().map(|p| p.taken_at),
+            previous_sizes: previous.map(|p| Arc::new(p.size_index())),
             growers,
         }
     }
@@ -263,8 +282,8 @@ impl Inner {
             ScanState::Done
         };
         self.duration_ms = finished.result.duration_ms;
-        self.previous_taken_at = finished.previous.as_ref().map(|p| p.taken_at);
-        self.previous_sizes = finished.previous.map(|p| Arc::new(p.size_index()));
+        self.previous_taken_at = finished.previous_taken_at;
+        self.previous_sizes = finished.previous_sizes;
         self.growers = finished.growers;
         self.result = Some(Arc::new(finished.result));
     }
@@ -345,6 +364,23 @@ mod tests {
         }
     }
 
+    /// Records like `Events`, but a progress emit first takes `delay`, like a real emitter
+    /// serializing the payload and crossing to the webview. That is the window in which
+    /// a `running` status read outside the lock would overtake `scan:done`.
+    struct SlowProgressEvents {
+        delay: Duration,
+        events: Events,
+    }
+
+    impl StatusEmitter for SlowProgressEvents {
+        fn emit(&self, event: &str, status: &ScanStatus) {
+            if event == PROGRESS_EVENT {
+                thread::sleep(self.delay);
+            }
+            self.events.emit(event, status);
+        }
+    }
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (name, size) in [
@@ -358,6 +394,18 @@ mod tests {
                 .unwrap()
                 .write_all(&vec![0u8; size])
                 .unwrap();
+        }
+        dir
+    }
+
+    /// `files` one-byte files spread over 50 folders: enough for a scan to outlast a few
+    /// ticks of a fast ticker.
+    fn wide_fixture(files: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..files {
+            let folder = dir.path().join(format!("d{}", i % 50));
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(folder.join(format!("f{i}")), b"x").unwrap();
         }
         dir
     }
@@ -449,6 +497,47 @@ mod tests {
             ),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn no_event_follows_done_however_fast_the_ticker_runs() {
+        let data = tempfile::tempdir().unwrap();
+        let fixture = wide_fixture(3_000);
+        let manager = manager_in(data.path()).with_progress_interval(Duration::from_millis(1));
+        let emitter = Arc::new(SlowProgressEvents {
+            delay: Duration::from_millis(5),
+            events: Events::default(),
+        });
+        manager
+            .start(emitter.clone(), fixture.path().to_path_buf())
+            .unwrap();
+        assert_eq!(wait_until_finished(&manager).state, ScanState::Done);
+        // Give a ticker that woke up around the end of the scan the time to emit.
+        thread::sleep(Duration::from_millis(50));
+
+        let events = emitter.events.lock().unwrap();
+        let done = events
+            .iter()
+            .position(|(event, _)| event == DONE_EVENT)
+            .expect("scan:done was emitted");
+        assert_eq!(
+            done,
+            events.len() - 1,
+            "events after scan:done: {:?}",
+            &events[done + 1..]
+        );
+        assert!(
+            done > 0,
+            "the scan finished before the first tick; the fixture is too small"
+        );
+        assert!(
+            events[..done].iter().all(
+                |(event, status)| event == PROGRESS_EVENT && status.state == ScanState::Running
+            ),
+            "{events:?}"
+        );
+        assert_eq!(events[done].1.state, ScanState::Done);
+        assert_eq!(events[done].1.files, 3_000);
     }
 
     #[test]
@@ -563,13 +652,49 @@ mod tests {
             tree,
         };
         let finished = Finished::persist(result, &data.path().join("snapshots"));
-        assert!(finished.previous.is_none());
+        assert!(finished.previous_sizes.is_none());
+        assert!(finished.previous_taken_at.is_none());
         assert!(finished.growers.is_empty());
         assert!(!data.path().join("snapshots").exists());
         let mut inner = Inner::default();
         inner.complete(finished);
         assert_eq!(inner.state, ScanState::Cancelled);
         assert_eq!(inner.status().files, 0);
+    }
+
+    #[test]
+    fn persist_indexes_the_previous_snapshot_before_the_result_is_installed() {
+        let data = tempfile::tempdir().unwrap();
+        let snapshots = data.path().join("snapshots");
+        let result = || {
+            let tree = Subtree::with_children(
+                Node::new("/root", NodeKind::Dir, 5, 5, 1, 0),
+                vec![Subtree::new(Node::new("f", NodeKind::File, 5, 5, 1, 0))],
+            )
+            .flatten()
+            .0;
+            ScanResult {
+                root: "/root".into(),
+                started_at: Utc::now(),
+                duration_ms: 1,
+                stats: ScanStats::default(),
+                cancelled: false,
+                tree,
+            }
+        };
+        let first = Finished::persist(result(), &snapshots);
+        assert!(first.previous_sizes.is_none());
+        let second = Finished::persist(result(), &snapshots);
+        let sizes = second
+            .previous_sizes
+            .as_ref()
+            .expect("index of the first snapshot");
+        assert_eq!(sizes.get("/root"), Some(&5));
+        assert!(second.previous_taken_at.is_some());
+        let mut inner = Inner::default();
+        inner.complete(second);
+        assert_eq!(inner.state, ScanState::Done);
+        assert!(inner.status().has_previous);
     }
 
     #[test]

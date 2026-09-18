@@ -83,7 +83,9 @@ pub fn disk_usage(
         .map_err(|err| format!("cannot read the volume of {}: {err}", path.display()))
 }
 
-/// The folders that grew the most since the previous snapshot, at most `limit` (default: 10).
+/// The folders that grew the most since the previous snapshot, at most `limit` (default:
+/// 10). The manager keeps only the [`GROWERS_KEPT`](crate::scan_manager::GROWERS_KEPT)
+/// largest growers of a scan, so no `limit` returns more than 50.
 #[tauri::command]
 pub fn top_growers(manager: State<'_, ScanManager>, limit: Option<usize>) -> Vec<Delta> {
     manager.growers(limit.unwrap_or(DEFAULT_GROWERS_LIMIT))
