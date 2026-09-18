@@ -12,6 +12,27 @@ use std::path::{Path, PathBuf};
 
 use super::BlockReason;
 
+/// What [`Limits::check`] decided about one path: the two forms the engine needs.
+///
+/// They differ in the last component alone, and only when the disk spells it otherwise than
+/// the caller did. Keeping both is what lets one entry be deleted by the name it was asked
+/// for while the batch reasons about which entries are the same thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    /// The normalized path: absolute, in the port's normal form, and carrying the caller's
+    /// own last component. This is what gets deleted.
+    pub path: PathBuf,
+    /// The same entry in the spelling the rules judged: fully resolved — except for a
+    /// symlink, which is judged as written, because deleting one leaves its target alone.
+    ///
+    /// Never a path to delete; [`Self::path`] is. It is the only form in which two entries
+    /// of one batch can be compared, and [`drop_nested`] is given these. `Data` and `data`,
+    /// or one name in NFC and in NFD, are a single directory on a stock macOS volume and
+    /// two different [`Path`]s: a batch that compared [`Self::path`] would promise their
+    /// bytes twice and then fail to delete whichever came second.
+    pub judged: PathBuf,
+}
+
 /// Where deletion is allowed and where it is never allowed.
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -109,11 +130,13 @@ impl Limits {
         Self::new(root, denied)
     }
 
-    /// Normalizes `path` and applies every rule. The returned path is what the engine
-    /// deletes — the caller's own last component, never the target of a link.
+    /// Normalizes `path` and applies every rule. [`Checked::path`] is what the engine
+    /// deletes — the caller's own last component, never the target of a link — and
+    /// [`Checked::judged`] is the form the rules were applied to, which the engine needs in
+    /// turn to tell two spellings of one entry apart.
     ///
     /// The rules are numbered as in the design; [`Self::new`] refers to rule 4.
-    pub fn check(&self, path: &Path) -> Result<PathBuf, BlockReason> {
+    pub fn check(&self, path: &Path) -> Result<Checked, BlockReason> {
         // 1. No last component to speak of: this is `/`, or a path ending in `..`. Both
         //    name something other than they appear to — `remove("/a/b/..")` empties `/a`.
         //    (A path with a file name always has a parent, so the two fail together.)
@@ -149,7 +172,10 @@ impl Limits {
         if self.denied.iter().any(|d| judged.starts_with(d)) {
             return Err(BlockReason::Denylisted);
         }
-        Ok(normalized)
+        Ok(Checked {
+            path: normalized,
+            judged,
+        })
     }
 }
 
@@ -212,9 +238,11 @@ fn parent_resolved(path: &Path) -> PathBuf {
 /// this the descendant's bytes would be counted twice and its deletion would fail with "no
 /// such file" once the ancestor is gone. Of several copies of one path the first survives.
 ///
-/// Takes paths [`Limits::check`] has returned: absolute and normalized. Anything else
-/// makes the answer meaningless rather than merely wrong — every path starts with the
-/// empty one, so a single empty entry would drop the whole batch.
+/// Takes the [`Checked::judged`] forms [`Limits::check`] returned, not the paths it hands
+/// on to the port: those keep the caller's spelling of the last component, and two
+/// spellings of one directory would then look like two entries. Anything else makes the
+/// answer meaningless rather than merely wrong — every path starts with the empty one, so a
+/// single empty entry would drop the whole batch.
 ///
 /// Quadratic. The 500 entries of a full listing (`DEFAULT_CHILDREN_LIMIT` in the desktop
 /// crate, the most a selection can hold) cost about 12 ms in a release build and 17 ms in
@@ -279,9 +307,11 @@ mod tests {
         let file = dir.path().join("keep/a.bin");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, b"x").unwrap();
+        let checked = limits(dir.path()).check(&file).unwrap();
+        assert_eq!(checked.path, fs::canonicalize(&file).unwrap());
         assert_eq!(
-            limits(dir.path()).check(&file).unwrap(),
-            fs::canonicalize(&file).unwrap()
+            checked.judged, checked.path,
+            "an ordinary file resolves to itself, so the two forms agree"
         );
     }
 
@@ -347,7 +377,8 @@ mod tests {
         assert_eq!(
             limits(dir.path())
                 .check(&dir.path().join("gone.bin"))
-                .unwrap(),
+                .unwrap()
+                .path,
             fs::canonicalize(dir.path()).unwrap().join("gone.bin")
         );
     }
@@ -363,9 +394,12 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         // The link lives inside the root, so it may be deleted; the target must not be
         // what the guard returns, or we would delete outside the root.
+        let checked = limits(&root).check(&link).unwrap();
+        assert_eq!(checked.path, fs::canonicalize(&root).unwrap().join("link"));
         assert_eq!(
-            limits(&root).check(&link).unwrap(),
-            fs::canonicalize(&root).unwrap().join("link")
+            checked.judged, checked.path,
+            "a symlink is judged as written; resolving it here would put the batch's \
+             comparison on the target and let a link swallow a sibling entry"
         );
     }
 
@@ -449,8 +483,8 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let with_slash = PathBuf::from(format!("{}/link/", root.display()));
         let checked = limits(&root).check(&with_slash).unwrap();
-        assert_eq!(checked, fs::canonicalize(&root).unwrap().join("link"));
-        assert_port_normal_form(&checked);
+        assert_eq!(checked.path, fs::canonicalize(&root).unwrap().join("link"));
+        assert_port_normal_form(&checked.path);
     }
 
     #[test]
@@ -462,8 +496,8 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let noisy = root.join("./sub/../sub/./a.bin");
         let checked = limits(&root).check(&noisy).unwrap();
-        assert_eq!(checked, fs::canonicalize(&file).unwrap());
-        assert_port_normal_form(&checked);
+        assert_eq!(checked.path, fs::canonicalize(&file).unwrap());
+        assert_port_normal_form(&checked.path);
     }
 
     #[test]
@@ -474,8 +508,8 @@ mod tests {
         let file = root.join("Cargo.toml");
         let limits = Limits::new(root, vec![]);
         let checked = limits.check(Path::new("./Cargo.toml")).unwrap();
-        assert_eq!(checked, fs::canonicalize(&file).unwrap());
-        assert_port_normal_form(&checked);
+        assert_eq!(checked.path, fs::canonicalize(&file).unwrap());
+        assert_port_normal_form(&checked.path);
     }
 
     #[test]
@@ -489,7 +523,7 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let limits = Limits::new(root.clone(), vec![dir.path().to_path_buf(), root.clone()]);
         assert_eq!(
-            limits.check(&file).unwrap(),
+            limits.check(&file).unwrap().path,
             fs::canonicalize(&file).unwrap()
         );
         assert_eq!(limits.check(&root), Err(BlockReason::IsRoot));
@@ -503,7 +537,7 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let limits = Limits::for_scan_root(dir.path().to_path_buf());
         assert_eq!(
-            limits.check(&file).unwrap(),
+            limits.check(&file).unwrap().path,
             fs::canonicalize(&file).unwrap()
         );
     }
@@ -534,7 +568,7 @@ mod tests {
             "and everything under it"
         );
         assert_eq!(
-            limits.check(&keep).unwrap(),
+            limits.check(&keep).unwrap().path,
             fs::canonicalize(&keep).unwrap(),
             "the home folder in the denylist must not block the scan of the home folder"
         );
@@ -583,7 +617,7 @@ mod tests {
             vec![dir.path().join("absent"), PathBuf::from("/no/such/place")],
         );
         assert_eq!(
-            limits.check(&file).unwrap(),
+            limits.check(&file).unwrap().path,
             fs::canonicalize(&file).unwrap()
         );
     }
@@ -613,7 +647,7 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         fs::create_dir(dir.path().join("Library")).unwrap();
         assert_eq!(
-            limits(dir.path()).check(&file).unwrap(),
+            limits(dir.path()).check(&file).unwrap().path,
             fs::canonicalize(&file).unwrap()
         );
     }
@@ -664,7 +698,7 @@ mod tests {
                 // Case-sensitive: a different name, naming nothing, and denying it would
                 // be denying a path that has nothing to do with the denied one.
                 assert_eq!(
-                    verdict.unwrap(),
+                    verdict.unwrap().path,
                     fs::canonicalize(dir.path()).unwrap().join(spelling),
                     "<root>/{spelling} is its own path on this volume"
                 );
@@ -691,8 +725,26 @@ mod tests {
         fs::create_dir(dir.path().join("Data")).unwrap();
         let limits = Limits::new(dir.path().to_path_buf(), vec![]);
         let checked = limits.check(&dir.path().join("data")).unwrap();
-        assert_eq!(checked, fs::canonicalize(dir.path()).unwrap().join("data"));
-        assert_port_normal_form(&checked);
+        assert_eq!(
+            checked.path,
+            fs::canonicalize(dir.path()).unwrap().join("data")
+        );
+        assert_port_normal_form(&checked.path);
+        // The other half of the same decision: the form the rules judged carries the name
+        // the disk has, and the engine compares the entries of a batch by it. Without it,
+        // `Data` and `data` would be two entries and their bytes would be promised twice.
+        if case_insensitive(dir.path()) {
+            assert_eq!(
+                checked.judged,
+                fs::canonicalize(dir.path()).unwrap().join("Data"),
+                "one directory, under the name it has on disk"
+            );
+        } else {
+            assert_eq!(
+                checked.judged, checked.path,
+                "a different name on this volume, naming nothing, so there is nothing to resolve"
+            );
+        }
     }
 
     #[test]
@@ -744,7 +796,7 @@ mod tests {
             "and as it resolves"
         );
         assert_eq!(
-            limits.check(&link.join("a.bin")).unwrap(),
+            limits.check(&link.join("a.bin")).unwrap().path,
             fs::canonicalize(&file).unwrap(),
             "what is inside it stays deletable"
         );
@@ -793,7 +845,7 @@ mod tests {
         fs::create_dir_all(&keychains).unwrap();
         let limits = Limits::with_home(library.clone(), Some(dir.path().to_path_buf()));
         assert_eq!(
-            limits.check(&keychains).unwrap(),
+            limits.check(&keychains).unwrap().path,
             fs::canonicalize(&keychains).unwrap()
         );
         assert_eq!(
@@ -831,7 +883,10 @@ mod tests {
         let late = real.join("Caches/app");
         fs::create_dir_all(&late).unwrap();
         assert_eq!(
-            limits.check(&dir.path().join("link/Caches/app")).unwrap(),
+            limits
+                .check(&dir.path().join("link/Caches/app"))
+                .unwrap()
+                .path,
             fs::canonicalize(&late).unwrap()
         );
     }

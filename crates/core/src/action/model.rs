@@ -87,7 +87,15 @@ pub enum EntryStatus {
 pub struct PreviewEntry {
     /// The normalized path, which is exactly what would be deleted.
     pub path: PathBuf,
-    /// The kind the disk reports now, not the one the plan carried.
+    /// What the entry is — and which of two different things this is depends on the status:
+    ///
+    /// - [`EntryStatus::Ready`], and [`BlockReason::Nested`] which was ready a moment
+    ///   earlier: the kind the disk reported during the preview, through the same
+    ///   classifier the scan uses. The re-validation before the deletion compares against
+    ///   this one, so it has to come from the disk.
+    /// - every other [`BlockReason`]: the plan's claim, unverified, because nothing could
+    ///   be looked at. Deliberately not an `Option` — a blocked row is still drawn, and its
+    ///   icon comes from here. The status is what says which of the two a reader is holding.
     pub kind: NodeKind,
     /// The size the plan carried, from the scan — deliberately not re-read while the kind
     /// is. Re-reading it would mean walking the subtree of every selected directory just
@@ -108,6 +116,12 @@ pub struct PreviewEntry {
 pub struct Preview {
     pub entries: Vec<PreviewEntry>,
     /// Sum of `size` over the [`EntryStatus::Ready`] entries only.
+    ///
+    /// Honest because of where the sizes come from: a scan attributes hard-linked data to
+    /// one path and reports 0 for the other links, so summing two selected entries cannot
+    /// count the same blocks twice. A plan built from somewhere else — a phase 3 module
+    /// with its own sizes — has to keep that property, or this number over-promises what
+    /// the disk will give back.
     pub total_bytes: u64,
     pub mode: Mode,
 }

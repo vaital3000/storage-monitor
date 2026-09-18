@@ -16,32 +16,40 @@ use super::model::{BlockReason, EntryStatus, Plan, PlanEntry, Preview, PreviewEn
 /// Checks a plan without touching anything. Every entry keeps its place in the list, so
 /// the UI can show blocked ones with their reason.
 pub fn preview(plan: &Plan, limits: &Limits, sys: &dyn System) -> Preview {
-    let mut entries: Vec<PreviewEntry> = plan
-        .entries
-        .iter()
-        .map(|entry| check_entry(entry, limits, sys))
-        .collect();
+    let mut entries: Vec<PreviewEntry> = Vec::with_capacity(plan.entries.len());
+    // Where each still-ready entry sits in `entries`, and the form to compare it by.
+    let mut ready: Vec<(usize, PathBuf)> = Vec::new();
+    for planned in &plan.entries {
+        match check_entry(planned, limits, sys) {
+            Verdict::Ready { entry, judged } => {
+                ready.push((entries.len(), judged));
+                entries.push(entry);
+            }
+            Verdict::Blocked(entry) => entries.push(entry),
+        }
+    }
 
     // Only the entries that are still ready take part: an entry that will not be deleted
     // cannot swallow the one below it. Selecting the root row together with a file inside
     // it is one click in a tree view, and that file still has to be deletable.
     //
-    // The paths are the ones `Limits::check` returned, never the ones the plan carried:
-    // `<root>/link/inner` and `<root>/real/inner` are one directory, and only the resolved
-    // spelling shows it. `drop_nested` cannot tell the difference itself — its
-    // `debug_assert` weighs absoluteness and nothing else, and says nothing at all in a
-    // release build.
-    let ready: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.status == EntryStatus::Ready)
-        .map(|(index, _)| index)
-        .collect();
-    let paths: Vec<PathBuf> = ready
-        .iter()
-        .map(|&index| entries[index].path.clone())
-        .collect();
-    for (&index, kept) in ready.iter().zip(drop_nested(&paths)) {
+    // They are compared by `Checked::judged`, never by the path that gets deleted. That one
+    // keeps the caller's spelling of the last component — deliberately, since a symlink must
+    // not resolve to its target — and two spellings of one directory would then look like
+    // two entries: `Data` and `data`, or one name in NFC and in NFD, are a single directory
+    // on a stock macOS volume. Comparing the deleted form would promise those bytes twice
+    // and then fail to delete whichever came second. `drop_nested` cannot catch the
+    // substitution itself: its `debug_assert` weighs absoluteness and nothing else, and says
+    // nothing at all in a release build.
+    //
+    // An exact duplicate lands here too, as `Nested` rather than a reason of its own: the
+    // dialog then says "another entry contains it" about a row that contains nothing, which
+    // is the wrong word for the right verdict. A `Duplicate` reason would be a wire change,
+    // a new arm in every consumer and a new string to translate, for one cosmetic line in a
+    // case the user reaches by selecting one row twice. Deliberate; revisit it if the
+    // Activity screen ever has to explain the difference.
+    let judged: Vec<PathBuf> = ready.iter().map(|(_, judged)| judged.clone()).collect();
+    for (&(index, _), kept) in ready.iter().zip(drop_nested(&judged)) {
         if !kept {
             entries[index].status = EntryStatus::Blocked(BlockReason::Nested);
         }
@@ -60,43 +68,67 @@ pub fn preview(plan: &Plan, limits: &Limits, sys: &dyn System) -> Preview {
     }
 }
 
+/// The verdict on one entry before the batch is looked at as a whole.
+enum Verdict {
+    /// Still a candidate, with the form the batch comparison needs. That form has no place
+    /// on [`PreviewEntry`]: it crosses IPC, and nothing outside this file may delete by it.
+    Ready {
+        entry: PreviewEntry,
+        judged: PathBuf,
+    },
+    /// Refused by the guards or by the disk, and so out of the comparison entirely.
+    Blocked(PreviewEntry),
+}
+
 /// One entry against the guards and the disk, before the batch is looked at as a whole.
 ///
 /// The size is the plan's throughout — the number the Explorer showed the user, which is
 /// what the dialog is about — while the kind is re-read for the entries that get that far.
 /// Only that one is worth a syscall: a stale size costs nothing, and a stale kind deletes
 /// the wrong thing.
-fn check_entry(entry: &PlanEntry, limits: &Limits, sys: &dyn System) -> PreviewEntry {
-    let blocked = |path: PathBuf, reason| PreviewEntry {
-        path,
-        // Nothing was successfully looked at, so there is no better answer than the plan's.
-        kind: entry.kind,
-        size: entry.size,
-        status: EntryStatus::Blocked(reason),
+fn check_entry(entry: &PlanEntry, limits: &Limits, sys: &dyn System) -> Verdict {
+    let blocked = |path: PathBuf, reason| {
+        Verdict::Blocked(PreviewEntry {
+            path,
+            // Nothing was read, so the plan's claim about the kind is all there is. It is
+            // unverified, and `PreviewEntry::kind` says so.
+            kind: entry.kind,
+            size: entry.size,
+            status: EntryStatus::Blocked(reason),
+        })
     };
     // Reports `Missing`, `Unreadable` and `Malformed` besides the placement rules, and each
     // of them means something different to the person reading the dialog. Pass them on.
-    let path = match limits.check(&entry.path) {
-        Ok(path) => path,
+    let checked = match limits.check(&entry.path) {
+        Ok(checked) => checked,
         // Without a normalized path the only honest thing to show is what was asked for.
         Err(reason) => return blocked(entry.path.clone(), reason),
     };
-    match sys.symlink_metadata(&path) {
-        Ok(meta) => PreviewEntry {
-            path,
-            // The walker's own classifier, so that a socket or a fifo is `Other` here as
-            // well. A private `if is_dir { Dir } else { File }` would disagree with the
-            // scan about every such entry, and the re-validation before the deletion would
-            // refuse them all as `KindChanged`, for ever.
-            kind: NodeKind::from_metadata(&meta),
-            size: entry.size,
-            status: EntryStatus::Ready,
+    match sys.symlink_metadata(&checked.path) {
+        Ok(meta) => Verdict::Ready {
+            entry: PreviewEntry {
+                path: checked.path,
+                // The walker's own classifier, so that a socket or a fifo is `Other` here
+                // as well. A private `if is_dir { Dir } else { File }` would disagree with
+                // the scan about every such entry, and the re-validation before the
+                // deletion would refuse them all as `KindChanged`, for ever.
+                kind: NodeKind::from_metadata(&meta),
+                size: entry.size,
+                status: EntryStatus::Ready,
+            },
+            judged: checked.judged,
         },
         // The guard judged where the path points, without insisting anything is there.
-        Err(SystemError::Missing(_)) => blocked(path, BlockReason::Missing),
-        // Permissions that changed under us, a loop, a path the port refuses: whatever it
-        // is, nobody can look at this entry, and that is not one to delete on a guess.
-        Err(_) => blocked(path, BlockReason::Unreadable),
+        Err(SystemError::Missing(_)) => blocked(checked.path, BlockReason::Missing),
+        // The port refuses a path that is not absolute and in normal form, and `check` is
+        // what produces that form — so this is a bug on this side of the port, not a state
+        // the user can do anything about. `Malformed` is at least the truth about the path;
+        // `Unreadable` below means "grant Full Disk Access", which would be an instruction
+        // to go and fix the wrong thing.
+        Err(SystemError::Rejected { .. }) => blocked(checked.path, BlockReason::Malformed),
+        // Permissions that changed under us, a loop, a variant added later: whatever it is,
+        // nobody can look at this entry, and that is not one to delete on a guess.
+        Err(_) => blocked(checked.path, BlockReason::Unreadable),
     }
 }
 
@@ -111,21 +143,61 @@ mod tests {
     use chrono::{DateTime, Utc};
     use std::fs::{self, Metadata};
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
 
-    /// A port that cannot look at anything, and that screams if asked to delete.
+    /// A port that cannot look at anything, records what it was asked about, and screams if
+    /// asked to delete.
     ///
     /// `Limits::check` stats the entry too, so on a real filesystem it reports anything but
     /// "not found" before the preview ever gets to look. What is left for the preview to
     /// meet is a race — the entry was readable a syscall ago and is not now — and a race is
     /// not a thing to reproduce with `chmod`.
-    struct Unreadable;
+    struct Failing {
+        /// What `symlink_metadata` answers. A function, because which `SystemError` arrives
+        /// is the whole point of two of the tests below.
+        error: fn(&Path) -> SystemError,
+        /// Every path the port was asked about, in order. Without it a test can only check
+        /// what `preview` stored, never what it went and looked at.
+        asked: Mutex<Vec<PathBuf>>,
+    }
 
-    impl System for Unreadable {
-        fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError> {
-            Err(SystemError::Metadata {
+    impl Failing {
+        fn new(error: fn(&Path) -> SystemError) -> Self {
+            Self {
+                error,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Cannot be read at all: the shape of a permission that changed under us.
+        fn unreadable() -> Self {
+            Self::new(|path| SystemError::Metadata {
                 path: path.to_path_buf(),
                 source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
             })
+        }
+
+        /// Refuses the path outright, the way the port does when the engine hands it a
+        /// shape it must never hand it.
+        fn rejecting() -> Self {
+            Self::new(|path| SystemError::Rejected {
+                path: path.to_path_buf(),
+                reason: "the path is not in normal form",
+            })
+        }
+
+        fn asked(&self) -> Vec<PathBuf> {
+            self.asked.lock().expect("an unpoisoned record").clone()
+        }
+    }
+
+    impl System for Failing {
+        fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError> {
+            self.asked
+                .lock()
+                .expect("an unpoisoned record")
+                .push(path.to_path_buf());
+            Err((self.error)(path))
         }
 
         fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
@@ -155,13 +227,9 @@ mod tests {
         }
     }
 
-    /// One entry with a path the `plan` helper cannot spell.
-    fn entry(path: PathBuf, size: u64) -> PlanEntry {
-        PlanEntry {
-            path,
-            kind: NodeKind::File,
-            size,
-        }
+    /// One entry with a path, or a claimed kind, the `plan` helper cannot spell.
+    fn entry(path: PathBuf, kind: NodeKind, size: u64) -> PlanEntry {
+        PlanEntry { path, kind, size }
     }
 
     #[test]
@@ -170,17 +238,17 @@ mod tests {
         fs::write(sys.root().join("a.bin"), b"x").unwrap();
         let mut p = plan(&sys, &["a.bin", "gone.bin"], Mode::Trash);
         p.entries[1].size = 999;
-        let preview = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
-        assert_eq!(preview.entries[0].status, EntryStatus::Ready);
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[0].status, EntryStatus::Ready);
         assert_eq!(
-            preview.entries[1].status,
+            checked.entries[1].status,
             EntryStatus::Blocked(BlockReason::Missing)
         );
         assert_eq!(
-            preview.total_bytes, 10,
+            checked.total_bytes, 10,
             "a blocked entry contributes nothing"
         );
-        assert_eq!(preview.mode, Mode::Trash);
+        assert_eq!(checked.mode, Mode::Trash);
     }
 
     #[test]
@@ -202,13 +270,13 @@ mod tests {
             ],
             mode: Mode::Permanent,
         };
-        let preview = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
         assert_eq!(
-            preview.entries[1].status,
+            checked.entries[1].status,
             EntryStatus::Blocked(BlockReason::Nested)
         );
         assert_eq!(
-            preview.total_bytes, 100,
+            checked.total_bytes, 100,
             "the child's bytes are not counted twice"
         );
     }
@@ -220,7 +288,9 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let p = plan(&sys, &["a.bin"], Mode::Permanent);
         preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
-        assert!(file.exists());
+        // Not `exists`, which follows a symlink: it would also pass if the entry had been
+        // replaced by a link to something else.
+        assert!(fs::symlink_metadata(&file).is_ok());
         assert_eq!(fs::read_dir(sys.trash_dir()).unwrap().count(), 0);
     }
 
@@ -229,8 +299,8 @@ mod tests {
         let sys = TestSystem::new();
         fs::create_dir(sys.root().join("a.bin")).unwrap();
         let p = plan(&sys, &["a.bin"], Mode::Trash); // planned as a File
-        let preview = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
-        assert_eq!(preview.entries[0].kind, NodeKind::Dir);
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[0].kind, NodeKind::Dir);
     }
 
     // The rest are not in the plan.
@@ -251,12 +321,14 @@ mod tests {
         fs::write(sys.root().join("keep.bin"), b"x").unwrap();
         let p = Plan {
             entries: vec![
-                entry(PathBuf::from("/"), 1), // no last component to delete
-                entry(a.join("x.bin"), 2),    // the parent resolves to a loop
+                // No last component to delete.
+                entry(PathBuf::from("/"), NodeKind::File, 1),
+                // The parent resolves to a loop.
+                entry(a.join("x.bin"), NodeKind::File, 2),
                 // Nothing is there — spelled through a symlinked parent, so that the path
                 // the guards examined and the one the plan carried can be told apart.
-                entry(sys.root().join("link/gone.bin"), 4),
-                entry(sys.root().join("keep.bin"), 8),
+                entry(sys.root().join("link/gone.bin"), NodeKind::File, 4),
+                entry(sys.root().join("keep.bin"), NodeKind::File, 8),
             ],
             mode: Mode::Permanent,
         };
@@ -340,25 +412,53 @@ mod tests {
         fs::write(sys.root().join("real/a.bin"), b"x").unwrap();
         std::os::unix::fs::symlink(sys.root().join("real"), sys.root().join("link")).unwrap();
         // Through a symlinked parent, so that the path the guards returned and the one the
-        // plan carried are two different paths and the assertion below can tell them apart.
-        let p = plan(&sys, &["link/a.bin"], Mode::Trash);
-        let checked = preview(
-            &p,
-            &Limits::new(sys.root().to_path_buf(), vec![]),
-            &Unreadable,
-        );
+        // plan carried are two different paths and the assertions below can tell them
+        // apart. The claimed kind is wrong on purpose: `a.bin` is a file.
+        let p = Plan {
+            entries: vec![entry(sys.root().join("link/a.bin"), NodeKind::Dir, 10)],
+            mode: Mode::Trash,
+        };
+        let port = Failing::unreadable();
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &port);
         assert_eq!(
             checked.entries[0].status,
             EntryStatus::Blocked(BlockReason::Unreadable)
         );
         assert_eq!(
+            port.asked(),
+            vec![sys.root().join("real/a.bin")],
+            "the preview asked the port about the path the guards returned"
+        );
+        assert_eq!(
             checked.entries[0].path,
             sys.root().join("real/a.bin"),
-            "an entry blocked after the guards reports the path they examined"
+            "and reports the path it asked about"
         );
-        // Nothing was read, so both come from the plan; the dialog still has a row to show.
-        assert_eq!(checked.entries[0].kind, NodeKind::File, "the plan's kind");
+        // Nothing was read, so both come from the plan, wrong claim and all; the dialog
+        // still has a row to draw.
+        assert_eq!(
+            checked.entries[0].kind,
+            NodeKind::Dir,
+            "the plan's unverified claim, not a guess of our own"
+        );
         assert_eq!(checked.entries[0].size, 10, "and the plan's size");
+        assert_eq!(checked.total_bytes, 0);
+    }
+
+    #[test]
+    fn a_path_the_port_refuses_is_malformed_not_unreadable() {
+        // `Rejected` means the engine handed the port a path it must never hand it — a bug
+        // on this side, not a state anyone can fix. `Unreadable` is the reason that sends a
+        // user to System Settings for Full Disk Access, which would be the wrong errand.
+        let sys = TestSystem::new();
+        fs::write(sys.root().join("a.bin"), b"x").unwrap();
+        let p = plan(&sys, &["a.bin"], Mode::Trash);
+        let port = Failing::rejecting();
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &port);
+        assert_eq!(
+            checked.entries[0].status,
+            EntryStatus::Blocked(BlockReason::Malformed)
+        );
         assert_eq!(checked.total_bytes, 0);
     }
 
@@ -414,31 +514,145 @@ mod tests {
         assert_eq!(checked.total_bytes, 100);
     }
 
-    #[test]
-    fn a_blocked_ancestor_neither_nests_what_is_below_it_nor_moves_it() {
-        // Selecting the root row together with things inside it costs one click in a tree
-        // view. The root is refused and stays where it is, so what is below it is not
-        // inside anything that is about to be deleted — and the entries that follow a
-        // blocked one must keep their own places in the list.
+    /// One directory, selected twice: once under the name it has on disk and once under a
+    /// spelling that opens the same directory on a stock macOS volume. Whether the two are
+    /// one directory is asked of the volume, not guessed from the OS, the way `guards.rs`
+    /// probes for case sensitivity.
+    fn assert_one_directory_counted_once(on_disk: &str, alias: &str) {
         let sys = TestSystem::new();
-        fs::create_dir_all(sys.root().join("dir/inner")).unwrap();
+        let real = sys.root().join(on_disk);
+        fs::create_dir(&real).unwrap();
+        let aliased = sys.root().join(alias);
+        let one_directory = aliased.is_dir();
         let p = Plan {
             entries: vec![
                 PlanEntry {
-                    path: sys.root().to_path_buf(),
+                    path: real,
                     kind: NodeKind::Dir,
-                    size: 1_000,
+                    size: 100,
                 },
+                PlanEntry {
+                    path: aliased,
+                    kind: NodeKind::Dir,
+                    size: 100,
+                },
+            ],
+            mode: Mode::Trash,
+        };
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[0].status, EntryStatus::Ready);
+        if one_directory {
+            assert_eq!(
+                checked.entries[1].status,
+                EntryStatus::Blocked(BlockReason::Nested),
+                "{alias} opens the directory created as {on_disk} on this volume"
+            );
+        } else {
+            // A case- and normalization-sensitive volume: two names, and the second names
+            // nothing. The rule under test has nothing to do here, and the total is right
+            // for the duller reason.
+            assert_eq!(
+                checked.entries[1].status,
+                EntryStatus::Blocked(BlockReason::Missing),
+                "{alias} is its own name on this volume"
+            );
+        }
+        assert_eq!(
+            checked.total_bytes, 100,
+            "one directory on disk, promised once"
+        );
+    }
+
+    #[test]
+    fn another_case_of_one_name_is_not_counted_twice() {
+        assert_one_directory_counted_once("Data", "data");
+    }
+
+    #[test]
+    fn another_normalization_of_one_name_is_not_counted_twice() {
+        // No user error at all: the same name typed on macOS arrives in NFC from one source
+        // and in NFD from another, and APFS treats them as one directory.
+        assert_one_directory_counted_once("caf\u{e9}", "cafe\u{301}");
+        assert_one_directory_counted_once("cafe\u{301}", "caf\u{e9}");
+    }
+
+    #[test]
+    fn a_symlink_and_the_directory_it_points_at_are_two_entries() {
+        // The other side of judging the resolved form: a symlink must stay judged as
+        // written. Deleting the link leaves the target alone, so neither entry contains the
+        // other and both bytes are really freed.
+        let sys = TestSystem::new();
+        let target = sys.root().join("target");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, sys.root().join("link")).unwrap();
+        let p = Plan {
+            entries: vec![
+                PlanEntry {
+                    path: sys.root().join("link"),
+                    kind: NodeKind::Symlink,
+                    size: 10,
+                },
+                PlanEntry {
+                    path: target,
+                    kind: NodeKind::Dir,
+                    size: 100,
+                },
+            ],
+            mode: Mode::Trash,
+        };
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[0].status, EntryStatus::Ready);
+        assert_eq!(checked.entries[1].status, EntryStatus::Ready);
+        assert_eq!(checked.total_bytes, 110);
+    }
+
+    #[test]
+    fn one_entry_selected_twice_is_promised_once() {
+        // `guards.rs` pins the first-wins rule on `drop_nested` itself; this is the
+        // consequence the user sees. The reason reads `Nested`, which is the wrong word for
+        // a row that contains nothing — a deliberate trade, spelled out in `preview`.
+        let sys = TestSystem::new();
+        fs::create_dir(sys.root().join("dir")).unwrap();
+        let p = Plan {
+            entries: vec![
                 PlanEntry {
                     path: sys.root().join("dir"),
                     kind: NodeKind::Dir,
                     size: 100,
                 },
                 PlanEntry {
-                    path: sys.root().join("dir/inner"),
+                    path: sys.root().join("dir"),
                     kind: NodeKind::Dir,
-                    size: 40,
+                    size: 100,
                 },
+            ],
+            mode: Mode::Trash,
+        };
+        let checked = preview(&p, &Limits::new(sys.root().to_path_buf(), vec![]), &sys);
+        assert_eq!(checked.entries[0].status, EntryStatus::Ready);
+        assert_eq!(
+            checked.entries[1].status,
+            EntryStatus::Blocked(BlockReason::Nested)
+        );
+        assert_eq!(checked.total_bytes, 100);
+    }
+
+    #[test]
+    fn a_blocked_ancestor_neither_nests_what_is_below_it_nor_moves_it() {
+        // Selecting the root row together with things inside it costs one click in a tree
+        // view. The root is refused and stays where it is, so what is below it is not
+        // inside anything that is about to be deleted — and the entries that follow a
+        // blocked one must keep their own places in the list.
+        //
+        // All three are directories on disk and all three are planned as something else, so
+        // that the kinds below say where each value came from instead of agreeing by luck.
+        let sys = TestSystem::new();
+        fs::create_dir_all(sys.root().join("dir/inner")).unwrap();
+        let p = Plan {
+            entries: vec![
+                entry(sys.root().to_path_buf(), NodeKind::Symlink, 1_000),
+                entry(sys.root().join("dir"), NodeKind::File, 100),
+                entry(sys.root().join("dir/inner"), NodeKind::File, 40),
             ],
             mode: Mode::Trash,
         };
@@ -451,6 +665,13 @@ mod tests {
                 EntryStatus::Ready,
                 EntryStatus::Blocked(BlockReason::Nested),
             ]
+        );
+        let kinds: Vec<NodeKind> = checked.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![NodeKind::Symlink, NodeKind::Dir, NodeKind::Dir],
+            "refused before anything was read, so the plan's claim stands; the other two \
+             were read, and a `Nested` entry keeps what the disk said"
         );
         assert_eq!(checked.total_bytes, 100);
     }

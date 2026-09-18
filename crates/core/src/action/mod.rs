@@ -5,7 +5,7 @@ mod guards;
 mod model;
 
 pub use engine::preview;
-pub use guards::{Limits, drop_nested};
+pub use guards::{Checked, Limits, drop_nested};
 pub use model::{
     BlockReason, EntryOutcome, EntryResult, EntryStatus, Mode, Outcome, Plan, PlanEntry, Preview,
     PreviewEntry,
