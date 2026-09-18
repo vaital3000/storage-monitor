@@ -28,6 +28,8 @@ impl Limits {
     /// `root` and `denied` are resolved here, each kept in both the spellings a path can
     /// have: with only its parent resolved, and fully resolved.
     ///
+    /// `root` must be absolute, the way a scan produces it.
+    ///
     /// A path that does not exist keeps whatever spelling it was handed; it then matches
     /// only a checked path that resolves to exactly that, which on macOS usually means
     /// never, since a real path resolves through `/private` or the case on disk.
@@ -45,11 +47,21 @@ impl Limits {
         let root = root
             .canonicalize()
             .unwrap_or_else(|_| root_as_given.clone());
+        // An empty root would pass rules 4 and 5 for every path on the machine, since
+        // everything starts with the empty path. A relative one refuses everything
+        // instead. Both are callers' mistakes rather than states to handle.
+        debug_assert!(
+            root.is_absolute(),
+            "a scan root must be absolute, got {}",
+            root.display()
+        );
         let denied = denied
             .iter()
             .flat_map(|d| forms(d))
             // Against the resolved root, since that is what rules 5 and 6 judge: a form the
-            // resolved root is not under can never swallow it.
+            // resolved root is not under can never swallow it. What makes dropping safe is
+            // rule 4 running first and testing both root spellings — reorder them and a
+            // dropped entry stops being covered.
             .filter(|d| !root.starts_with(d))
             .collect();
         Self {
@@ -75,11 +87,19 @@ impl Limits {
             PathBuf::from("/sbin"),
             PathBuf::from("/Library"),
             PathBuf::from("/Applications"),
-            // On macOS these three are where the previous four actually live, and the
-            // first two are symlinks: `/etc` is `/private/etc`. `Limits::new` keeps both
-            // spellings, which is what makes denying them work from either side.
+            PathBuf::from("/opt"),
+            PathBuf::from("/cores"),
+            // Other people's home folders, and whatever is mounted. A scan rooted inside
+            // one of them still works: `Limits::new` drops whichever entry contains the
+            // root, so a `/Volumes/Backup` root keeps its own contents deletable.
+            PathBuf::from("/Users"),
+            PathBuf::from("/Volumes"),
+            // On macOS these are where much of the above actually lives, and the first
+            // three are symlinks into the fourth: `/etc` is `/private/etc`. `Limits::new`
+            // keeps both spellings, which is what makes denying them work from either side.
             PathBuf::from("/etc"),
             PathBuf::from("/var"),
+            PathBuf::from("/tmp"),
             PathBuf::from("/private"),
         ];
         if let Some(home) = home {
@@ -145,6 +165,10 @@ impl Limits {
 fn judged_form(normalized: &Path) -> Result<PathBuf, BlockReason> {
     match std::fs::symlink_metadata(normalized) {
         Ok(meta) if meta.file_type().is_symlink() => Ok(normalized.to_path_buf()),
+        // The one fallback in here that judges the spelling the caller wrote: the entry was
+        // there a syscall ago and cannot be resolved now, so something is moving underneath
+        // us. Narrow enough to leave — the rules still run, and `preview` stats the entry
+        // again — but it is the branch to look at first if a verdict ever surprises anyone.
         Ok(_) => Ok(normalized
             .canonicalize()
             .unwrap_or_else(|_| normalized.to_path_buf())),
@@ -489,8 +513,10 @@ mod tests {
         // `for_scan_root` reads the real home folder, so the rule is exercised through the
         // seam it delegates to, with a temp directory standing in for the home.
         let dir = tempfile::tempdir().unwrap();
-        // Created before the limits are built: an absent denied path is kept as given and
-        // would then not match the canonical form of the checked path.
+        // The order does not matter any more: `Limits::new` resolves the parent of a denied
+        // path, so `<home>/Library` is recorded in the spelling a checked path resolves to
+        // whether or not it exists yet. `a_denied_folder_that_appears_later_is_still_denied`
+        // is the test for that; this one is about the rule itself.
         let library = dir.path().join("Library/Caches");
         fs::create_dir_all(&library).unwrap();
         let keep = dir.path().join("Downloads/a.bin");
@@ -529,8 +555,13 @@ mod tests {
             "/etc",
             "/etc/hosts",
             "/var",
+            "/tmp",
             "/private",
             "/Applications",
+            "/Users",
+            "/Volumes",
+            "/opt",
+            "/cores",
         ] {
             assert_eq!(
                 limits.check(Path::new(path)),
@@ -613,24 +644,38 @@ mod tests {
         // gets deleted — so the rules judge the resolved form instead. Without that, a
         // denied `Library` stops nobody: `library` is the same directory.
         let dir = tempfile::tempdir().unwrap();
-        if !case_insensitive(dir.path()) {
-            eprintln!("skipped: case-sensitive volume");
-            return;
-        }
+        let insensitive = case_insensitive(dir.path());
         fs::create_dir_all(dir.path().join("Library/Caches")).unwrap();
         let limits = limits(dir.path());
-        for spelling in ["Library", "library", "LIBRARY"] {
-            assert_eq!(
-                limits.check(&dir.path().join(spelling)),
-                Err(BlockReason::Denylisted),
-                "<root>/{spelling}"
-            );
-        }
         assert_eq!(
-            limits.check(&dir.path().join("library/Caches")),
+            limits.check(&dir.path().join("Library")),
             Err(BlockReason::Denylisted),
-            "and below it"
+            "the spelling on disk, on any volume"
         );
+        for spelling in ["library", "LIBRARY"] {
+            let verdict = limits.check(&dir.path().join(spelling));
+            if insensitive {
+                assert_eq!(
+                    verdict,
+                    Err(BlockReason::Denylisted),
+                    "<root>/{spelling} opens the denied directory on this volume"
+                );
+            } else {
+                // Case-sensitive: a different name, naming nothing, and denying it would
+                // be denying a path that has nothing to do with the denied one.
+                assert_eq!(
+                    verdict.unwrap(),
+                    fs::canonicalize(dir.path()).unwrap().join(spelling),
+                    "<root>/{spelling} is its own path on this volume"
+                );
+            }
+        }
+        let below = limits.check(&dir.path().join("library/Caches"));
+        if insensitive {
+            assert_eq!(below, Err(BlockReason::Denylisted), "and below it");
+        } else {
+            assert_eq!(below, Err(BlockReason::Missing), "and nothing is below it");
+        }
     }
 
     #[test]
@@ -639,11 +684,10 @@ mod tests {
         // a name can differ here, and on this volume either spelling opens the same
         // directory — but it is the same line of code that keeps a symlink from being
         // handed to the port as its target.
+        // On a case-sensitive volume `data` is simply absent and the same assertion holds
+        // for the duller reason, so the test branches on nothing: either way the answer is
+        // the name that was asked for.
         let dir = tempfile::tempdir().unwrap();
-        if !case_insensitive(dir.path()) {
-            eprintln!("skipped: case-sensitive volume");
-            return;
-        }
         fs::create_dir(dir.path().join("Data")).unwrap();
         let limits = Limits::new(dir.path().to_path_buf(), vec![]);
         let checked = limits.check(&dir.path().join("data")).unwrap();
@@ -708,15 +752,18 @@ mod tests {
 
     #[test]
     fn a_path_behind_an_unreadable_directory_is_not_called_gone() {
-        if unsafe { geteuid() } == 0 {
-            eprintln!("skipped: running as root");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let locked = dir.path().join("locked");
         fs::create_dir_all(locked.join("inner")).unwrap();
         fs::write(locked.join("inner/a.bin"), b"x").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            // root, or a filesystem that does not enforce the mode: there is nothing
+            // unreadable here to test against.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: the mode was not enforced");
+            return;
+        }
         let limits = Limits::new(dir.path().to_path_buf(), vec![]);
         // Collected before the permissions go back, so a failure still leaves a tempdir
         // that can be cleaned up.
@@ -799,10 +846,5 @@ mod tests {
             limits.check(Path::new("Cargo.toml")),
             Err(BlockReason::Missing)
         );
-    }
-
-    unsafe extern "C" {
-        #[link_name = "geteuid"]
-        fn geteuid() -> u32;
     }
 }
