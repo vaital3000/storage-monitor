@@ -849,7 +849,7 @@ pub fn actions_log() -> PathBuf {
 }
 ```
 
-`log.rs`: `LogEntry { at, path: String, kind: NodeKind, mode: Mode, result: LogResult, detail: Option<String>, bytes: u64 }` with `LogResult { Removed, Failed, Skipped }`, all camelCase. `ActionLog::append` creates the parent directory, opens with `OpenOptions::new().create(true).append(true)`, and writes all lines of the batch in one `write_all` so a batch never interleaves with another writer. `tail` reads the file to a string, iterates lines, `serde_json::from_str` per line, skips the errors, keeps the last `limit` and reverses them.
+`log.rs`: `LogEntry { at, path: String, kind: NodeKind, mode: Mode, result: LogResult, detail: Option<String>, bytes: u64 }` with `LogResult { Removed, Failed, Skipped }`, all camelCase. `ActionLog::append` creates the parent directory, opens with `OpenOptions::new().create(true).append(true)`, and writes all lines of the batch in one `write_all` so a batch never interleaves with another writer. `tail` reads the file as **bytes** and decodes with `String::from_utf8_lossy`, then iterates lines from the end, `serde_json::from_str` per line, skipping the errors, until it has `limit` of them. Not `read_to_string`: that fails the whole read with `InvalidData` when a write was torn in the middle of a multi-byte character, which is exactly the racing-`tail` case this has to survive. Reading from the end also parses at most `limit` lines instead of all of them.
 
 Four things follow from `Outcome` being the only input:
 
@@ -857,6 +857,9 @@ Four things follow from `Outcome` being the only input:
 - `EntryOutcome::path` is a `PathBuf` and `LogEntry::path` is a `String`. Convert with `to_string_lossy()`, not an `unwrap`, and point the comment at the paragraph in `model.rs` that explains why a lossy conversion cannot lose anything here.
 - A `Failed` message already embeds the absolute path, because it comes from `SystemError`'s `Display`. `detail` will therefore repeat `path`; harmless in the file, but the Activity screen must not render both.
 - `bytes` is 0 for everything that is not `Removed`. That is deliberate — nothing was freed — but the Activity screen should not read as though a skipped row was worth nothing.
+- `detail` carries the failure message for `Failed` **and the block reason for `Skipped`**, as the wire name `BlockReason` serializes to (`"denylisted"`, `"outsideRoots"`, …). Without it a skipped row reaches Activity with no reason at all. It is the same vocabulary `ipc.ts` already mirrors, so Task 15 maps it the way `nodeErrors.ts` maps scan errors.
+- An empty batch writes nothing and creates nothing — no file, no directory. A no-op leaving an empty `actions.jsonl` behind is worse than no file.
+- A filename may contain a newline, so lines are written through `serde_json`, never formatted by hand: an unescaped name could otherwise forge a log line.
 
 **Step 4: Run the tests**
 
