@@ -243,9 +243,12 @@ declare global {
 }
 
 /**
- * `@tauri-apps/api` 2.11 unlistens with `{ event, eventId }` while the mock's remover reads
- * `args.id`, so listeners were never dropped and every later emit warned about a missing
- * callback. Passing `id` too makes unlisten work.
+ * Works around a mismatch inside `@tauri-apps/api` 2.11: `event.js` unlistens with
+ * `invoke('plugin:event|unlisten', { event, eventId })`, while the remover in `mocks.js`
+ * looks the listener up under `args.id`. Left alone, listeners are never dropped and every
+ * later emit warns about a missing callback. Passing `id` next to `eventId` lets the mock
+ * find it; once upstream reads `eventId`, the extra field is ignored and the shim is
+ * harmless, so it can stay until the dependency is bumped past the fix.
  */
 function fixUnlisten(): void {
   const internals = tauriInternals();

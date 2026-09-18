@@ -23,41 +23,34 @@ describe('App', () => {
     await waitFor(() => expect(screen.getByTestId('version')).toHaveTextContent('Error: boom'));
   });
 
-  it('lists the five sections, Explorer selected, the others focusable but marked', async () => {
+  it('lists the five sections: Explorer selected, the others disabled and marked "soon"', async () => {
     installIpcMock();
     renderWithClient(<App />);
     const nav = screen.getByRole('navigation', { name: 'Sections' });
     expect(within(nav).getAllByRole('button')).toHaveLength(5);
-    expect(within(nav).getByRole('button', { name: 'Explorer' })).toHaveAttribute(
-      'aria-current',
-      'page',
-    );
-    expect(within(nav).getByRole('button', { name: 'Explorer' })).not.toHaveAttribute(
-      'aria-disabled',
-    );
+    const explorer = within(nav).getByRole('button', { name: 'Explorer' });
+    expect(explorer).toHaveAttribute('aria-current', 'page');
+    expect(explorer).toBeEnabled();
     for (const label of ['Overview', 'Cleanup', 'Activity', 'Settings']) {
-      const button = within(nav).getByRole('button', { name: label });
-      expect(button).toHaveAttribute('aria-disabled', 'true');
+      const button = within(nav).getByRole('button', { name: `${label} soon` });
+      expect(button).toBeDisabled();
+      expect(button).not.toHaveAttribute('aria-disabled');
       expect(button).not.toHaveAttribute('aria-current');
-      expect(button).not.toBeDisabled();
-      button.focus();
-      expect(button).toHaveFocus();
     }
     expect(await screen.findByRole('button', { name: 'Scan' })).toBeInTheDocument();
   });
 
-  it('opens a placeholder for a section that is not built yet, and comes back', async () => {
+  it('stays on the Explorer when a section of a later phase is clicked', async () => {
     installIpcMock();
     renderWithClient(<App />);
     expect(await screen.findByRole('button', { name: 'Scan' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cleanup' }));
-    expect(screen.getByRole('heading', { name: 'Cleanup' })).toBeInTheDocument();
-    expect(screen.getByText('Coming in a later phase')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Cleanup' })).toHaveAttribute('aria-current', 'page');
-    expect(screen.queryByRole('button', { name: 'Scan' })).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Explorer' }));
-    expect(await screen.findByRole('button', { name: 'Scan' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cleanup soon' }));
+    expect(screen.getByRole('button', { name: 'Scan' })).toBeInTheDocument();
+    expect(screen.queryByText('Coming in a later phase')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Explorer' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
   });
 });

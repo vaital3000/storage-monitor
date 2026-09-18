@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, formatDate, formatDelta, formatPercent, shortenPath } from './format';
+import {
+  basename,
+  countLabel,
+  formatBytes,
+  formatDate,
+  formatDelta,
+  formatDuration,
+  formatPercent,
+  shortenPath,
+} from './format';
 
 describe('formatBytes', () => {
   it('shows bytes without a decimal', () => {
@@ -91,5 +100,50 @@ describe('shortenPath', () => {
       expect(shortenPath(path, max).length).toBeLessThanOrEqual(Math.max(max, 1));
     }
     expect(shortenPath(path, 1)).toBe('…');
+  });
+});
+
+describe('basename', () => {
+  it('is the last path component, with or without a trailing slash', () => {
+    expect(basename('/Users/demo')).toBe('demo');
+    expect(basename('/Users/demo/Library/')).toBe('Library');
+    expect(basename('Application Support')).toBe('Application Support');
+  });
+
+  it('is the path itself when there is no component', () => {
+    expect(basename('/')).toBe('/');
+    expect(basename('')).toBe('');
+  });
+});
+
+describe('formatDuration', () => {
+  it('shows milliseconds under a second', () => {
+    expect(formatDuration(0)).toBe('0 ms');
+    expect(formatDuration(312)).toBe('312 ms');
+    expect(formatDuration(999)).toBe('999 ms');
+  });
+
+  it('shows seconds with one decimal under a minute', () => {
+    expect(formatDuration(1000)).toBe('1.0 s');
+    expect(formatDuration(4812)).toBe('4.8 s');
+    expect(formatDuration(59_949)).toBe('59.9 s');
+  });
+
+  it('shows minutes and whole seconds from a minute up, never "60.0 s"', () => {
+    expect(formatDuration(59_950)).toBe('1 min 0 s');
+    expect(formatDuration(60_000)).toBe('1 min 0 s');
+    expect(formatDuration(754_500)).toBe('12 min 35 s');
+  });
+});
+
+describe('countLabel', () => {
+  it('pluralises with an s except for exactly one', () => {
+    expect(countLabel(1, 'item')).toBe('1 item');
+    expect(countLabel(0, 'file')).toBe('0 files');
+    expect(countLabel(2, 'folder')).toBe('2 folders');
+  });
+
+  it('groups thousands', () => {
+    expect(countLabel(12_345, 'read error')).toBe('12,345 read errors');
   });
 });

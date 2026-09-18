@@ -8,8 +8,9 @@ interface SidebarProps {
 }
 
 /**
- * The five sections of the design. Sections of later phases stay in the tab order and
- * open their placeholder, but are marked `aria-disabled` and dimmed.
+ * The five sections of the design. Sections of later phases are disabled buttons, dimmed
+ * and marked "soon" (the badge is part of their accessible name); only the Explorer
+ * navigates.
  */
 export default function Sidebar({ page, onNavigate, versionLabel }: SidebarProps) {
   return (
@@ -22,22 +23,26 @@ export default function Sidebar({ page, onNavigate, versionLabel }: SidebarProps
               <li key={id}>
                 <button
                   type="button"
-                  onClick={() => onNavigate(id)}
+                  disabled={!available}
+                  onClick={available ? () => onNavigate(id) : undefined}
                   aria-current={selected ? 'page' : undefined}
-                  aria-disabled={available ? undefined : true}
                   title={available ? undefined : 'Coming in a later phase'}
                   className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm focus-visible:outline-2 focus-visible:outline-blue-500 ${
                     selected
                       ? 'bg-neutral-200/80 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-50'
-                      : 'text-neutral-700 hover:bg-neutral-200/60 dark:text-neutral-300 dark:hover:bg-neutral-800/70'
-                  } ${available ? '' : 'opacity-50'}`}
+                      : available
+                        ? 'text-neutral-700 hover:bg-neutral-200/60 dark:text-neutral-300 dark:hover:bg-neutral-800/70'
+                        : 'text-neutral-700 opacity-50 dark:text-neutral-300'
+                  }`}
                 >
                   <Icon className="size-4 shrink-0" />
                   <span className="flex-1 truncate">{label}</span>
                   {!available && (
-                    <span aria-hidden className="text-xs text-neutral-500">
-                      soon
-                    </span>
+                    // The space keeps "soon" a separate word of the accessible name.
+                    <>
+                      {' '}
+                      <span className="text-xs text-neutral-500">soon</span>
+                    </>
                   )}
                 </button>
               </li>

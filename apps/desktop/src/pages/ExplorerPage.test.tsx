@@ -14,6 +14,7 @@ import {
 } from '../mocks/fixtures';
 import { installIpcMock, revealed, setMockScanDelay } from '../mocks/ipc';
 import { charts, lastChart } from '../test/echarts';
+import { holdReply, replyOnce } from '../test/invoke';
 import { renderWithClient } from '../test/render';
 import ExplorerPage from './ExplorerPage';
 
@@ -81,6 +82,16 @@ describe('ExplorerPage before a scan', () => {
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
   });
 
+  it('shows why the folder is unknown when the backend cannot name it', async () => {
+    replyOnce('default_root', () => {
+      throw 'no home directory';
+    });
+    renderWithClient(<ExplorerPage />);
+    expect(await screen.findByText('no home directory')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Scan' })).toBeInTheDocument();
+    expect(screen.queryByText('…')).not.toBeInTheDocument();
+  });
+
   it('shows the error and a Retry button when the backend cannot answer', async () => {
     mockIPC(() => {
       throw new Error('boom');
@@ -101,10 +112,15 @@ describe('ExplorerPage while scanning', () => {
     expect(await screen.findByRole('progressbar', { name: 'Scanning' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Scan' })).not.toBeInTheDocument();
+    // Only the static line is announced; the counters and the path change too often.
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent(/^Scanning…$/);
+    expect(within(status).queryByTestId('scan-files')).not.toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByTestId('scan-current-path')).toHaveTextContent(/\S/);
       expect(screen.getByTestId('scan-files')).not.toHaveTextContent(/^0$/);
     });
+    expect(screen.getByTestId('scan-current-path').closest('[role="status"]')).toBeNull();
 
     expect(await screen.findByRole('table', {}, { timeout: 3000 })).toBeInTheDocument();
     expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
@@ -238,6 +254,41 @@ describe('ExplorerPage after a scan', () => {
     expect(crumbs()).toEqual(['demo']);
   });
 
+  it('leaves Backspace with a modifier key alone', async () => {
+    await scanned();
+    fireEvent.click(row('Library'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library']));
+    for (const modifier of ['metaKey', 'ctrlKey', 'altKey']) {
+      fireEvent.keyDown(document.body, { key: 'Backspace', [modifier]: true });
+    }
+    await settle();
+    expect(crumbs()).toEqual(['demo', 'Library']);
+  });
+
+  it('focuses the first row after a keyboard navigation, but not after a click', async () => {
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+    try {
+      await scanned();
+      fireEvent.pointerDown(row('Library'));
+      fireEvent.click(row('Library'));
+      await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library']));
+      expect(rows()[0]).not.toHaveFocus();
+
+      const developer = row('Developer');
+      developer.focus();
+      fireEvent.keyDown(developer, { key: 'Enter' });
+      await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library', 'Developer']));
+      expect(rows()[0]).toHaveFocus();
+      expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+
+      fireEvent.keyDown(document.body, { key: 'Backspace' });
+      await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library']));
+      expect(rows()[0]).toHaveFocus();
+    } finally {
+      focus.mockRestore();
+    }
+  });
+
   it('moves the focus between rows with the arrow keys', async () => {
     await scanned();
     const [first, second] = rows();
@@ -259,7 +310,7 @@ describe('ExplorerPage after a scan', () => {
     expect(cells('Application Support')[4]).toHaveTextContent(String(partial.fileCount));
     expect(
       within(row('Application Support')).getByRole('img', { name: PARTIAL_READ }),
-    ).toHaveAttribute('data-marker', 'lock');
+    ).toHaveAttribute('data-marker', 'partial');
 
     fireEvent.click(row('Application Support'));
     await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library', 'Application Support']));
@@ -273,6 +324,21 @@ describe('ExplorerPage after a scan', () => {
     await waitFor(() => expect(crumbs()).toEqual(['demo', '.Trash']));
     expect(screen.queryByTestId('node-rows')).not.toBeInTheDocument();
     expect(screen.getByRole('table')).toHaveTextContent(PERMISSION_DENIED);
+  });
+
+  it('shows the error of a directory that cannot be read and offers the way back', async () => {
+    await scanned();
+    replyOnce('tree_node', () => {
+      throw 'tree is gone';
+    });
+    fireEvent.click(row('Library'));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('tree is gone');
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Back to the top' }));
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(names()[0]).toBe('Library');
   });
 
   it('reveals a row in Finder without navigating', async () => {
@@ -347,6 +413,23 @@ describe('ExplorerPage after a scan', () => {
     fireEvent.click(row('Library'));
     await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library']));
     fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(names()[0]).toBe('Library');
+  });
+
+  it('does not show the old tree while the root of a rescan loads', async () => {
+    await scanned();
+    fireEvent.click(row('Library'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Library']));
+
+    const release = holdReply('tree_node');
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    expect(await screen.findByText('Loading…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Rescan' })).toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('node-rows')).not.toBeInTheDocument();
+
+    release();
     await waitFor(() => expect(crumbs()).toEqual(['demo']));
     expect(names()[0]).toBe('Library');
   });

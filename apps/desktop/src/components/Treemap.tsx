@@ -13,7 +13,7 @@ import {
 } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { useEffect, useMemo, useRef } from 'react';
-import { formatBytes, formatDelta, formatPercent } from '../lib/format';
+import { countLabel, formatBytes, formatDelta, formatPercent } from '../lib/format';
 import type { ChildView, NodeId, NodeKind } from '../lib/ipc';
 import { describeNodeError } from '../lib/nodeErrors';
 
@@ -29,7 +29,8 @@ type Cell = SeriesDatum & {
   value: number;
   /** Null for the aggregated "Other" cell. */
   nodeId: NodeId | null;
-  kind: NodeKind | 'other';
+  /** `aggregate` for the "Other" cell, which stands for many children. */
+  kind: NodeKind | 'aggregate';
   delta: number | null;
   error: string | null;
 };
@@ -62,10 +63,6 @@ function cellColor(child: ChildView, rank: number, count: number): string {
     : `hsl(30 8% ${(56 + t * 12).toFixed(1)}%)`;
 }
 
-function count(n: number): string {
-  return `${n.toLocaleString('en-US')} ${n === 1 ? 'item' : 'items'}`;
-}
-
 function buildCells(items: readonly ChildView[]): Cell[] {
   const sized = items.filter((child) => child.size > 0).sort((a, b) => b.size - a.size);
   const top = sized.slice(0, TREEMAP_LIMIT);
@@ -82,10 +79,10 @@ function buildCells(items: readonly ChildView[]): Cell[] {
   }));
   if (rest.length > 0) {
     cells.push({
-      name: `Other (${count(rest.length)})`,
+      name: `Other (${countLabel(rest.length, 'item')})`,
       value: rest.reduce((sum, child) => sum + child.size, 0),
       nodeId: null,
-      kind: 'other',
+      kind: 'aggregate',
       delta: null,
       error: null,
       itemStyle: { color: OTHER_COLOR },

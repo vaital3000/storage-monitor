@@ -1,7 +1,8 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClientProvider } from '@tanstack/react-query';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { createQueryClient } from './lib/queryClient';
 import { installIpcMock } from './mocks/ipc';
 import './index.css';
 
@@ -10,10 +11,7 @@ if (import.meta.env.VITE_MOCK_IPC === '1') {
   installIpcMock();
 }
 
-// Commands are local and deterministic: a failure is worth showing, not retrying.
-const queryClient = new QueryClient({
-  defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
-});
+const queryClient = createQueryClient();
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>

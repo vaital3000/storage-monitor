@@ -7,15 +7,18 @@ import {
   Link,
   Lock,
   SquareArrowOutUpRight,
+  TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
-import { formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
+import { countLabel, formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
 import type { ChildView, NodeId, NodeKind, NodeView } from '../lib/ipc';
 import { describeNodeError, type NodeErrorMark } from '../lib/nodeErrors';
 
 interface NodeTableProps {
   node: NodeView;
+  /** Focus the first row when another directory arrives (the keyboard brought us there). */
+  focusFirstRow?: boolean;
   /** A directory row was activated. */
   onOpen: (id: NodeId) => void;
   /** "Reveal in Finder" was clicked for the absolute `path`. */
@@ -106,16 +109,22 @@ function KindIcon({ kind }: { kind: NodeKind }) {
   return <Icon className={`size-4 shrink-0 ${className}`} />;
 }
 
-/** The lock (could not read) or info (chose not to read) marker next to a name. */
+const MARKER_ICONS: Record<NodeErrorMark['kind'], { icon: LucideIcon; className: string }> = {
+  lock: { icon: Lock, className: 'text-amber-600 dark:text-amber-500' },
+  partial: { icon: TriangleAlert, className: 'text-amber-600 dark:text-amber-500' },
+  info: { icon: Info, className: 'text-neutral-400' },
+};
+
+/** The lock (could not read), warning (read in part) or info (chose not to read) next to a name. */
 function Marker({ mark }: { mark: NodeErrorMark }) {
-  const Icon = mark.kind === 'lock' ? Lock : Info;
+  const { icon: Icon, className } = MARKER_ICONS[mark.kind];
   return (
     <span
       role="img"
       aria-label={mark.title}
       title={mark.title}
       data-marker={mark.kind}
-      className={`inline-flex shrink-0 ${mark.kind === 'lock' ? 'text-amber-600 dark:text-amber-500' : 'text-neutral-400'}`}
+      className={`inline-flex shrink-0 ${className}`}
     >
       <Icon className="size-3.5" />
     </span>
@@ -125,10 +134,6 @@ function Marker({ mark }: { mark: NodeErrorMark }) {
 function deltaClass(delta: number | null): string {
   if (delta === null || delta === 0) return '';
   return delta > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-700 dark:text-emerald-400';
-}
-
-function items(count: number): string {
-  return `${count.toLocaleString('en-US')} ${count === 1 ? 'item' : 'items'}`;
 }
 
 interface RowProps {
@@ -213,7 +218,12 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
  * The children of one directory: sortable, keyboard-navigable (Enter opens a directory,
  * arrows move between rows), with a "Reveal in Finder" button per row.
  */
-export default function NodeTable({ node, onOpen, onReveal }: NodeTableProps) {
+export default function NodeTable({
+  node,
+  focusFirstRow = false,
+  onOpen,
+  onReveal,
+}: NodeTableProps) {
   const [sort, setSort] = useState<Sort>({ key: 'size', direction: 'desc' });
   const sorted = useMemo(() => sortChildren(node.children, sort), [node.children, sort]);
   const maxSize = useMemo(
@@ -223,12 +233,13 @@ export default function NodeTable({ node, onOpen, onReveal }: NodeTableProps) {
   const body = useRef<HTMLTableSectionElement>(null);
   const shownId = useRef(node.id);
 
-  // After navigating, keyboard users continue from the first row of the new directory.
+  // After a keyboard navigation, keyboard users continue from the first row of the new
+  // directory; a click leaves the focus where the pointer put it.
   useEffect(() => {
     if (shownId.current === node.id) return;
     shownId.current = node.id;
-    body.current?.querySelector('tr')?.focus();
-  }, [node.id]);
+    if (focusFirstRow) body.current?.querySelector('tr')?.focus({ preventScroll: true });
+  }, [node.id, focusFirstRow]);
 
   const toggle = (key: SortKey) => {
     setSort((current) =>
@@ -240,7 +251,8 @@ export default function NodeTable({ node, onOpen, onReveal }: NodeTableProps) {
 
   const onBodyKeyDown = (event: KeyboardEvent<HTMLTableSectionElement>) => {
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
-    const row = (event.target as HTMLElement).closest('tr');
+    if (!(event.target instanceof HTMLElement)) return;
+    const row = event.target.closest('tr');
     const next = event.key === 'ArrowDown' ? row?.nextElementSibling : row?.previousElementSibling;
     if (next instanceof HTMLElement) {
       event.preventDefault();
@@ -313,7 +325,7 @@ export default function NodeTable({ node, onOpen, onReveal }: NodeTableProps) {
         )}
       </table>
       <p className="border-t border-neutral-100 px-3 py-1.5 text-xs text-neutral-500 dark:border-neutral-800">
-        {items(node.childrenTotal)}
+        {countLabel(node.childrenTotal, 'item')}
         {node.truncated && `, showing the first ${node.children.length.toLocaleString('en-US')}`}
       </p>
     </div>

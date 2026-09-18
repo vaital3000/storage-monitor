@@ -59,19 +59,19 @@ function series(): Series {
   return option.series[0];
 }
 
-/** Stand-in for the browser's ResizeObserver: records callbacks so a test can fire them. */
-const resizeCallbacks: Array<() => void> = [];
+/** Stand-in for the browser's ResizeObserver: records instances so a test can fire them. */
 class FakeResizeObserver {
-  constructor(callback: () => void) {
-    resizeCallbacks.push(callback);
+  constructor(public callback: () => void) {
+    observers.push(this);
   }
   observe = vi.fn();
   disconnect = vi.fn();
 }
+const observers: FakeResizeObserver[] = [];
 
 beforeEach(() => {
   charts.length = 0;
-  resizeCallbacks.length = 0;
+  observers.length = 0;
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
 });
 
@@ -146,6 +146,24 @@ describe('Treemap', () => {
     expect(label(s.data[1])).toBe(`🔒 Mail\n${formatBytes(1.2 * GB)}`);
   });
 
+  it('paints a partially read directory like any other, without a lock', () => {
+    const error = '3 entries could not be read';
+    const partial = [child(1, 'Library', 10 * GB), child(2, 'App Support', 5 * GB, { error })];
+    const plain = [child(1, 'Library', 10 * GB), child(2, 'App Support', 5 * GB)];
+    render(<Treemap items={partial} parentSize={15 * GB} onSelect={() => undefined} />);
+    const withError = series();
+    render(<Treemap items={plain} parentSize={15 * GB} onSelect={() => undefined} />);
+    const withoutError = series();
+
+    expect(withError.data[1].itemStyle).toEqual(withoutError.data[1].itemStyle);
+    expect(withError.data[1].itemStyle).not.toEqual(withError.data[0].itemStyle);
+    const label = withError.label.formatter({ data: withError.data[1] });
+    expect(label).toBe(`App Support\n${formatBytes(5 * GB)}`);
+    // The tooltip still explains it.
+    const option = charts[0].lastOption() as Option;
+    expect(option.tooltip.formatter({ data: withError.data[1] })).toContain(error);
+  });
+
   it('shows name, size, share of the parent and delta in the tooltip', () => {
     const items = [child(1, 'Library', 95.4 * GB, { delta: 6.4 * GB }), child(2, 'src', 4.6 * GB)];
     render(<Treemap items={items} parentSize={100 * GB} onSelect={() => undefined} />);
@@ -185,17 +203,33 @@ describe('Treemap', () => {
     expect(lastChart().clear).toHaveBeenCalled();
   });
 
-  it('follows its container size and disposes the chart on unmount', () => {
+  it('follows its container size and lets go of it with the chart on unmount', () => {
     const { unmount } = render(
       <Treemap items={seventy()} parentSize={100 * GB} onSelect={() => undefined} />,
     );
     const chart = lastChart();
-    expect(resizeCallbacks).toHaveLength(1);
-    resizeCallbacks[0]();
+    expect(observers).toHaveLength(1);
+    const [observer] = observers;
+    expect(observer.observe).toHaveBeenCalledWith(screen.getByTestId('treemap'));
+    observer.callback();
     expect(chart.resize).toHaveBeenCalledTimes(1);
 
     unmount();
     expect(chart.dispose).toHaveBeenCalledTimes(1);
+    expect(observer.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('clicks reach the latest onSelect without a new chart', () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const { rerender } = render(
+      <Treemap items={seventy()} parentSize={100 * GB} onSelect={first} />,
+    );
+    rerender(<Treemap items={seventy()} parentSize={100 * GB} onSelect={second} />);
+    expect(charts).toHaveLength(1);
+    lastChart().trigger('click', { data: series().data[0] });
+    expect(second).toHaveBeenCalledWith(1);
+    expect(first).not.toHaveBeenCalled();
   });
 
   it('redraws when the children change without creating a new chart', () => {

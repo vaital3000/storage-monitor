@@ -25,14 +25,13 @@ function Stat({ label, value, testId }: { label: string; value: string; testId?:
 /** The card shown while a scan runs: counters, the directory being read, and Cancel. */
 export default function ScanProgress({ status, cancelling, onCancel }: ScanProgressProps) {
   return (
-    <section
-      role="status"
-      aria-live="polite"
-      className="mx-auto mt-16 w-full max-w-xl rounded-xl border border-neutral-200 bg-white p-5 shadow-sm dark:border-neutral-800 dark:bg-neutral-800/60"
-    >
+    <section className="mx-auto mt-16 w-full max-w-xl rounded-xl border border-neutral-200 bg-white p-5 shadow-sm dark:border-neutral-800 dark:bg-neutral-800/60">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
-          <h2 className="text-lg font-semibold">Scanning…</h2>
+          {/* The only live region: the counters and the path change too often to be read out. */}
+          <p role="status" className="text-lg font-semibold">
+            Scanning…
+          </p>
           <p
             className="truncate font-mono text-xs text-neutral-500"
             title={status.root ?? undefined}

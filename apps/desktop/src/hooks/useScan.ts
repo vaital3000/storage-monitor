@@ -38,7 +38,10 @@ export const IDLE_STATUS: ScanStatus = {
 
 export interface ScanController {
   status: ScanStatus;
-  /** True once the backend answered the first `scan_status`; the UI shows nothing before. */
+  /**
+   * True once the backend answered the first `scan_status` or an event arrived; the UI
+   * shows nothing before.
+   */
   ready: boolean;
   /** Bumped on every `scan:done`, unique for the session; part of every tree query key. */
   generation: number;
@@ -91,6 +94,8 @@ export function useScan(): ScanController {
       if (!active) return;
       touched.current = true;
       setStatus((current) => (isTerminal(current.state) ? current : next));
+      // A progress event can beat the reply to the initial `scan_status`.
+      setReady(true);
     }).catch(unsubscribed);
     const done = onScanDone((final) => {
       if (!active) return;
@@ -126,7 +131,8 @@ export function useScan(): ScanController {
     try {
       const started = await scanStart(root);
       touched.current = true;
-      setStatus(started);
+      // A progress event may have arrived while the reply was on its way; it is fresher.
+      setStatus((current) => (current.state === 'running' ? current : started));
       setReady(true);
     } catch (e: unknown) {
       touched.current = true;
@@ -139,14 +145,17 @@ export function useScan(): ScanController {
   }, []);
 
   const cancel = useCallback(async () => {
+    if (status.state !== 'running') return;
     setCancelling(true);
     try {
-      // The reply is still `running`; `scan:done` with `cancelled` follows.
-      await scanCancel();
+      // The reply is still `running`; `scan:done` with `cancelled` follows. Any other
+      // reply means the scan ended on its own before the request landed.
+      const reply = await scanCancel();
+      if (reply.state !== 'running') setCancelling(false);
     } catch {
       setCancelling(false);
     }
-  }, []);
+  }, [status.state]);
 
   return {
     status,

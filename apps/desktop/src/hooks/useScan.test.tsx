@@ -5,7 +5,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SCAN_DONE_EVENT, SCAN_PROGRESS_EVENT, type ScanStatus } from '../lib/ipc';
 import { FIXTURE_ROOT, fixtureStatusDone } from '../mocks/fixtures';
 import { installIpcMock, setMockScanDelay } from '../mocks/ipc';
-import { useScan } from './useScan';
+import { holdReply, recordCommands, replyOnce } from '../test/invoke';
+import { IDLE_STATUS, useScan } from './useScan';
 
 beforeEach(() => {
   installIpcMock();
@@ -25,6 +26,9 @@ function renderScan() {
 async function ready(result: { current: { ready: boolean } }) {
   await waitFor(() => expect(result.current.ready).toBe(true));
 }
+
+/** One macrotask: enough for the mock's (asynchronous) listen and invoke to settle. */
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('useScan', () => {
   it('starts idle with the status reported by the backend', async () => {
@@ -83,6 +87,9 @@ describe('useScan', () => {
     const { result } = renderScan();
     await ready(result);
     const generation = result.current.generation;
+    // The mock's `scan:done` follows the cancel after one delay; at 0 ms it can beat the
+    // flush of `act` and the assertions below would see the final state.
+    setMockScanDelay(50);
     await act(() => result.current.start());
     await act(() => result.current.cancel());
     expect(result.current.cancelling).toBe(true);
@@ -127,6 +134,68 @@ describe('useScan', () => {
     expect(result.current.status.error).toBe('disk on fire');
     expect(result.current.hasResult).toBe(false);
     expect(result.current.generation).toBe(generation + 1);
+  });
+
+  it('is ready as soon as a progress event arrives, before scan_status answers', async () => {
+    const release = holdReply('scan_status');
+    const { result } = renderScan();
+    await act(tick);
+    expect(result.current.ready).toBe(false);
+
+    const running: ScanStatus = { ...IDLE_STATUS, state: 'running', root: FIXTURE_ROOT, files: 7 };
+    await act(() => emit(SCAN_PROGRESS_EVENT, running));
+    expect(result.current.ready).toBe(true);
+    expect(result.current.status).toEqual(running);
+
+    release();
+    await act(tick);
+    // The late idle reply does not overwrite the fresher progress.
+    expect(result.current.status).toEqual(running);
+  });
+
+  it('keeps a progress event that arrived before the start reply', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    setMockScanDelay(10_000);
+    const release = holdReply('scan_start');
+    let starting!: Promise<void>;
+    act(() => {
+      starting = result.current.start();
+    });
+
+    const progress: ScanStatus = {
+      ...IDLE_STATUS,
+      state: 'running',
+      root: FIXTURE_ROOT,
+      files: 3,
+      currentPath: '/x',
+    };
+    await act(() => emit(SCAN_PROGRESS_EVENT, progress));
+    expect(result.current.status).toEqual(progress);
+
+    release();
+    await act(() => starting);
+    expect(result.current.status).toEqual(progress);
+  });
+
+  it('ignores cancel while no scan is running', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    const commands = recordCommands();
+    await act(() => result.current.cancel());
+    expect(result.current.cancelling).toBe(false);
+    expect(commands).not.toContain('scan_cancel');
+  });
+
+  it('drops the cancelling flag when the reply says the scan already ended', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    setMockScanDelay(10_000);
+    await act(() => result.current.start());
+    replyOnce('scan_cancel', fixtureStatusDone);
+    await act(() => result.current.cancel());
+    expect(result.current.cancelling).toBe(false);
+    expect(result.current.status.state).toBe('running');
   });
 
   it('keeps running when a second start is refused', async () => {

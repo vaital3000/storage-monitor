@@ -4,16 +4,22 @@ import Button from './Button';
 interface EmptyStateProps {
   /** The folder a scan would walk; undefined until the backend answered. */
   root: string | undefined;
+  /** Why the folder is unknown, when the backend could not name it. */
+  error?: string;
   onScan: () => void;
 }
 
 /** What the Explorer shows before the first scan. */
-export default function EmptyState({ root, onScan }: EmptyStateProps) {
+export default function EmptyState({ root, error, onScan }: EmptyStateProps) {
   return (
     <section className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
       <HardDrive className="size-10 text-neutral-400" strokeWidth={1.5} />
       <h2 className="text-xl font-semibold">Scan your home folder</h2>
-      <p className="font-mono text-sm text-neutral-500">{root ?? '…'}</p>
+      {error === undefined ? (
+        <p className="font-mono text-sm text-neutral-500">{root ?? '…'}</p>
+      ) : (
+        <p className="font-mono text-sm break-words text-red-700 dark:text-red-300">{error}</p>
+      )}
       <Button variant="primary" onClick={onScan} className="mt-2">
         Scan
       </Button>

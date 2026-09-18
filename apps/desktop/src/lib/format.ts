@@ -58,3 +58,28 @@ export function shortenPath(path: string, max: number): string {
   }
   return `…${path.slice(-(max - 1))}`;
 }
+
+/** The last component of a path (`demo` for `/Users/demo/`); the path itself when it has none. */
+export function basename(path: string): string {
+  const parts = path.split('/').filter((part) => part !== '');
+  return parts.length > 0 ? parts[parts.length - 1] : path;
+}
+
+/** `312 ms`, `4.8 s`, `12 min 35 s`: a duration in milliseconds. */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) {
+    return `${Math.max(0, Math.round(ms))} ms`;
+  }
+  // Rounded to tenths first, so that 59.96 s becomes "1 min 0 s" and never "60.0 s".
+  const tenths = Math.round(ms / 100);
+  if (tenths < 600) {
+    return `${(tenths / 10).toFixed(1)} s`;
+  }
+  const seconds = Math.round(ms / 1000);
+  return `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+}
+
+/** `1 item`, `12,345 read errors`: a count with its noun, pluralised with an `s`. */
+export function countLabel(count: number, singular: string): string {
+  return `${count.toLocaleString('en-US')} ${count === 1 ? singular : `${singular}s`}`;
+}

@@ -1,5 +1,5 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { useCallback, useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Breadcrumbs from '../components/Breadcrumbs';
 import Button from '../components/Button';
 import DiskUsageBar from '../components/DiskUsageBar';
@@ -8,7 +8,7 @@ import NodeTable from '../components/NodeTable';
 import ScanProgress from '../components/ScanProgress';
 import Treemap from '../components/Treemap';
 import { useScan } from '../hooks/useScan';
-import { formatBytes, formatDate } from '../lib/format';
+import { basename, countLabel, formatBytes, formatDate, formatDuration } from '../lib/format';
 import {
   defaultRoot,
   diskUsage,
@@ -22,19 +22,6 @@ import { describeNodeError } from '../lib/nodeErrors';
 
 const ROOT_ID: NodeId = 0;
 
-function basename(path: string): string {
-  const parts = path.split('/').filter((part) => part !== '');
-  return parts.length > 0 ? parts[parts.length - 1] : path;
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms} ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.round((ms % 60_000) / 1000);
-  return `${minutes} min ${seconds} s`;
-}
-
 /** Backspace in a text field edits the text; anywhere else it goes up one directory. */
 function isEditable(target: EventTarget | null): boolean {
   return (
@@ -44,6 +31,30 @@ function isEditable(target: EventTarget | null): boolean {
       target instanceof HTMLTextAreaElement ||
       target instanceof HTMLSelectElement)
   );
+}
+
+/**
+ * Tells whether the last input came from the keyboard. A navigation made by key moves the
+ * focus to the first row of the new directory; a click leaves it where the pointer put it.
+ */
+function useKeyboardInput(): () => boolean {
+  const keyboard = useRef(false);
+  useEffect(() => {
+    const onKeyDown = () => {
+      keyboard.current = true;
+    };
+    const onPointerDown = () => {
+      keyboard.current = false;
+    };
+    // Captured, so that a handler which stops propagation cannot hide the input.
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('pointerdown', onPointerDown, true);
+    };
+  }, []);
+  return useCallback(() => keyboard.current, []);
 }
 
 interface ResultHeaderProps {
@@ -65,10 +76,9 @@ function ResultHeader({ status, disk, onRescan }: ResultHeaderProps) {
           {basename(root)}
         </h2>
         <p data-testid="scan-summary" className="text-sm text-neutral-500 tabular-nums">
-          {formatBytes(status.bytes)} · {status.files.toLocaleString('en-US')} files ·{' '}
-          {status.dirs.toLocaleString('en-US')} folders · scanned in{' '}
-          {formatDuration(status.durationMs)}
-          {status.errors > 0 && ` · ${status.errors.toLocaleString('en-US')} read errors`}
+          {formatBytes(status.bytes)} · {countLabel(status.files, 'file')} ·{' '}
+          {countLabel(status.dirs, 'folder')} · scanned in {formatDuration(status.durationMs)}
+          {status.errors > 0 && ` · ${countLabel(status.errors, 'read error')}`}
         </p>
         {status.state === 'cancelled' && (
           <p className="mt-1 text-sm text-amber-700 dark:text-amber-400">
@@ -113,21 +123,28 @@ function FailedState({ error, onRetry }: { error: string | null; onRetry: () => 
 export default function ExplorerPage() {
   const scan = useScan();
   const { status, generation, hasResult } = scan;
+  const isKeyboard = useKeyboardInput();
 
   // The node on screen, valid for one generation: ids change with every scan, so a new
-  // tree opens at its root.
-  const [nav, setNav] = useState({ generation, id: ROOT_ID });
-  const currentId = nav.generation === generation ? nav.id : ROOT_ID;
-  const open = useCallback((id: NodeId) => setNav({ generation, id }), [generation]);
+  // tree opens at its root. `focus` remembers whether the keyboard brought us there.
+  const [nav, setNav] = useState({ generation, id: ROOT_ID, focus: false });
+  const current = nav.generation === generation ? nav : { id: ROOT_ID, focus: false };
+  const open = useCallback(
+    (id: NodeId) => setNav({ generation, id, focus: isKeyboard() }),
+    [generation, isKeyboard],
+  );
 
   const root = useQuery({ queryKey: ['defaultRoot'], queryFn: defaultRoot, staleTime: Infinity });
   // `tree_node` rejects with "no scan result" until a scan is done or cancelled.
   const node = useQuery({
-    queryKey: ['treeNode', generation, currentId],
-    queryFn: () => treeNode(currentId),
+    queryKey: ['treeNode', generation, current.id],
+    queryFn: () => treeNode(current.id),
     enabled: hasResult,
     staleTime: Infinity,
-    placeholderData: keepPreviousData,
+    // The node on screen stays while the next one loads, but only within one scan: a
+    // rescan opens on a blank root rather than on the tree it replaces.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[1] === generation ? previous : undefined,
   });
   const disk = useQuery({
     queryKey: ['diskUsage', generation, status.root],
@@ -145,7 +162,9 @@ export default function ExplorerPage() {
   useEffect(() => {
     if (parentId === null) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Backspace' || isEditable(event.target)) return;
+      // With a modifier, Backspace belongs to the system (⌘⌫ moves to the Trash).
+      if (event.key !== 'Backspace' || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isEditable(event.target)) return;
       event.preventDefault();
       open(parentId);
     };
@@ -163,7 +182,13 @@ export default function ExplorerPage() {
     return <p className="p-6 text-sm text-neutral-500">Loading…</p>;
   }
   if (status.state === 'idle') {
-    return <EmptyState root={root.data} onScan={() => void scan.start()} />;
+    return (
+      <EmptyState
+        root={root.data}
+        error={root.error === null ? undefined : String(root.error)}
+        onScan={() => void scan.start()}
+      />
+    );
   }
   if (status.state === 'running') {
     return (
@@ -199,7 +224,7 @@ export default function ExplorerPage() {
             </p>
           )}
           <Treemap items={view.children} parentSize={view.size} onSelect={open} />
-          <NodeTable node={view} onOpen={open} onReveal={reveal} />
+          <NodeTable node={view} focusFirstRow={current.focus} onOpen={open} onReveal={reveal} />
         </>
       ) : node.isError ? (
         <div role="alert" className="flex items-center gap-4 text-sm">
