@@ -102,9 +102,23 @@ function after(callback: () => void): void {
   }, mockScanDelayMs);
 }
 
-/** Emits a copy of the status; a mock that was cleared underneath has no listeners left. */
+type RawInvoke = (cmd: string, args?: unknown, options?: unknown) => Promise<unknown>;
+
+/** The IPC bridge installed by `mockIPC`, absent once a test cleared the mocks. */
+function tauriInternals(): { invoke?: RawInvoke } | undefined {
+  return (window as unknown as { __TAURI_INTERNALS__?: { invoke?: RawInvoke } })
+    .__TAURI_INTERNALS__;
+}
+
+/**
+ * Emits a copy of the status. A tick that fires after a test cleared the mock has nobody
+ * to talk to; a listener that throws is not swallowed, so the test that owns it fails.
+ */
 function publish(event: string): void {
-  void emit(event, { ...status }).catch(() => undefined);
+  if (typeof tauriInternals()?.invoke !== 'function') {
+    return;
+  }
+  void emit(event, { ...status });
 }
 
 function finish(final: ScanStatus): void {
@@ -218,6 +232,35 @@ export function resetIpcMock(): void {
   revealed.length = 0;
 }
 
+declare global {
+  interface Window {
+    /** Test hooks of the fake backend; present in mock mode and in unit tests only. */
+    __STORAGE_MONITOR_MOCK__?: {
+      revealed: string[];
+      setMockScanDelay: (ms: number) => void;
+    };
+  }
+}
+
+/**
+ * `@tauri-apps/api` 2.11 unlistens with `{ event, eventId }` while the mock's remover reads
+ * `args.id`, so listeners were never dropped and every later emit warned about a missing
+ * callback. Passing `id` too makes unlisten work.
+ */
+function fixUnlisten(): void {
+  const internals = tauriInternals();
+  const mocked = internals?.invoke;
+  if (internals === undefined || mocked === undefined) {
+    return;
+  }
+  internals.invoke = (cmd, args, options) => {
+    if (cmd === 'plugin:event|unlisten' && typeof args === 'object' && args !== null) {
+      return mocked(cmd, { ...args, id: (args as { eventId?: unknown }).eventId }, options);
+    }
+    return mocked(cmd, args, options);
+  };
+}
+
 /**
  * Installs fake handlers for every backend command and routes `emit` to `listen`.
  * Used by unit tests, e2e and browser dev; resets the mock state first.
@@ -225,4 +268,6 @@ export function resetIpcMock(): void {
 export function installIpcMock(): void {
   resetIpcMock();
   mockIPC(handle, { shouldMockEvents: true });
+  fixUnlisten();
+  window.__STORAGE_MONITOR_MOCK__ = { revealed, setMockScanDelay };
 }

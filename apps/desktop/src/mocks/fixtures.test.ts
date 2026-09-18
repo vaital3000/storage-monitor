@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   FIXTURE_ROOT,
+  PARTIAL_READ,
   fixtureDisk,
   fixtureGrowers,
   fixtureNode,
@@ -84,7 +85,17 @@ describe('fixture tree', () => {
       expect(node.size).toBe(0);
       expect(node.children).toEqual([]);
     }
-    expect(fixtureNodes.filter((n) => n.error !== null)).toHaveLength(3);
+    expect(fixtureNodes.filter((n) => n.error !== null)).toHaveLength(4);
+  });
+
+  it('has one partially readable directory that still has children and a size', () => {
+    const partial = fixtureNodes.filter((n) => n.error === PARTIAL_READ);
+    expect(partial).toHaveLength(1);
+    expect(partial[0]).toBe(fixtureNode('Library/Application Support'));
+    expect(partial[0].kind).toBe('dir');
+    expect(partial[0].children.length).toBeGreaterThan(0);
+    expect(partial[0].size).toBeGreaterThan(GB);
+    expect(partial[0].fileCount).toBeGreaterThan(0);
   });
 
   it('resolves absolute and root-relative paths', () => {
@@ -96,9 +107,9 @@ describe('fixture tree', () => {
 });
 
 describe('previous sizes', () => {
-  it('cover about ten existing paths with growth and shrinkage', () => {
-    expect(previousSizes.size).toBeGreaterThanOrEqual(8);
-    expect(previousSizes.size).toBeLessThanOrEqual(14);
+  it('cover about twenty existing paths with growth and shrinkage', () => {
+    expect(previousSizes.size).toBeGreaterThanOrEqual(15);
+    expect(previousSizes.size).toBeLessThanOrEqual(24);
     const deltas = [...previousSizes].map(([path, before]) => fixtureNode(path).size - before);
     expect(deltas.filter((d) => d > 0).length).toBeGreaterThanOrEqual(5);
     expect(deltas.filter((d) => d < 0).length).toBeGreaterThanOrEqual(2);
@@ -202,8 +213,15 @@ describe('fixtureGrowers', () => {
     }
     const deltas = growers.map((g) => g.delta);
     expect(deltas).toEqual([...deltas].sort((a, b) => b - a));
-    expect(growers.map((g) => g.path)).not.toContain(FIXTURE_ROOT);
-    expect(growers[0].path).toBe(`${FIXTURE_ROOT}/Library`);
+    const paths = growers.map((g) => g.path);
+    expect(paths).not.toContain(FIXTURE_ROOT);
+    // The chain above DerivedData grew by the same amount: the deepest culprit is named.
+    expect(paths[0]).toBe(`${FIXTURE_ROOT}/Library/Developer/Xcode/DerivedData`);
+    for (const parent of ['Library', 'Library/Developer', 'Library/Developer/Xcode', 'src']) {
+      expect(paths).not.toContain(`${FIXTURE_ROOT}/${parent}`);
+    }
+    expect(paths).toContain(`${FIXTURE_ROOT}/src/storage-monitor/target`);
+    expect(paths).toContain(`${FIXTURE_ROOT}/Library/Containers/com.docker.docker/Data/vms/0/data`);
   });
 });
 
@@ -224,7 +242,8 @@ describe('fixtureDisk and fixtureStatusDone', () => {
     expect(status.bytes).toBe(fixtureNodes[0].size);
     expect(status.files).toBe(fixtureNodes.filter((n) => n.kind !== 'dir').length);
     expect(status.dirs).toBe(fixtureNodes.filter((n) => n.kind === 'dir').length);
-    expect(status.errors).toBe(2);
+    // Two unreadable directories plus the three entries of the partially read one.
+    expect(status.errors).toBe(5);
     expect(status.currentPath).toBe('');
     expect(status.error).toBeNull();
     expect(status.durationMs).toBeGreaterThan(0);

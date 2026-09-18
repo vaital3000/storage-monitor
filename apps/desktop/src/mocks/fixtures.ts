@@ -1,6 +1,7 @@
 // A deterministic home folder for mock mode, unit tests and e2e: about 60 nodes and
 // 180 GB, with the artifacts the cleanup modules will target, two folders the scanner
-// cannot read, one mount point it skips, and a previous snapshot for deltas.
+// cannot read, one it could read only in part, one mount point it skips, and a previous
+// snapshot for deltas.
 
 import type { Crumb, Delta, DiskUsage, NodeId, NodeKind, NodeView, ScanStatus } from '../lib/ipc';
 
@@ -11,6 +12,10 @@ export const FIXTURE_ROOT = '/Users/demo';
 export const PERMISSION_DENIED = 'Operation not permitted (os error 1)';
 /** What the scanner reports for a directory on another volume. */
 export const DIFFERENT_VOLUME = 'skipped: different volume';
+/** What the scanner reports for a directory it could list only in part. */
+export const PARTIAL_READ = '3 entries could not be read';
+/** The entries behind `PARTIAL_READ`; the walker counts each of them as an error. */
+const PARTIAL_READ_ERRORS = 3;
 
 /** One node of the fixture, numbered like the backend's tree: breadth first, siblings largest first. */
 export interface FixtureNode {
@@ -83,6 +88,11 @@ function unreadable(name: string, error: string, daysAgo: number): Spec {
   return { name, kind: 'dir', size: 0, logicalSize: 0, daysAgo, error, children: [] };
 }
 
+/** A directory some of whose entries could not be read; the rest was walked as usual. */
+function partial(name: string, error: string, children: Spec[]): Spec {
+  return { ...dir(name, children), error };
+}
+
 const HOME: Spec = dir('demo', [
   dir('Library', [
     dir('Developer', [
@@ -125,6 +135,10 @@ const HOME: Spec = dir('demo', [
       ]),
       unreadable('com.apple.mail', PERMISSION_DENIED, 1),
     ]),
+    partial('Application Support', PARTIAL_READ, [
+      dir('Code', [file('CachedData', gb(1.26), 2)]),
+      file('Slack.db', mb(640), 1),
+    ]),
   ]),
   dir('Downloads', [
     file('macOS Sequoia 15.6 Installer.dmg', gb(13.87), 9),
@@ -159,17 +173,28 @@ const HOME: Spec = dir('demo', [
   file('.zshrc', kb(3.1), 120),
 ]);
 
-/** Growth since the previous snapshot, by root-relative path; negative when a path shrank. */
+/**
+ * Growth since the previous snapshot, by root-relative path; negative when a path shrank.
+ * A directory whose growth is explained by one child carries the child's growth, like a
+ * real pair of snapshots would, so `top_growers` names the deepest culprit.
+ */
 const GROWTH: ReadonlyArray<[string, number]> = [
   ['', gb(5.6)],
   ['Library', gb(6.4)],
+  ['Library/Developer', gb(6.2)],
+  ['Library/Developer/Xcode', gb(6.2)],
   ['Library/Developer/Xcode/DerivedData', gb(6.2)],
   ['Library/Developer/Xcode/DerivedData/Dodo-cxjtbwqrnlvzmegakfoyuhpsdi', gb(3.1)],
   ['Library/Containers/com.docker.docker', gb(1.1)],
+  ['Library/Containers/com.docker.docker/Data', gb(1.1)],
+  ['Library/Containers/com.docker.docker/Data/vms', gb(1.1)],
+  ['Library/Containers/com.docker.docker/Data/vms/0', gb(1.1)],
+  ['Library/Containers/com.docker.docker/Data/vms/0/data', gb(1.1)],
   ['Library/Caches', -gb(0.9)],
   ['Downloads', -gb(4.2)],
   ['Documents/Design/hero-assets.psd', gb(0.6)],
   ['src', gb(1.6)],
+  ['src/storage-monitor', gb(1.4)],
   ['src/storage-monitor/target', gb(1.4)],
   ['Movies', gb(1.2)],
 ];
@@ -337,7 +362,7 @@ export function fixtureStatusDone(): ScanStatus {
     files: count((n) => n.kind !== 'dir'),
     dirs: count((n) => n.kind === 'dir'),
     bytes: fixtureNodes[0].size,
-    errors: count((n) => n.error === PERMISSION_DENIED),
+    errors: count((n) => n.error === PERMISSION_DENIED) + PARTIAL_READ_ERRORS,
     currentPath: '',
     durationMs: SCAN_DURATION_MS,
     error: null,

@@ -14,7 +14,7 @@ import {
   type ScanStatus,
 } from '../lib/ipc';
 import { FIXTURE_ROOT, fixtureDisk, fixtureGrowers, fixtureNodes } from './fixtures';
-import { installIpcMock, resetIpcMock, revealed, setMockScanDelay } from './ipc';
+import { installIpcMock, mockScanDelayMs, resetIpcMock, revealed, setMockScanDelay } from './ipc';
 
 /** Subscribes to both scan events; `done` resolves with the payload of `scan:done`. */
 async function subscribe() {
@@ -135,16 +135,28 @@ describe('a simulated scan', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it('stops delivering to a listener that unsubscribed', async () => {
-    // The mock of @tauri-apps/api warns about a callback it no longer knows.
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const spy = vi.fn();
-    const unlisten = await onScanProgress(spy);
-    await unlisten();
-    const { done } = await subscribe();
-    await scanStart();
-    await done;
-    expect(spy).not.toHaveBeenCalled();
+  it('stops delivering to a listener that unsubscribed, without a warning', async () => {
+    const warn = vi.spyOn(console, 'warn');
+    try {
+      const spy = vi.fn();
+      const unlisten = await onScanProgress(spy);
+      await unlisten();
+      const { done } = await subscribe();
+      await scanStart();
+      await done;
+      expect(spy).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('exposes the test hooks on the window for Playwright', async () => {
+    expect(window.__STORAGE_MONITOR_MOCK__?.revealed).toBe(revealed);
+    window.__STORAGE_MONITOR_MOCK__?.setMockScanDelay(0);
+    expect(mockScanDelayMs).toBe(0);
+    await revealInFinder('/x');
+    expect(window.__STORAGE_MONITOR_MOCK__?.revealed).toEqual(['/x']);
   });
 });
 
