@@ -14,7 +14,7 @@
 
 - The `System` port covers filesystem and clock only. Process execution arrives in 2b.
 - Both modes ship; the mode is chosen per batch and is not remembered until Settings exists.
-- `trash` 5.2.9 with `set_delete_method(DeleteMethod::NsFileManager)`. The `Finder` default shells out to `osascript` and needs an Automation grant that an ad-hoc signed build loses on every rebuild. The cost is that "Put Back" may be missing, so the UI says "Show in Trash" and never promises Put Back.
+- `trash` 5.2.9 with `set_delete_method(DeleteMethod::NsFileManager)`. The `Finder` default shells out to `osascript` and needs an Automation grant that an ad-hoc signed build loses on every rebuild. The cost is that "Put Back" may be missing, so the UI never promises it. An earlier draft said the UI would offer "Show in Trash" instead; Task 13 found there is nothing to build that from, and design section 11 records why phase 2a ships without it.
 - After a batch only the deleted paths are rescanned, never their parents.
 - The arena is rebuilt to splice the results in; children live in contiguous id ranges.
 
@@ -1552,6 +1552,8 @@ git commit -m "feat(desktop): add the Activity screen"
 **Step 1: Write the failing tests**
 
 In `explorer.spec.ts`: select two rows, click "Move to Trash", assert the dialog lists both with the total, confirm, and assert both rows disappear while the header total shrinks. Take `explorer-selection.png` while the dialog is open.
+
+**That screenshot is carrying a known gap, so review it rather than glance at it.** Task 13 left one deliberate mutation survivor that a unit test cannot honestly kill: dropping `variant="primary"` from the confirm button loses the emphasis on the most dangerous control on the screen and nothing fails, because asserting a Tailwind class in a unit test pins the stylesheet rather than the behaviour. The screenshot is where that becomes visible. Frame it with the dialog in Permanent mode, where the emphasis matters most.
 
 **Serve the app's own CSP from the mock server, and fail a spec on any violation.** This is the only place in the project where the policy can be exercised by a test: `just dev` does not apply it (Tauri attaches the header in the `tauri://localhost` handler, which a `devUrl` document never reaches), and CI's `tauri build` compiles the binary without launching it. Set `Content-Security-Policy` as a response header on port 1430 — the same string as `tauri.conf.json` — and register a `securitypolicyviolation` listener that fails the test.
 
