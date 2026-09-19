@@ -495,8 +495,10 @@ describe('ExplorerPage deleting the selection', () => {
     const bar = screen.getByTestId('selection-bar');
     expect(bar).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
     // A row cannot carry `aria-selected` while the table is not a grid, so the count is what
-    // a screen reader hears when Space ticks a row.
+    // a screen reader hears when Space ticks a row — once, from the region that is always
+    // mounted, and not a second time from the words next to the buttons.
     expect(announcement).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
+    expect(within(bar).getByText(/selected/)).toHaveAttribute('aria-hidden', 'true');
 
     fireEvent.click(box('Downloads'));
     fireEvent.click(box('Movies'));
@@ -550,6 +552,37 @@ describe('ExplorerPage deleting the selection', () => {
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('runs the mode the dialog was switched to, not the one it was opened in', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').size;
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+
+    fireEvent.click(within(dialog).getByRole('radio', { name: 'Permanent' }));
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /I understand/ }));
+    fireEvent.click(confirmButton(dialog));
+
+    // The report reads `outcome.mode`, which is the mode `action_run` was called with — so
+    // this sentence is the one place the page's choice of mode can be seen from outside.
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent(
+      `Deleted 1 item · ${formatBytes(downloads)}`,
+    );
+    expect(within(dialog).queryByText(/Moved/)).not.toBeInTheDocument();
+  });
+
+  it('holds the dialog on the running batch until the report arrives', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const release = holdReply('action_run');
+
+    fireEvent.click(confirmButton(dialog));
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Moving to the Trash…');
+    expect(confirmButton(dialog)).toBeDisabled();
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeDisabled();
+
+    release();
+    expect(await within(dialog).findByTestId('result-summary')).toBeInTheDocument();
   });
 
   it('re-reads the tree and the volume the batch changed', async () => {
@@ -763,6 +796,44 @@ describe('ExplorerPage deleting the selection', () => {
     expect(commands).not.toContain('tree_node');
     // The selection goes anyway: the question it was asked for has been answered.
     expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+  });
+
+  it('patches the tree for an entry that failed, although nothing was removed', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+
+    // A deletion that failed halfway leaves a branch nobody can describe from here, so
+    // `touched` sends it to the splice next to the entries that went — and the ids move for
+    // a batch that freed not one byte.
+    const oneFailed: BatchResult = {
+      outcome: {
+        entries: [
+          {
+            path: `${FIXTURE_ROOT}/Downloads/q3-report.pdf`,
+            kind: 'file',
+            result: { result: 'failed', message: 'Operation not permitted (os error 1)' },
+          },
+        ],
+        freedBytes: 0,
+        at: '2026-09-18T09:31:00Z',
+        mode: 'trash',
+      },
+      recorded: true,
+      treeStale: false,
+    };
+    replyOnce('action_run', () => oneFailed);
+    const commands = recordCommands();
+
+    fireEvent.click(confirmButton(dialog));
+    expect(await within(dialog).findByTestId('result-failed')).toHaveTextContent(
+      'Operation not permitted',
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(commands).toContain('tree_node');
   });
 
   it('leaves Backspace alone while the dialog is open', async () => {
