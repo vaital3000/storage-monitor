@@ -109,14 +109,17 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
     use storage_monitor_core::action::{EntryOutcome, EntryResult, Mode, Outcome};
     use storage_monitor_core::scan::NodeKind;
-    use tauri::WebviewUrl;
+
+    use crate::scan_manager::{DONE_EVENT, PROGRESS_EVENT};
     use tauri::test::{INVOKE_KEY, MockRuntime, mock_builder, mock_context, noop_assets};
     use tauri::webview::InvokeRequest;
+    use tauri::{Listener, WebviewUrl};
 
     #[test]
     fn get_app_info_returns_core_metadata() {
@@ -294,6 +297,18 @@ mod tests {
         // Last, because it is the only one that leaves the app busy: a scan of the temp
         // directory, which also runs `AppHandle<MockRuntime>` as a `StatusEmitter` — the
         // impl this crate made generic, and which nothing else exercises at run time.
+        // Recorded as they are emitted: the worker thread calls a Rust listener directly,
+        // so nothing here waits on an event loop.
+        let events: Arc<Mutex<Vec<(&str, Value)>>> = Arc::default();
+        for event in [PROGRESS_EVENT, DONE_EVENT] {
+            let events = Arc::clone(&events);
+            webview.listen(event, move |received| {
+                let status = serde_json::from_str(received.payload())
+                    .unwrap_or_else(|err| panic!("{event} carried no status: {err}"));
+                events.lock().expect("the recorder").push((event, status));
+            });
+        }
+
         let started = ipc.ok("scan_start", json!({ "root": dir.path() }));
         assert_eq!(started["root"], json!(dir.path()), "{started}");
         assert_eq!(started["state"], json!("running"), "{started}");
@@ -312,8 +327,34 @@ mod tests {
         assert_eq!(done["state"], json!("done"), "{done}");
         assert!(
             done["files"].as_u64().is_some_and(|files| files > 0),
-            "the emitter carried the walk back: {done}"
+            "the walk reached the manager: {done}"
         );
+
+        // And the window was told. `run` emits `scan:done` while it holds the manager's
+        // lock, and the poll above needed that lock to see `done` at all, so the emit has
+        // already returned by now: no sleep, no flake. An emitter whose body does nothing
+        // passes every other test in this crate — every manager test carries a recorder of
+        // its own — and costs the real window its live progress.
+        let seen = events.lock().expect("the recorder");
+        let of = |event| seen.iter().filter(move |(name, _)| *name == event);
+        let finished: Vec<&Value> = of(DONE_EVENT).map(|(_, status)| status).collect();
+        assert_eq!(
+            finished.len(),
+            1,
+            "one scan:done reached the window: {seen:?}"
+        );
+        assert_eq!(finished[0]["state"], json!("done"), "{:?}", finished[0]);
+        assert_eq!(
+            finished[0]["files"], done["files"],
+            "and it carried the same walk the command reports"
+        );
+        // `scan:progress` is not asserted to *arrive*: the ticker sleeps before its first
+        // emit and stops as soon as the scan is over, so a scan of a temp directory this
+        // small is normally finished first, and demanding one would be a timing race. What
+        // every one that does arrive has to be is a running status — the window draws it.
+        for (name, status) in of(PROGRESS_EVENT) {
+            assert_eq!(status["state"], json!("running"), "{name} {status}");
+        }
 
         let listed: BTreeSet<&str> = every_command!(command_names)
             .into_iter()
