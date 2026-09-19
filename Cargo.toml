@@ -23,6 +23,15 @@ nix = { version = "0.31", features = ["fs"] }
 dirs = "7"
 tempfile = "3"
 
+# Debug builds carry the debug info of every dependency, which in a Tauri tree is
+# hundreds of crates and most of `target/debug`. Keep line tables for our own
+# crates so test backtraces stay readable, and drop the rest.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = true
