@@ -1,5 +1,6 @@
-// The sections of the app shell (design section 10). Only the Explorer exists in phase 1;
-// the others open a placeholder.
+// The sections of the app shell (design section 10). The Explorer and Activity exist —
+// phase 2a ships the deletion and the record of it together, because a screen that deletes
+// with nothing that says what it deleted is half a feature. The rest open a placeholder.
 
 import {
   Activity,
@@ -24,7 +25,7 @@ export const PAGES: readonly PageEntry[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard, available: false },
   { id: 'explorer', label: 'Explorer', icon: FolderTree, available: true },
   { id: 'cleanup', label: 'Cleanup', icon: Sparkles, available: false },
-  { id: 'activity', label: 'Activity', icon: Activity, available: false },
+  { id: 'activity', label: 'Activity', icon: Activity, available: true },
   { id: 'settings', label: 'Settings', icon: Settings, available: false },
 ];
 

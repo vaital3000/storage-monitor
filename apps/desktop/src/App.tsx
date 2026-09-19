@@ -3,6 +3,7 @@ import { useState } from 'react';
 import AppShell from './components/AppShell';
 import { getAppInfo } from './lib/ipc';
 import { DEFAULT_PAGE, pageEntry, type PageId } from './lib/pages';
+import ActivityPage from './pages/ActivityPage';
 import ExplorerPage from './pages/ExplorerPage';
 import PlaceholderPage from './pages/PlaceholderPage';
 
@@ -18,7 +19,15 @@ export default function App() {
 
   return (
     <AppShell page={page} onNavigate={setPage} versionLabel={versionLabel}>
-      {page === 'explorer' ? <ExplorerPage /> : <PlaceholderPage title={pageEntry(page).label} />}
+      {/* One page at a time, which is what lets the Activity screen re-read the record on
+          every open rather than being told to: leaving the Explorer unmounts it. */}
+      {page === 'explorer' ? (
+        <ExplorerPage />
+      ) : page === 'activity' ? (
+        <ActivityPage />
+      ) : (
+        <PlaceholderPage title={pageEntry(page).label} />
+      )}
     </AppShell>
   );
 }
