@@ -262,6 +262,9 @@ describe('ConfirmDeleteDialog', () => {
     );
     expect(screen.getByTestId('delete-total')).toHaveTextContent('2 items · 3.0 GB');
     expect(screen.getByTestId('delete-total')).toHaveTextContent('1 blocked');
+    // The heading counts what will go, like the total under it — three rows are listed.
+    expect(dialog()).toHaveAccessibleName('Move 2 items to the Trash?');
+    expect(entryItems()).toHaveLength(3);
   });
 
   it('takes the total from the backend rather than adding the rows up again', () => {
@@ -269,7 +272,8 @@ describe('ConfirmDeleteDialog', () => {
     // backend saw the real sizes, and the dialog is not allowed to have an opinion about
     // them. A dialog that sums what it renders would print 3.0 GB.
     show(previewOf([ready(`${ROOT}/Downloads`, 2e9), ready(`${ROOT}/src`, 1e9)], 7_000_000_000));
-    expect(screen.getByTestId('delete-total')).toHaveTextContent('2 items · 7.0 GB');
+    // Anchored: with nothing blocked the line ends there, rather than admitting "0 blocked".
+    expect(screen.getByTestId('delete-total')).toHaveTextContent(/^2 items · 7\.0 GB$/);
   });
 
   it('opens on the Trash and explains what the Trash does', () => {
@@ -318,6 +322,18 @@ describe('ConfirmDeleteDialog', () => {
     expect(confirmed).toHaveBeenCalledExactlyOnceWith('permanent');
   });
 
+  it('disarms the button again when the acknowledgement is taken back', () => {
+    // The tick is a switch, not a door that only opens: a user who reads the list again
+    // and changes their mind has to be able to put the safety back on.
+    show(TWO_READY, { initialMode: 'permanent' });
+    fireEvent.click(understandBox());
+    expect(confirmButton()).toBeEnabled();
+
+    fireEvent.click(understandBox());
+    expect(understandBox()).not.toBeChecked();
+    expect(confirmButton()).toBeDisabled();
+  });
+
   it('forgets the acknowledgement when the mode goes back to the Trash', () => {
     show(TWO_READY);
     selectMode('Permanent');
@@ -343,6 +359,13 @@ describe('ConfirmDeleteDialog', () => {
     fireEvent.click(understandBox());
     expect(confirmButton()).toBeEnabled();
 
+    // Out of the question and back is enough; it does not matter what happened while it
+    // was away, and the rule must not depend on which phase it went through.
+    view.setStatus({ phase: 'running' });
+    view.setStatus({ phase: 'asking' });
+    expect(understandBox()).not.toBeChecked();
+
+    fireEvent.click(understandBox());
     view.setStatus({ phase: 'running' });
     view.setStatus({ phase: 'failed', message: 'another batch is running' });
     view.setStatus({ phase: 'asking' });
@@ -425,6 +448,7 @@ describe('ConfirmDeleteDialog', () => {
   it('says which kind of deletion is running', () => {
     show(TWO_READY, { initialMode: 'permanent', status: { phase: 'running' } });
     expect(screen.getByRole('status')).toHaveTextContent('Deleting…');
+    expect(understandBox()).toBeDisabled();
   });
 
   it('ignores Escape while the batch runs, so its report cannot be lost', () => {
@@ -675,6 +699,10 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     show(TWO_READY, { status: { phase: 'done', result: batch([MOVED]) } });
     expect(screen.queryByTestId('not-recorded')).not.toBeInTheDocument();
     expect(screen.queryByTestId('tree-stale')).not.toBeInTheDocument();
+    // And no empty groups under the summary: a heading over nothing is a question the
+    // user then has to answer by counting rows.
+    expect(screen.queryByTestId('result-failed')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('result-skipped')).not.toBeInTheDocument();
   });
 
   it('gives the report a key to scroll it by', () => {
