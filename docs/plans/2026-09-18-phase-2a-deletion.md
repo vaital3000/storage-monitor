@@ -1392,7 +1392,7 @@ Run: `pnpm --filter @storage-monitor/desktop test src/components/NodeTable.test.
 
 **Step 3: Implement**
 
-Add to `NodeTableProps`:
+Add to `NodeTableProps` a **paired-optional** pair — both or neither, enforced by a union so half a pair is a compile error:
 
 ```ts
   /** Ids of the selected rows. */
@@ -1400,9 +1400,17 @@ Add to `NodeTableProps`:
   onSelectionChange: (selection: ReadonlySet<NodeId>) => void;
 ```
 
+Required props would not compile: `ExplorerPage` is the only call site and Task 14 owns it. Optional also keeps the column invisible until then, which matters because rendering it shifts every positional selector — see the hand-off below.
+
+**The range anchor is an id, not an index.** An index is wrong the moment the table is re-sorted; the id is resolved against the displayed order at click time.
+
+**The header checkbox replaces the selection rather than merging into it.** Select-all reports exactly the shown rows, and clear reports the empty set — even when the incoming selection holds an id the table is not showing. In a deletion UI nothing invisible may survive a "clear", or the action bar goes on counting it and the batch goes on deleting it.
+
 A new first column, width `w-8`, padding `px-2`, holding an `<input type="checkbox">` with an `aria-label` of the row name. The existing `COLUMNS` comment records the fixed widths; update the arithmetic in it (452 px becomes 484 px) so the next reader is not misled. Keep the name column flexible.
 
-Shift-click needs the index of the last row the user touched; hold it in a ref and clear it when the node changes.
+Shift-click needs the id of the last row the user touched; hold it in a ref and clear it when the node changes.
+
+**Hand-off, because the checkbox column shifts every positional selector.** When Task 14 renders it, `ExplorerPage.test.tsx`'s `getAllByRole('cell')[0]` becomes `[1]`, and Task 16's e2e selectors `td:first-child span[title]` and `getByRole('cell').nth(3)` become `td:nth-child(2)` and `.nth(4)`. The column is optional precisely so those breakages land in the task that renders it rather than in this one.
 
 **Step 4: Run the tests and commit**
 
