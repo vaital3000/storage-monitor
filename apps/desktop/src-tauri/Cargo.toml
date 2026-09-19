@@ -25,3 +25,5 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `TestSystem`: deletion tests run against a temporary filesystem, never the real one.
+storage-monitor-core = { workspace = true, features = ["testing"] }
