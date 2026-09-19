@@ -3,7 +3,9 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use storage_monitor_core::scan::{Node, NodeKind, ScanOptions, ScanProgress, Tree, scan};
+use storage_monitor_core::scan::{
+    Node, NodeKind, ScanError, ScanOptions, ScanProgress, Tree, rescan_path, scan,
+};
 use storage_monitor_core::snapshot::{Snapshot, deltas, top_growers};
 use tempfile::TempDir;
 
@@ -484,6 +486,149 @@ fn root_must_be_a_directory() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn rescan_of_a_deleted_path_reports_nothing() {
+    let dir = fixture();
+    let gone = dir.path().join("docs");
+    fs::remove_dir_all(&gone).unwrap();
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    assert!(rescan_path(&gone, &options).unwrap().is_none());
+}
+
+#[test]
+fn rescan_of_a_directory_returns_its_current_contents() {
+    let dir = fixture();
+    let docs = dir.path().join("docs");
+    fs::remove_file(docs.join("report.txt")).unwrap();
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let tree = rescan_path(&docs, &options).unwrap().unwrap();
+    assert_eq!(tree.root().file_count, 2, "only the two notes are left");
+    assert_eq!(tree.root().logical_size, 300);
+}
+
+#[test]
+fn rescan_of_a_single_file_returns_one_node() {
+    let dir = fixture();
+    let file = dir.path().join("big.bin");
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let tree = rescan_path(&file, &options).unwrap().unwrap();
+    assert_eq!(tree.len(), 1);
+    assert_eq!(tree.root().kind, NodeKind::File);
+    assert_eq!(tree.root().logical_size, 40_000);
+}
+
+#[test]
+fn rescan_of_a_symlink_does_not_follow_it() {
+    let dir = fixture();
+    let link = dir.path().join("docs-link");
+    std::os::unix::fs::symlink(dir.path().join("docs"), &link).unwrap();
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let tree = rescan_path(&link, &options).unwrap().unwrap();
+    assert_eq!(tree.root().kind, NodeKind::Symlink);
+    assert_eq!(tree.len(), 1);
+}
+
+#[test]
+fn rescan_names_its_root_with_the_absolute_path() {
+    let dir = fixture();
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let file = dir.path().join("big.bin");
+    let tree = rescan_path(&file, &options).unwrap().unwrap();
+    assert_eq!(&*tree.root().name, file.to_str().unwrap());
+    assert_eq!(tree.path(Tree::ROOT), file, "a patch is spliced by path");
+    let docs = dir.path().join("docs");
+    let tree = rescan_path(&docs, &options).unwrap().unwrap();
+    assert_eq!(&*tree.root().name, docs.to_str().unwrap());
+    assert_eq!(tree.path(Tree::ROOT), docs);
+}
+
+#[test]
+fn rescan_normalizes_the_path_before_reading_it() {
+    // `lstat` resolves a symlink whose path ends in a separator, so a trailing slash would
+    // otherwise walk the target of the link that was just deleted.
+    let dir = fixture();
+    let root = dir.path();
+    std::os::unix::fs::symlink(root.join("docs"), root.join("docs-link")).unwrap();
+    let options = ScanOptions::new(root.to_path_buf());
+    let slashed = |name: &str| PathBuf::from(format!("{}/{name}/", root.display()));
+
+    let tree = rescan_path(&slashed("docs-link"), &options)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tree.root().kind,
+        NodeKind::Symlink,
+        "the link is not followed"
+    );
+    assert_eq!(tree.len(), 1);
+    assert_eq!(&*tree.root().name, root.join("docs-link").to_str().unwrap());
+
+    let tree = rescan_path(&slashed("docs"), &options).unwrap().unwrap();
+    assert_eq!(&*tree.root().name, root.join("docs").to_str().unwrap());
+    assert_eq!(tree.root().file_count, 3);
+}
+
+#[test]
+fn rescan_of_a_dangling_symlink_reports_the_link_itself() {
+    let dir = fixture();
+    let link = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("gone"), &link).unwrap();
+    assert!(!link.exists(), "the target is missing, the link is not");
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    for path in [link.clone(), PathBuf::from(format!("{}/", link.display()))] {
+        let tree = rescan_path(&path, &options).unwrap().unwrap();
+        assert_eq!(tree.root().kind, NodeKind::Symlink, "{}", path.display());
+        assert_eq!(tree.len(), 1);
+    }
+}
+
+#[test]
+fn rescan_carries_the_excludes_of_the_scan() {
+    let dir = fixture();
+    let docs = dir.path().join("docs");
+    let mut options = ScanOptions::new(dir.path().to_path_buf());
+    options.excludes.push(docs.join("notes"));
+    let tree = rescan_path(&docs, &options).unwrap().unwrap();
+    assert_eq!(names(&tree, Tree::ROOT), vec!["report.txt"]);
+    assert_eq!(tree.root().file_count, 1);
+    assert_eq!(tree.root().logical_size, 3_000);
+}
+
+#[test]
+fn rescan_of_an_unreadable_path_reports_the_error_it_hit() {
+    if unsafe { libc_geteuid() } == 0 {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let dir = fixture();
+    let locked = dir.path().join("locked");
+    let inside = locked.join("inside.bin");
+    write(&inside, 10);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    // The directory itself can be stat'ed but not listed; its entry cannot even be stat'ed.
+    let listed = rescan_path(&locked, &options);
+    let entry = rescan_path(&inside, &options);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let tree = listed.unwrap().unwrap();
+    assert_eq!(tree.root().kind, NodeKind::Dir);
+    assert_eq!(tree.len(), 1);
+    let error = tree.error(Tree::ROOT);
+    assert!(
+        error.unwrap_or("").contains("ermission"),
+        "error: {error:?}"
+    );
+
+    match entry {
+        Err(ScanError::Root { path, source }) => {
+            assert_eq!(path, inside);
+            assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("expected a Root error, got {other:?}"),
+    }
 }
 
 unsafe extern "C" {

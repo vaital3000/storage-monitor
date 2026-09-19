@@ -4,7 +4,8 @@
 //! nested [`Subtree`] that is then flattened into a [`Tree`]. It follows the root when the
 //! root itself is a symlink (`/tmp` on macOS) but never a symlink below it, stays on the
 //! root's volume by default, records unreadable directories as errors instead of failing
-//! and attributes hard-linked data to one path.
+//! and attributes hard-linked data to one path. [`rescan_path`] rebuilds one branch of such
+//! a tree after a deletion, under the options of the scan it patches.
 
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
@@ -141,6 +142,53 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
     })
 }
 
+/// A fresh [`Tree`] rooted at `path`, or `None` when the path is gone. Used after a
+/// deletion to replace one branch of a scan instead of walking the whole root again.
+///
+/// `options` supplies the excludes and the same-volume rule of the scan this patch belongs
+/// to; its `root` is ignored. The root node carries `path` as its name, normalized exactly
+/// like the root of a [`scan`], so the patch and the tree it joins name the same path.
+///
+/// The tree describes what is at `path` *now*: a directory is walked, anything else — a
+/// file, a symlink, a socket — becomes a single node, so a path that changed kind since the
+/// scan is reported as it is today. Unlike [`scan`], a symlinked `path` is never followed:
+/// the path is the one that was just deleted, and resolving it would walk the target of a
+/// link the user removed. A directory that exists but cannot be listed comes back as a
+/// single node carrying the error, as it would inside a full scan; a path that cannot be
+/// read at all is a [`ScanError::Root`], and only a missing path is `None`.
+///
+/// Hard-linked data is attributed within `path` alone: twins outside it keep whatever the
+/// last full scan decided, and a single node keeps its size even when it is one of several
+/// links to the same data.
+pub fn rescan_path(path: &Path, options: &ScanOptions) -> Result<Option<Tree>, ScanError> {
+    // Normalize before the stat, not after: `lstat` follows a symlink whose path ends in a
+    // separator, so `deleted-link/` would otherwise report — and then walk — its target.
+    let path: PathBuf = path.components().collect();
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ScanError::Root { path, source }),
+    };
+    if meta.is_dir() {
+        // `scan` stats the root once more and would follow it if it were a symlink by then.
+        // Closing that window means walking from a file descriptor, which the scanner does
+        // not do; what it leaves open is a path swapped between these two stats.
+        let result = scan(&rescan_options(path, options), &ScanProgress::default())?;
+        return Ok(Some(result.tree));
+    }
+    let node = node_from_metadata(&path.to_string_lossy(), &meta);
+    Ok(Some(Subtree::new(node).flatten().0))
+}
+
+/// The options of the scan being patched, re-rooted at the rescanned path: everything but
+/// the root still describes that scan, and a field added later is carried over by default.
+fn rescan_options(root: PathBuf, options: &ScanOptions) -> ScanOptions {
+    ScanOptions {
+        root,
+        ..options.clone()
+    }
+}
+
 fn walk_dir(path: &Path, mut node: Node, ctx: &Ctx) -> Subtree {
     ctx.progress.enter(path);
     if ctx.progress.is_cancelled() {
@@ -240,4 +288,29 @@ fn node_from_metadata(name: &str, meta: &Metadata) -> Node {
         u32::from(!is_dir),
         meta.mtime(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same-volume rule has no fixture that can observe it — that needs a second
+    /// volume — so both of its values are pinned here instead.
+    #[test]
+    fn a_rescan_keeps_every_option_of_the_scan_but_the_root() {
+        for same_device in [true, false] {
+            let options = ScanOptions {
+                root: PathBuf::from("/home/me"),
+                excludes: vec![PathBuf::from("/home/me/Library")],
+                same_device,
+            };
+            let patched = rescan_options(PathBuf::from("/home/me/cache"), &options);
+            assert_eq!(patched.root, PathBuf::from("/home/me/cache"));
+            assert_eq!(patched.excludes, options.excludes);
+            assert_eq!(
+                patched.same_device, same_device,
+                "the volume rule of the scan is kept"
+            );
+        }
+    }
 }
