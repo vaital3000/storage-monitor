@@ -10,7 +10,7 @@ use storage_monitor_core::paths;
 use storage_monitor_core::scan::{NodeId, Tree};
 use storage_monitor_core::snapshot::Delta;
 use storage_monitor_core::system::RealSystem;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Runtime, State};
 
 use crate::actions::{self, BatchLock};
 use crate::scan_manager::ScanManager;
@@ -30,9 +30,13 @@ pub fn default_root() -> Result<String, String> {
 }
 
 /// Starts a scan of `root` (default: the home folder); progress arrives as events.
+///
+/// Generic over the runtime, as every command reached through a generic
+/// [`configure`](crate::configure) has to be: the handle is the event sink, and the mock
+/// runtime the registration test builds over has a handle of its own.
 #[tauri::command]
-pub fn scan_start(
-    app: AppHandle,
+pub fn scan_start<R: Runtime>(
+    app: AppHandle<R>,
     manager: State<'_, ScanManager>,
     root: Option<String>,
 ) -> Result<ScanStatus, String> {

@@ -37,7 +37,9 @@ pub trait StatusEmitter: Send + Sync + 'static {
     fn emit(&self, event: &str, status: &ScanStatus);
 }
 
-impl StatusEmitter for tauri::AppHandle {
+/// Generic over the runtime so that the same window bootstrap builds over the mock one:
+/// `lib::configure` is where that matters, and nothing here changes with it.
+impl<R: tauri::Runtime> StatusEmitter for tauri::AppHandle<R> {
     fn emit(&self, event: &str, status: &ScanStatus) {
         if let Err(err) = tauri::Emitter::emit(self, event, status) {
             eprintln!("cannot emit {event}: {err}");
