@@ -208,9 +208,11 @@ impl ScanManager {
     /// Rescans every path of a finished batch and splices the results into the tree, so the
     /// Explorer agrees with the disk again. Paths the tree does not know are ignored, and
     /// nothing happens at all while no scan result is held — during a scan there is none,
-    /// and the scan itself is about to produce a truthful tree. Both of those are
-    /// [`TreeState::Current`]: there is no row on screen for what the batch deleted, so
-    /// there is nothing to warn about.
+    /// and the scan itself is about to produce a truthful tree. All three of those are
+    /// [`TreeState::Current`], the unresolved path included: there is no row on screen for
+    /// what the batch deleted, so there is nothing to warn about. That last one is a
+    /// positive answer about a lookup that failed, and it is only true while the caller
+    /// hands over the spelling the scan recorded — the rule the next paragraph is about.
     ///
     /// **The paths are the ones the UI sent.** [`Tree::find`] matches the spelling the scan
     /// recorded, component by component; the normalized path the guards hand to the `System`
@@ -313,10 +315,15 @@ impl ScanManager {
         };
         inner.result = Some(Arc::new(patched));
         inner.generation += 1;
-        // Nothing to arrange about freeing the arena that was just replaced, although it
-        // can be hundreds of megabytes: `patch_paths` holds the same `Arc` until it
-        // returns, which is after this guard is gone, so the last strong reference never
-        // dies under the lock in the first place.
+        // The lock goes before `current` does. `current` is a strong reference to the arena
+        // that was just replaced — hundreds of megabytes of it — and locals drop in reverse
+        // declaration order, so without this line its refcount falls while the guard is
+        // still alive. Today that costs nothing, because `patch_paths` holds the same `Arc`
+        // until it returns and the deallocation happens there instead; but that is a
+        // property of the caller's frame, and this function should not need one to be
+        // right. `start` releases the lock before dropping the previous tree for the same
+        // reason.
+        drop(inner);
         true
     }
 

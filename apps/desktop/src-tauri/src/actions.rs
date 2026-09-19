@@ -82,6 +82,18 @@ pub fn preview_batch(
 /// Every entry that was removed **or** failed is rescanned, not just the removed ones:
 /// `remove` is not atomic, so a failure can leave most of a tree deleted, and the rescan is
 /// what makes the Explorer agree with the disk again.
+///
+/// **The rule for whoever adds the next step here.** An `Err` from `action_run` means the
+/// batch did not run, and the dialog is written against exactly that: every failure of a
+/// batch that *did* run is a field of [`BatchResult`], never an error. So nothing added
+/// after [`execute`] may panic out of this function — which is why the splice is caught
+/// rather than trusted, and why the same has to be done for whatever comes next.
+///
+/// In a debug build that guarantee is already weaker than it reads, and deliberately: the
+/// `debug_assert`s in [`touched`] and in `execute`'s own `freed_bytes` invariant fire after
+/// the entries are gone, so a developer build can answer `Err` for a batch that deleted
+/// everything it was asked to. That is what an assertion is for. It is not the contract the
+/// UI is written against, and it is not a licence to add a fallible step here.
 pub fn run_batch(
     manager: &ScanManager,
     sys: &dyn System,
@@ -176,10 +188,16 @@ fn plan_for(manager: &ScanManager, paths: &[PathBuf], mode: Mode) -> Plan {
 
 /// The rules for the scan the window holds, or `None` when nothing has been scanned.
 ///
-/// The root, deliberately, and not the tree: a scan that failed or was cancelled leaves a
-/// root and no result, and a batch then is guarded by exactly the rules the user's last
-/// choice of root implies. Sizes go missing in that case, nothing else — [`plan_for`] says
-/// what that costs.
+/// The root, deliberately, and not the tree, because the two part company in two states.
+/// A **failed** scan leaves a root and no result. So does a scan that is **running**:
+/// `ScanManager::start` clears the result and keeps the root, so a batch can be deleting
+/// paths the walker is enumerating this second — which is safe, and is the state that made
+/// this a root question rather than a tree question. In both, the guards are exactly the
+/// rules the user's choice of root implies, and only the sizes are missing; [`plan_for`]
+/// says what that costs.
+///
+/// A **cancelled** scan is not one of them: `Inner::complete` installs its partial tree like
+/// any other, so it has a root and a result, and a batch patches it like any other.
 ///
 /// Not limits over an empty root: every path starts with the empty path, so rules 4 and 5
 /// would pass for everything on the machine, and the `debug_assert` that says so is gone in
@@ -640,6 +658,12 @@ mod tests {
             child_names(&before),
             "the stale row stays"
         );
+        assert!(
+            !batch.tree_stale,
+            "and no warning goes with it: the tree is wrong about a row this batch did not \
+             delete, which is true of every row the disk changed behind the app's back. The \
+             flag is about what the batch itself left behind, or it means nothing."
+        );
         assert_eq!(root_view(&manager).size, before.size);
         assert_eq!(
             manager.generation(),
@@ -810,7 +834,10 @@ mod tests {
     /// and a second batch arriving mid-flight.
     struct Meddling<'a> {
         inner: &'a TestSystem,
-        after_removal: Box<dyn Fn() + Send + Sync + 'a>,
+        /// Runs after the port was *asked* to delete, whether or not it managed to: a hook
+        /// that ran only after a real removal would quietly not run for an entry a test
+        /// failed on purpose, which is the other half of what this seam is for.
+        after_attempt: Box<dyn Fn() + Send + Sync + 'a>,
     }
 
     impl System for Meddling<'_> {
@@ -820,13 +847,13 @@ mod tests {
 
         fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
             let done = self.inner.move_to_trash(path);
-            (self.after_removal)();
+            (self.after_attempt)();
             done
         }
 
         fn remove(&self, path: &Path) -> Result<(), SystemError> {
             let done = self.inner.remove(path);
-            (self.after_removal)();
+            (self.after_attempt)();
             done
         }
 
@@ -859,7 +886,7 @@ mod tests {
         // cannot be resolved, so locking it earlier would mean nothing was deleted at all.
         let meddling = Meddling {
             inner: &sys,
-            after_removal: Box::new(|| {
+            after_attempt: Box::new(|| {
                 fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
             }),
         };
@@ -928,7 +955,7 @@ mod tests {
         let held = Mutex::new(Vec::new());
         let meddling = Meddling {
             inner: &sys,
-            after_removal: Box::new(|| held.lock().unwrap().push(batches.is_held())),
+            after_attempt: Box::new(|| held.lock().unwrap().push(batches.is_held())),
         };
 
         let batch = run_batch(
