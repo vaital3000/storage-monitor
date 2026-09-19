@@ -27,16 +27,19 @@ export default function Button({
   type = 'button',
   ...rest
 }: ButtonProps) {
+  // One lookup feeding both, so the name and the look cannot come apart. `data-variant` is
+  // there for the tests: which variant a control wears is a decision about what it means —
+  // the way on, or something that cannot be taken back — while what each one looks like is
+  // the stylesheet's business. That only holds while an attribute saying `danger` cannot
+  // sit on a button painted blue, which is why `Button.test.tsx` checks the pair.
+  const style = VARIANTS[variant];
   return (
     <button
       type={type}
-      // The variant, in a value a test can read. Which variant a button wears is a decision
-      // about what it means — the way on, or something that cannot be taken back — and one
-      // worth pinning; what each of them looks like is the stylesheet's business, and a test
-      // that asserted the classes would pin that instead.
-      data-variant={variant}
-      className={`${BASE} ${VARIANTS[variant]} ${className}`}
+      className={`${BASE} ${style} ${className}`}
       {...rest}
+      // After the caller's props: the attribute describes the button, not the call site.
+      data-variant={variant}
     />
   );
 }

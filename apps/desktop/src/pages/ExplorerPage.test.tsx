@@ -1,8 +1,9 @@
+import { emit } from '@tauri-apps/api/event';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
-import type { BatchResult } from '../lib/ipc';
+import { SCAN_DONE_EVENT, type BatchResult } from '../lib/ipc';
 import {
   DIFFERENT_VOLUME,
   FIXTURE_ROOT,
@@ -15,7 +16,7 @@ import {
 } from '../mocks/fixtures';
 import { installIpcMock, revealed, setMockScanDelay } from '../mocks/ipc';
 import { charts, lastChart } from '../test/echarts';
-import { holdReply, recordCommands, replyOnce } from '../test/invoke';
+import { holdReply, recordCommands, replyOnce, wrapInvoke } from '../test/invoke';
 import { renderWithClient } from '../test/render';
 import ExplorerPage from './ExplorerPage';
 
@@ -510,6 +511,10 @@ describe('ExplorerPage deleting the selection', () => {
     for (const button of within(bar()).getAllByRole('button', { hidden: true })) {
       expect(button).toBeDisabled();
     }
+    // And the one that matters to everyone else: it is not drawn. The class is the
+    // behaviour here, the way a variant's colour is — jsdom applies no stylesheet, so
+    // there is nothing else to ask.
+    expect(bar()).toHaveClass('invisible');
 
     const total = fixtureNode('Downloads').size + fixtureNode('Movies').size;
     fireEvent.click(box('Downloads'));
@@ -521,8 +526,10 @@ describe('ExplorerPage deleting the selection', () => {
     // mounted, and not a second time from the words next to the buttons.
     expect(announcement).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
     expect(within(bar()).getByText(/selected/)).toHaveAttribute('aria-hidden', 'true');
-    // Named, because it is the only place in the app where a selection can be acted on.
-    expect(bar()).toHaveAttribute('role', 'toolbar');
+    // Named, because it is the only place in the app where a selection can be acted on —
+    // and a `group` rather than a `toolbar`, which would promise one tab stop and arrow
+    // keys between the controls that these three ordinary buttons do not give.
+    expect(bar()).toHaveAttribute('role', 'group');
     expect(bar()).toHaveAccessibleName('Selection');
     expect(within(bar()).getByRole('button', { name: 'Delete permanently' })).toHaveAttribute(
       'data-variant',
@@ -871,6 +878,144 @@ describe('ExplorerPage deleting the selection', () => {
     expect(screen.getByTestId('selection-status')).toHaveTextContent(
       'Checking what would be deleted…',
     );
+  });
+
+  it('drops the question a rescan replaced, before it can be answered', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // Nothing is modal yet, and Rescan is right there in the header — a user who ticked a
+    // folder and thought better of it can reach it. The preview lands while the walk is
+    // still going, so no navigation and no generation has moved when the reply arrives.
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    release();
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    await settle();
+
+    // A modal nobody asked for, over a tree with nothing ticked, whose button would move
+    // 28.7 GB against sizes and verdicts from the scan before it.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
+  });
+
+  it('drops an unanswered question when a rescan lands on the open dialog', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    expect(dialog).toBeInTheDocument();
+
+    await act(() => emit(SCAN_DONE_EVENT, fixtureStatusDone()));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('keeps the report when a rescan lands on it, because nothing else says what ran', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+
+    // The other half of the same rule: a question may be dropped, an answer may not.
+    // `recorded` and `treeStale` are reported here and nowhere else.
+    await act(() => emit(SCAN_DONE_EVENT, fixtureStatusDone()));
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    // The same element throughout, not one that went away with the tree and came back: a
+    // remounted dialog is a stranger — new focus, and the mode reset to what it opened in.
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByTestId('result-summary')).toBeInTheDocument();
+  });
+
+  it('frees the page for the next question when a rescan takes one', async () => {
+    await scanned();
+    // Never released: the abandoned preview is on the wire for the whole test.
+    holdReply('action_preview');
+    const commands = recordCommands();
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    // One plain macrotask before `waitFor` takes over: inside its `act` scope the reply
+    // held above never settles, and the simulated scan's own timers never get a turn.
+    await settle();
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // A scan replaces every id as surely as a navigation does, and leaves the same page
+    // behind: one that looks idle and ignores the click.
+    expect(commands.filter((cmd) => cmd === 'action_preview')).toHaveLength(2);
+  });
+
+  it('keeps a refusal on screen after the ticks that caused it are gone', async () => {
+    await scanned();
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    await screen.findByTestId('preview-error');
+
+    // The table stays live through all of this, so the ticks can go before the alert is
+    // read. An alert that hides itself — and disables its own Dismiss — is worse than none.
+    fireEvent.click(box('Downloads'));
+    expect(barShows()).toBe(true);
+    expect(screen.getByTestId('preview-error')).toHaveTextContent('no scan result');
+    expect(screen.getByRole('button', { name: 'Move to Trash' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByTestId('preview-error')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
+  });
+
+  it('runs the batch the dialog listed, not the ticks as they are at the end', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(box('Movies'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    // Live table, again: a tick can go while the guards are still answering about it.
+    fireEvent.click(box('Movies'));
+    release();
+
+    const dialog = await screen.findByRole('dialog');
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Downloads`, `${FIXTURE_ROOT}/Movies`]);
+    fireEvent.click(confirmButton(dialog));
+
+    // What the dialog listed is what runs. The user agreed to a list of paths, not to a
+    // recomputation of a selection that moved behind the modal.
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent('Moved 2 items');
+  });
+
+  it('opens the question that is still being asked, not the one it replaced', async () => {
+    await scanned();
+    // A gate per call, not one for both: the abandoned reply has to land *while* the live
+    // one is still on the wire, which is the only ordering in which one flag shared by two
+    // calls goes wrong — and the ordering `holdReply` cannot produce.
+    const gates: Array<() => void> = [];
+    wrapInvoke(async (name, original) => {
+      const reply = original();
+      if (name !== 'action_preview') return reply;
+      reply.catch(() => undefined);
+      await new Promise<void>((open) => gates.push(open));
+      return reply;
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    fireEvent.click(box('family-2025.mov'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    gates[0]();
+    await settle();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    // The live question still opens: the reply that came back to a page that had moved on
+    // gave up its own place and nobody else's.
+    gates[1]();
+    const dialog = await screen.findByRole('dialog');
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Movies/family-2025.mov`]);
   });
 
   it('goes back to the top from any depth, not one level up', async () => {

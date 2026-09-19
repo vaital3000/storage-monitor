@@ -61,33 +61,37 @@ interface Scope {
  * `{ phase: 'failed' }` batch, which is the far more alarming sentence "the deletion ran and
  * could not finish".
  *
- * Both carry the scope they were started in, and die with it like the ticks do: a "Checking
- * what would be deleted…" over another directory's rows narrates a batch nobody asked for,
- * and a banner about rows that are gone can outlive a navigation, a rescan and the ticks it
- * names — taking Backspace with it, since a deletion on screen holds the key.
+ * All three carry the scope they were asked in, and a question that is out of it is
+ * dropped: a "Checking what would be deleted…" over another directory's rows narrates a
+ * batch nobody asked for, a banner about rows that are gone outlives the ticks it names,
+ * and a dialog does both at once — over a tree whose sizes and verdicts were read before
+ * the rescan that replaced it. Nothing here is modal until the dialog opens, and Rescan sits
+ * in the header the whole time.
  *
- * `confirming` carries none, deliberately: it is modal, so nothing can move the scope under
- * it, and the report it ends on has to survive the one thing that does — this page sending
- * itself back to the root when the batch patched the tree.
+ * An **answer** is never dropped, which is why the rule reads `status.phase === 'asking'`
+ * rather than "not confirming": once the batch is running the report is the only thing that
+ * will ever say `recorded` or `treeStale`, and this page's own re-anchor moves the scope
+ * out from under it every time.
  */
-type Deletion =
-  | ({ phase: 'previewing' } & Scope)
-  | ({ phase: 'previewFailed'; message: string } & Scope)
-  | {
-      phase: 'confirming';
-      /** The mode the entry point asked for; the dialog's toggle may move away from it. */
-      mode: DeletionMode;
-      /** Captured when the dialog opened: what the user is being asked to confirm. */
-      paths: string[];
-      preview: Preview;
-      status: BatchStatus;
-    };
-
-function outOfScope(deletion: Deletion, scope: Scope): boolean {
-  return (
-    deletion.phase !== 'confirming' &&
-    (deletion.generation !== scope.generation || deletion.node !== scope.node)
+type Deletion = Scope &
+  (
+    | { phase: 'previewing' }
+    | { phase: 'previewFailed'; message: string }
+    | {
+        phase: 'confirming';
+        /** The mode the entry point asked for; the dialog's toggle may move away from it. */
+        mode: DeletionMode;
+        /** Captured when the dialog opened: what the user is being asked to confirm. */
+        paths: string[];
+        preview: Preview;
+        status: BatchStatus;
+      }
   );
+
+/** A question nobody can still be asking, because the rows it is about are gone. */
+function outOfScope(deletion: Deletion, scope: Scope): boolean {
+  const unanswered = deletion.phase !== 'confirming' || deletion.status.phase === 'asking';
+  return unanswered && (deletion.generation !== scope.generation || deletion.node !== scope.node);
 }
 
 /** Backspace in a text field edits the text; anywhere else it goes up one directory. */
@@ -179,18 +183,18 @@ function ResultHeader({ status, disk, onRescan }: ResultHeaderProps) {
  */
 function PreviewError({ message }: { message: string }) {
   return (
-    <p
-      role="alert"
-      data-testid="preview-error"
-      className="flex min-w-0 items-baseline gap-2 text-sm"
-    >
-      <span className="shrink-0 font-medium text-red-700 dark:text-red-400">
+    <p role="alert" data-testid="preview-error" className="min-w-0 text-sm">
+      <span className="font-medium text-red-700 dark:text-red-400">
         Could not check what would be deleted
-      </span>
-      <span className="truncate font-mono text-xs text-red-700 dark:text-red-300" title={message}>
+      </span>{' '}
+      {/* Wrapped, not truncated, and not left to a `title`: at the window's own minimum
+          width a truncated line showed an ellipsis and nothing else, and a tooltip is not
+          reachable by keyboard or touch, not announced and not selectable for a bug
+          report. What it costs is a second shift, on the path that already went wrong. */}
+      <span className="font-mono text-xs break-words text-red-700 dark:text-red-300">
         {message}
-      </span>
-      <span className="shrink-0 text-muted">Nothing was deleted.</span>
+      </span>{' '}
+      <span className="text-muted">Nothing was deleted.</span>
     </p>
   );
 }
@@ -205,27 +209,37 @@ function PreviewError({ message }: { message: string }) {
  * it moves everything below by 61.4 px against a row of 34.5 px: the first tick would slide
  * the next row the user is aiming at almost two rows up, on the one screen in this app that
  * deletes things. `invisible` also takes the buttons out of the tab order, and `aria-hidden`
- * out of the accessibility tree, so a bar nobody can see is not a trap either.
+ * out of the accessibility tree, so a bar nobody can see is not a trap either. The cost is
+ * a band of that height on every Explorer screen, ticked or not; the plan records the trade.
+ *
+ * "Nothing to say" is not "nothing ticked": the table stays live through the round trip, so
+ * the ticks can go before the refusal they caused has been read. An alert that hides itself,
+ * with its own Dismiss disabled inside it, is worse than no alert at all.
  */
 function SelectionBar({
   summary,
-  shown,
+  ticked,
   busy,
   error,
   onDelete,
   onDismiss,
 }: {
   summary: string;
-  shown: boolean;
+  /** How many rows are ticked; none is what disables the two entry points. */
+  ticked: number;
   busy: boolean;
   error: string | null;
   onDelete: (mode: DeletionMode) => void;
   onDismiss: () => void;
 }) {
+  const shown = ticked > 0 || error !== null;
   return (
     <div
       data-testid="selection-bar"
-      role="toolbar"
+      // `group` and not `toolbar`: the APG pattern is one tab stop with arrow keys between
+      // the controls, and these are three ordinary tab stops. The same argument that left
+      // the table a `table` rather than a `grid` applies here, to this task's own markup.
+      role="group"
       aria-label="Selection"
       aria-hidden={shown ? undefined : true}
       className={`flex items-center gap-3 rounded-lg border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900 ${
@@ -241,15 +255,15 @@ function SelectionBar({
         <PreviewError message={error} />
       )}
       <div className="ml-auto flex shrink-0 gap-2">
-        {error !== null && (
-          <Button disabled={!shown} onClick={onDismiss}>
-            Dismiss
-          </Button>
-        )}
-        <Button disabled={busy || !shown} onClick={() => onDelete('trash')}>
+        {error !== null && <Button onClick={onDismiss}>Dismiss</Button>}
+        <Button disabled={busy || ticked === 0} onClick={() => onDelete('trash')}>
           Move to Trash
         </Button>
-        <Button variant="danger" disabled={busy || !shown} onClick={() => onDelete('permanent')}>
+        <Button
+          variant="danger"
+          disabled={busy || ticked === 0}
+          onClick={() => onDelete('permanent')}
+        >
           Delete permanently
         </Button>
       </div>
@@ -318,15 +332,17 @@ export default function ExplorerPage() {
   const select = (ids: ReadonlySet<NodeId>) => setPicked({ ...scope, ids });
 
   const [deletion, setDeletion] = useState<Deletion | null>(null);
-  // One call of a deletion in flight, and a ref because that has to be true before React
-  // re-renders: two clicks in one task both read the same `deletion` from their render, and
-  // two overlapping `action_run` calls resolve their ids against one generation — whichever
-  // splices second is dropped, and its rows stay in the tree until the next scan.
-  const calling = useRef(false);
-  // Which preview a reply may still open a dialog for. Bumped whenever the scope moves, so
-  // a reply that was in flight across a navigation finds itself stale and is dropped
-  // instead of opening a modal over rows the user is no longer looking at.
-  const request = useRef(0);
+  // The preview in flight, by number, or null. It is the guard — one question at a time —
+  // and the stamp a reply checks itself against: a reply whose number is no longer here was
+  // abandoned by a scope that moved, and may not open a dialog over rows nobody is looking
+  // at. A ref, because both have to be true before React re-renders: two clicks in one task
+  // read the same `deletion` from the same render.
+  const previews = useRef(0);
+  const pendingPreview = useRef<number | null>(null);
+  // The batch in flight. Kept apart from the preview on purpose: one flag for both would let
+  // an abandoned preview's `finally` — which can land long after the user moved on and
+  // confirmed something else — free the guard of a running batch.
+  const running = useRef(false);
   // The other half of the same rule, in state: the "Checking…" and the banner it may end
   // with are dropped when the scope they were started in is gone. Same shape as the ticks
   // above — adjusted while rendering, and read through `pending` in this render too.
@@ -340,12 +356,10 @@ export default function ExplorerPage() {
   // dropped while rendering, below; the two refs cannot be touched there — rendering has to
   // stay pure — and they belong together anyway.
   useEffect(() => {
-    request.current += 1;
-    // Freeing the guard here is what keeps the next directory's buttons from doing nothing
-    // at all while an abandoned preview is still on the wire. It cannot free a running
-    // batch by accident: the dialog is modal, so no scope moves under one — and the only
-    // move that happens during a batch is this page's own, after the outcome is in hand.
-    calling.current = false;
+    // Both halves of abandoning it: the reply will find its number gone and drop itself,
+    // and the next directory's buttons work again rather than looking idle and ignoring
+    // the click. A running batch is untouched — it has a flag of its own.
+    pendingPreview.current = null;
   }, [generation, current.id]);
 
   const root = useQuery({ queryKey: ['defaultRoot'], queryFn: defaultRoot, staleTime: Infinity });
@@ -409,28 +423,44 @@ export default function ExplorerPage() {
 
   /** Asks the guards about the ticked rows, and opens the dialog on their answer. */
   const askToDelete = (mode: DeletionMode) => {
-    if (view === undefined || ticked.length === 0 || calling.current) return;
-    calling.current = true;
-    const asked = { ...scope, token: request.current };
-    setDeletion({ phase: 'previewing', ...scope });
+    if (
+      view === undefined ||
+      ticked.length === 0 ||
+      pendingPreview.current !== null ||
+      running.current
+    )
+      return;
+    const call = (previews.current += 1);
+    pendingPreview.current = call;
+    const asked = scope;
+    setDeletion({ phase: 'previewing', ...asked });
     // `ChildView` carries no path of its own: a row is its parent's path and its name.
     const paths = ticked.map((child) => `${view.path}/${child.name}`);
     void actionPreview(paths, mode)
       .then(
         (preview) => {
-          // The user left while this was on the wire. Opening the dialog now would put a
-          // modal about another directory's rows in front of them, and a `previewFailed`
-          // would name rows that are no longer on screen; both are the reply's to drop.
-          if (request.current !== asked.token) return;
-          setDeletion({ phase: 'confirming', mode, paths, preview, status: { phase: 'asking' } });
+          // The scope moved while this was on the wire — a navigation, or a rescan started
+          // from the header, which is reachable the whole time this is pending. Both make
+          // the reply about rows nobody is looking at.
+          if (pendingPreview.current !== call) return;
+          setDeletion({
+            phase: 'confirming',
+            mode,
+            paths,
+            preview,
+            status: { phase: 'asking' },
+            ...asked,
+          });
         },
         (e: unknown) => {
-          if (request.current !== asked.token) return;
+          if (pendingPreview.current !== call) return;
           setDeletion({ phase: 'previewFailed', message: String(e), ...asked });
         },
       )
       .finally(() => {
-        calling.current = false;
+        // Only if it is still this call's to give back: an abandoned preview must not free
+        // the question someone asked after it.
+        if (pendingPreview.current === call) pendingPreview.current = null;
       });
   };
 
@@ -467,12 +497,12 @@ export default function ExplorerPage() {
 
   /** Runs the batch the dialog is showing, in the mode its toggle now stands at. */
   const runDeletion = (mode: DeletionMode) => {
-    // Two guards for one rule, because they fail in different directions: `calling` is the
-    // only thing two clicks in one task can see, and the status is the only thing left if
-    // the guard was freed by a scope that moved under a batch — which nothing can do today.
+    // Two guards for one rule, because they fail in different directions: the flag is the
+    // only thing two clicks in one task can see, and the status is what answers a click that
+    // arrives after the state moved — a stale render, a handler kept by something else.
     if (deletion?.phase !== 'confirming' || deletion.status.phase !== 'asking') return;
-    if (calling.current) return;
-    calling.current = true;
+    if (running.current) return;
+    running.current = true;
     const asked = deletion;
     setDeletion({ ...asked, status: { phase: 'running' } });
     void actionRun(asked.paths, mode)
@@ -486,7 +516,7 @@ export default function ExplorerPage() {
         (e: unknown) => setDeletion({ ...asked, status: { phase: 'failed', message: String(e) } }),
       )
       .finally(() => {
-        calling.current = false;
+        running.current = false;
       });
   };
 
@@ -546,7 +576,7 @@ export default function ExplorerPage() {
           </p>
           <SelectionBar
             summary={summary}
-            shown={ticked.length > 0}
+            ticked={ticked.length}
             busy={checking}
             error={pending?.phase === 'previewFailed' ? pending.message : null}
             onDelete={askToDelete}
@@ -560,19 +590,6 @@ export default function ExplorerPage() {
             selection={selection}
             onSelectionChange={select}
           />
-          {pending?.phase === 'confirming' && (
-            <ConfirmDeleteDialog
-              // A whole `Preview` where `Omit<Preview, 'mode'>` is asked for, and no cast:
-              // the dialog simply cannot read the mode the guards were called with.
-              preview={pending.preview}
-              status={pending.status}
-              initialMode={pending.mode}
-              onConfirm={runDeletion}
-              // "Unmount me", in every phase, and no claim about whether a batch ran — this
-              // page knows that from `deletion.status`, and has already acted on it.
-              onClose={() => setDeletion(null)}
-            />
-          )}
         </>
       ) : node.isError ? (
         <div role="alert" className="flex items-center gap-4 text-sm">
@@ -581,6 +598,23 @@ export default function ExplorerPage() {
         </div>
       ) : (
         <p className="text-sm text-muted">Loading…</p>
+      )}
+      {/* Outside the branch above, because a modal is not part of the tree it was opened
+          over: a rescan blanks `view` while the new root loads, and a dialog mounted in
+          there would vanish mid-batch and come back a stranger — new focus, the mode reset
+          to what it opened with. What ends a dialog is the scope rule and `onClose`. */}
+      {pending?.phase === 'confirming' && (
+        <ConfirmDeleteDialog
+          // A whole `Preview` where `Omit<Preview, 'mode'>` is asked for, and no cast:
+          // the dialog simply cannot read the mode the guards were called with.
+          preview={pending.preview}
+          status={pending.status}
+          initialMode={pending.mode}
+          onConfirm={runDeletion}
+          // "Unmount me", in every phase, and no claim about whether a batch ran — this
+          // page knows that from `deletion.status`, and has already acted on it.
+          onClose={() => setDeletion(null)}
+        />
       )}
     </div>
   );
