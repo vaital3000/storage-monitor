@@ -1529,12 +1529,14 @@ git commit -m "test(desktop): cover deletion and the Activity screen end to end"
 
 **Files:**
 
-- Create: `docs/adr/0005-patching-the-scan-tree.md`
+- Create: `docs/adr/0005-patching-the-scan-tree.md`, `docs/adr/0006-content-security-policy.md`
 - Modify: `CLAUDE.md`, `README.md`, `docs/plans/2026-09-17-storage-monitor-design.md`, `docs/images/`
 
 **Step 1: The ADR**
 
 `0005-patching-the-scan-tree.md`, following the shape of the existing four. Context: a finished batch leaves the in-memory tree stale and a full rescan of the home folder costs 25 seconds. Decision: rescan the deleted paths only and rebuild the arena around the results; the snapshot is not rewritten. Consequences: hard-link attribution is not recomputed, so twins of a deleted hard link report 0 until the next full scan; the deltas keep pointing at the previous snapshot and the next scan shows the deletion as negative growth.
+
+`0006-content-security-policy.md` takes the prose that has outgrown the guard test: why `style-src` keeps `'unsafe-inline'` (inline style *attributes* in the disk bar, the table's column widths and the ECharts tooltip — not Tailwind, which compiles at build time), what makes that grant tolerable (`img-src 'self'` leaves an injected `url()` nowhere to beacon, `font-src 'self'` closes the same door for `@font-face`), why `require-trusted-types-for` is omitted deliberately, and why nothing but a manual run and the Playwright header can exercise the policy at all. Leave `the_content_security_policy_stays_closed` pointing at it — the test is where a future editor lands, the ADR is where the argument belongs.
 
 **Step 2: `CLAUDE.md`**
 
@@ -1572,6 +1574,12 @@ This is the first destructive code in the project, so exercise it by hand before
 ```bash
 git push -u origin feat/phase-2a-deletion
 gh pr create --title "feat: delete from the Explorer (phase 2a)" --body "..."
+```
+
+**The squash message carries what the individual commits did not.** At least one commit on this branch describes only part of its own diff — `8c38b90` is the CSP guard and the widened registration test by its message, and also the `activity` → `activity_tail` rename and a round of doc work. Read the full diff when writing the squash body, not the commit subjects, or a reviewer meets those changes unannounced.
+
+```bash
+# (the command above)
 ```
 
 The body carries the test plan, the manual verification above, and the screenshots. Wait for green CI, self-review the diff, then squash-merge. release-please will open the release PR for `0.3.0` (a `feat` commit bumps the minor); close and reopen it once so CI runs, check that the diff is versions and changelog only, merge it, and verify the built assets like in the previous phases.
