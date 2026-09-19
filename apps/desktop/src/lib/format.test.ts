@@ -7,6 +7,7 @@ import {
   formatDelta,
   formatDuration,
   formatPercent,
+  formatTimestamp,
   shortenPath,
 } from './format';
 
@@ -145,5 +146,40 @@ describe('countLabel', () => {
 
   it('groups thousands', () => {
     expect(countLabel(12_345, 'read error')).toBe('12,345 read errors');
+  });
+
+  it('takes a plural for a noun that does not end in an s', () => {
+    expect(countLabel(2, 'damaged entry', 'damaged entries')).toBe('2 damaged entries');
+    expect(countLabel(1, 'damaged entry', 'damaged entries')).toBe('1 damaged entry');
+    expect(countLabel(0, 'entry', 'entries')).toBe('0 entries');
+  });
+});
+
+describe('formatTimestamp', () => {
+  it('shows the local date and time of day of an RFC 3339 stamp', () => {
+    // Built locally and sent as the instant it is, so the expectation holds in every
+    // time zone — the same trick `formatDate`'s test uses one describe above.
+    const at = new Date(2026, 8, 18, 14, 32, 5);
+    expect(formatTimestamp(at.toISOString())).toBe('2026-09-18 14:32:05');
+  });
+
+  it('reads the offset the stamp carries rather than the digits in it', () => {
+    // Two spellings of one instant. A formatter that took the digits as they stand would
+    // answer 12:00 for the first and 09:00 for the second.
+    expect(formatTimestamp('2026-09-18T12:00:00+03:00')).toBe(
+      formatTimestamp('2026-09-18T09:00:00Z'),
+    );
+  });
+
+  it('gives back a stamp this platform cannot read, instead of NaN', () => {
+    // A leap second is a second to `chrono`, which is what writes the log and what the
+    // mock's reader was measured against; the ECMAScript date grammar stops at 59. So
+    // this is a line the backend can write and the browser cannot parse — and the first
+    // assertion is what says which of the two moved, on the day this fails.
+    const leap = '2026-06-30T23:59:60Z';
+    expect(Date.parse(leap)).toBeNaN();
+    expect(formatTimestamp(leap)).toBe(leap);
+    expect(formatTimestamp('whenever')).toBe('whenever');
+    expect(formatTimestamp('')).toBe('');
   });
 });
