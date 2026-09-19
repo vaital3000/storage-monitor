@@ -1078,8 +1078,10 @@ pub fn replace_subtrees(tree: &Tree, patches: Vec<(NodeId, Option<Tree>)>) -> Tr
 1. Build a map `NodeId -> Option<Tree>` from the patches and a set of the ancestors of every patched node.
 2. Walk the old tree from the root. For a node that is patched: skip it entirely when the replacement is `None`; otherwise place the replacement's nodes, keeping the *old* node's `name` for the replacement's root (the rescanned tree's root carries an absolute path).
 3. Place every other node as it is, with its error if it has one.
-4. For a group whose parent is in the ancestor set, sort the children with `by_size_then_name` before placing them; other groups keep their order, which is already sorted.
-5. Aggregates: after the placement, walk the new arena in reverse id order (children always have a larger id than their parent) and add each node's `size`, `logical_size` and `file_count` into its parent when the parent is in the ancestor set. Nodes carry their own subtree totals already, so only the ancestors need the adjustment — recompute their totals from scratch by starting them at their own on-disk values.
+4. Aggregates come **first**, over the old tree, before a single node is placed: collect every ancestor of every patch, order them deepest first (a child's id always exceeds its parent's) and recompute each from its children, taking a patched child's weight from its replacement. Only the ancestors need it; every other node already carries its own subtree totals.
+5. Then place, sorting a group with `by_size_then_name` when its parent is in the ancestor set; other groups keep the order the walker gave them.
+
+   The order of these two matters and the obvious one does not work: a group cannot be sorted before its members' new sizes are known, and a member that is itself an ancestor of a deeper patch only learns its new size from that deeper aggregation. Sorting during placement with stale sizes puts a shrunken directory in the wrong place — `/root`'s children must come back `["b.bin", "a"]` once `a` drops from 100 to 70, and a placement-time sort would still see 100.
 
 Note for the implementer: a node's `size` is the subtree total, and the walker adds the directory's own allocated blocks to it. When recomputing an ancestor, start from `own_size = old_size - sum(old children sizes)` so the directory's own blocks survive the patch. Compute `own_size` from the *old* tree before rebuilding.
 
