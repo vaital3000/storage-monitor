@@ -433,6 +433,9 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]).toHaveTextContent(`${ROOT}/Movies`);
     expect(failed[0]).toHaveTextContent('Permission denied (os 13)');
+    // The heading, not the colour, is what says which list this is: a failure may have
+    // torn a tree half down, where a skip touched nothing at all.
+    expect(screen.getByRole('heading', { name: 'Could not be deleted' })).toBeInTheDocument();
   });
 
   it('names every entry the batch skipped, with the reason in words', () => {
@@ -452,6 +455,8 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     expect(skipped).toHaveLength(1);
     expect(skipped[0]).toHaveTextContent(`${ROOT}/src`);
     expect(skipped[0]).toHaveTextContent('No longer what the preview saw');
+    expect(screen.getByRole('heading', { name: 'Skipped' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Could not be deleted' })).not.toBeInTheDocument();
   });
 
   it('admits a batch that deleted without being recorded', () => {

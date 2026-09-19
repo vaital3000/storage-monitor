@@ -156,12 +156,19 @@ const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), [tabindex]:not
 
 const PATH_CLASS = 'truncate font-mono text-xs';
 
+/**
+ * One group of the result view, under a heading that says which group it is. The heading
+ * and not the colour, because the two mean different things to whoever reads them: a
+ * failure may have left a tree half torn down, while a skipped entry was never touched.
+ */
 function EntryLines({
   lines,
+  title,
   testId,
   tone,
 }: {
   lines: ResultLine[];
+  title: string;
   testId: string;
   tone: string;
 }) {
@@ -169,16 +176,19 @@ function EntryLines({
     return null;
   }
   return (
-    <ul data-testid={testId} className="flex flex-col gap-1 text-sm">
-      {lines.map((line) => (
-        <li key={line.path} className="flex min-w-0 flex-col">
-          <span className={PATH_CLASS} title={line.path}>
-            {line.path}
-          </span>
-          <span className={tone}>{line.detail}</span>
-        </li>
-      ))}
-    </ul>
+    <section data-testid={testId} className="flex flex-col gap-1">
+      <h3 className="text-sm font-medium">{title}</h3>
+      <ul className="flex flex-col gap-1 text-sm">
+        {lines.map((line) => (
+          <li key={line.path} className="flex min-w-0 flex-col">
+            <span className={PATH_CLASS} title={line.path}>
+              {line.path}
+            </span>
+            <span className={tone}>{line.detail}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
@@ -418,8 +428,13 @@ function Report({ result, titleId, onClose, onShowInTrash }: ReportProps) {
       </h2>
 
       <div className="flex max-h-60 flex-col gap-3 overflow-y-auto">
-        <EntryLines lines={failed} testId="result-failed" tone="text-red-700 dark:text-red-400" />
-        <EntryLines lines={skipped} testId="result-skipped" tone="text-muted" />
+        <EntryLines
+          lines={failed}
+          title="Could not be deleted"
+          testId="result-failed"
+          tone="text-red-700 dark:text-red-400"
+        />
+        <EntryLines lines={skipped} title="Skipped" testId="result-skipped" tone="text-muted" />
       </div>
 
       {!recorded && (
