@@ -506,6 +506,10 @@ fn rescan_of_a_directory_returns_its_current_contents() {
     let tree = rescan_path(&docs, &options).unwrap().unwrap();
     assert_eq!(tree.root().file_count, 2, "only the two notes are left");
     assert_eq!(tree.root().logical_size, 300);
+    // docs/ and docs/notes/ hold the same two files, so the counts above cannot tell the
+    // rescanned directory from its child: pin the shape as well.
+    assert_eq!(tree.len(), 4, "docs, notes and the two notes");
+    assert_eq!(names(&tree, Tree::ROOT), vec!["notes"]);
 }
 
 #[test]
@@ -537,6 +541,8 @@ fn rescan_names_its_root_with_the_absolute_path() {
     let file = dir.path().join("big.bin");
     let tree = rescan_path(&file, &options).unwrap().unwrap();
     assert_eq!(&*tree.root().name, file.to_str().unwrap());
+    // `Path` compares component-wise, so this cannot fail while the string above holds;
+    // it is here to name what Task 7 needs, not as a second check. Keep both.
     assert_eq!(tree.path(Tree::ROOT), file, "a patch is spliced by path");
     let docs = dir.path().join("docs");
     let tree = rescan_path(&docs, &options).unwrap().unwrap();
@@ -629,6 +635,196 @@ fn rescan_of_an_unreadable_path_reports_the_error_it_hit() {
         }
         other => panic!("expected a Root error, got {other:?}"),
     }
+}
+
+#[test]
+fn rescan_of_a_path_under_a_file_is_gone() {
+    // The tree still lists docs/report.txt/inner because the scan saw a directory there;
+    // what is at that path now is nothing, and `ENOTDIR` is how the kernel says so.
+    let dir = fixture();
+    let stale = dir.path().join("docs/report.txt/inner");
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    assert_eq!(
+        fs::symlink_metadata(&stale).unwrap_err().kind(),
+        std::io::ErrorKind::NotADirectory,
+        "the parent is a file"
+    );
+    assert!(rescan_path(&stale, &options).unwrap().is_none());
+}
+
+#[test]
+fn rescan_of_a_path_behind_a_symlink_loop_is_an_error_not_a_gone_path() {
+    // `ELOOP` says the path could not be resolved, not that it is missing: dropping the
+    // branch on it would delete a subtree from the tree over a transient failure.
+    let dir = fixture();
+    let loop_link = dir.path().join("loop");
+    std::os::unix::fs::symlink(&loop_link, &loop_link).unwrap();
+    let behind = loop_link.join("inner");
+    // `ELOOP` is 62 on macOS and 40 on Linux; ask the kernel for it rather than spell it.
+    let eloop = fs::metadata(&loop_link).unwrap_err().raw_os_error();
+    assert!(eloop.is_some());
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    match rescan_path(&behind, &options) {
+        Err(ScanError::Root { path, source }) => {
+            assert_eq!(path, behind);
+            assert_eq!(source.raw_os_error(), eloop);
+        }
+        other => panic!("expected a Root error, got {other:?}"),
+    }
+}
+
+/// Entries of `/` that are not `keep`, so a scan of `/` stats its children and walks
+/// nothing else. Excludes only ever hold directories back, which is all this needs.
+fn siblings_at_the_root_of_the_volume(keep: &str) -> Vec<PathBuf> {
+    fs::read_dir("/")
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path != Path::new(keep))
+        .collect()
+}
+
+#[test]
+fn rescan_of_another_volume_is_skipped_exactly_as_the_walker_skips_it() {
+    // `/dev` is devfs on macOS and a container mount on Linux; `/` is the boot volume.
+    let root = PathBuf::from("/");
+    let other = PathBuf::from("/dev");
+    if fs::metadata(&root).unwrap().dev() == fs::metadata(&other).unwrap().dev() {
+        eprintln!("skipped: /dev is on the same volume as /");
+        return;
+    }
+    let mut options = ScanOptions::new(root.clone());
+    assert!(options.same_device, "the rule under test");
+    let tree = rescan_path(&other, &options).unwrap().unwrap();
+    assert_eq!(tree.len(), 1, "the other volume is not walked");
+    assert_eq!(tree.error(Tree::ROOT), Some("skipped: different volume"));
+    assert_eq!(tree.root().kind, NodeKind::Dir);
+    assert_eq!(tree.root().file_count, 0);
+    assert_eq!(&*tree.root().name, "/dev", "the root carries the path");
+
+    // The leaf a real walk of `/` leaves behind for the same mount point, to the byte.
+    options.excludes = siblings_at_the_root_of_the_volume("/dev");
+    let full = scan(&options, &ScanProgress::default()).unwrap();
+    let (leaf_id, leaf) = child(&full.tree, Tree::ROOT, "dev");
+    assert_eq!(full.tree.error(leaf_id), tree.error(Tree::ROOT));
+    assert_eq!(leaf.kind, tree.root().kind);
+    assert_eq!(leaf.size, tree.root().size);
+    assert_eq!(leaf.logical_size, tree.root().logical_size);
+    assert_eq!(leaf.file_count, tree.root().file_count);
+    assert_eq!(leaf.mtime, tree.root().mtime);
+    assert!(!full.tree.has_children(leaf_id));
+
+    // Without the rule the patch walks it, which is what the scan it joins never did.
+    options.same_device = false;
+    let walked = rescan_path(&other, &options).unwrap().unwrap();
+    assert!(walked.len() > 1, "only {} nodes", walked.len());
+    assert_eq!(walked.error(Tree::ROOT), None);
+}
+
+fn subtree_size(tree: &Tree, id: u32) -> usize {
+    1 + tree
+        .children(id)
+        .map(|child| subtree_size(tree, child))
+        .sum::<usize>()
+}
+
+/// Asserts that two subtrees hold the same nodes: same shape, sizes, counts and errors.
+/// Names are compared per child; the roots are not, since a patch names its root with the
+/// absolute path while the scan it joins holds the file name there.
+fn assert_same_subtree(patch: &Tree, patch_id: u32, full: &Tree, full_id: u32) {
+    let (a, b) = (patch.get(patch_id).unwrap(), full.get(full_id).unwrap());
+    let where_ = full.path(full_id);
+    let at = where_.display();
+    assert_eq!(a.kind, b.kind, "kind at {at}");
+    assert_eq!(a.size, b.size, "size at {at}");
+    assert_eq!(a.logical_size, b.logical_size, "logical size at {at}");
+    assert_eq!(a.file_count, b.file_count, "file count at {at}");
+    assert_eq!(a.mtime, b.mtime, "mtime at {at}");
+    assert_eq!(patch.error(patch_id), full.error(full_id), "error at {at}");
+    assert_eq!(
+        patch.child_count(patch_id),
+        full.child_count(full_id),
+        "children of {at}"
+    );
+    for (a_child, b_child) in patch.children(patch_id).zip(full.children(full_id)) {
+        assert_eq!(
+            &*patch.get(a_child).unwrap().name,
+            &*full.get(b_child).unwrap().name,
+            "child names under {at}"
+        );
+        assert_same_subtree(patch, a_child, full, b_child);
+    }
+}
+
+#[test]
+fn rescan_matches_the_branch_a_full_scan_produces() {
+    // The property Task 7 splices on: a patch is the branch the walker would have built.
+    // No hard links here on purpose — those are attributed across the whole scan, and a
+    // patch cannot reproduce a decision that was made outside it.
+    let as_root = unsafe { libc_geteuid() } == 0;
+    let dir = fixture();
+    let docs = dir.path().join("docs");
+    write(&docs.join("deep/nested/leaf.bin"), 4_096);
+    fs::create_dir_all(docs.join("empty")).unwrap();
+    std::os::unix::fs::symlink(docs.join("report.txt"), docs.join("link")).unwrap();
+    std::os::unix::fs::symlink(docs.join("gone"), docs.join("dangling")).unwrap();
+    let locked = docs.join("locked");
+    write(&locked.join("inside.bin"), 10);
+    if !as_root {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let full = scan(&options, &ScanProgress::default());
+    let patch = rescan_path(&docs, &options);
+    if !as_root {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let full = full.unwrap().tree;
+    let patch = patch.unwrap().unwrap();
+
+    let (docs_id, _) = child(&full, Tree::ROOT, "docs");
+    assert_same_subtree(&patch, Tree::ROOT, &full, docs_id);
+    // Not a fixed number: as root the unreadable directory is readable and holds one node
+    // more. The point is that the patch loses none of them.
+    assert_eq!(patch.len(), subtree_size(&full, docs_id), "no node is lost");
+    assert!(patch.len() >= 12, "a trivial fixture proves nothing");
+    assert_eq!(&*patch.root().name, docs.to_str().unwrap());
+    assert_eq!(&*full.get(docs_id).unwrap().name, "docs");
+    if !as_root {
+        assert_eq!(patch.errors().len(), 1, "the unreadable directory");
+    }
+}
+
+#[test]
+fn rescan_re_attributes_hard_links_inside_the_branch() {
+    // A known limitation of patching rather than rescanning, and the expensive direction:
+    // attribution runs over one branch, so a link whose bytes the full scan gave to a twin
+    // outside takes them back, and splicing the patch makes the totals above it grow. The
+    // next full scan corrects it; holding the whole tree's (dev, ino) set is what the
+    // design rejected.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(&root.join("a/z.bin"), 8_192);
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::hard_link(root.join("a/z.bin"), root.join("b/a.bin")).unwrap();
+    let options = ScanOptions::new(root.to_path_buf());
+    let full = scan(&options, &ScanProgress::default()).unwrap().tree;
+    let (b, b_node) = child(&full, Tree::ROOT, "b");
+    let (_, loser) = child(&full, b, "a.bin");
+    assert_eq!(
+        loser.size, 0,
+        "a/z.bin is the smaller path and keeps the data"
+    );
+    let data = allocated(&root.join("a/z.bin"));
+
+    let patch = rescan_path(&root.join("b"), &options).unwrap().unwrap();
+    let (_, patched) = child(&patch, Tree::ROOT, "a.bin");
+    assert_eq!(patched.size, data, "the link takes its bytes back");
+    assert_eq!(
+        patch.root().size,
+        b_node.size + data,
+        "so the branch weighs {data} bytes more than the scan says"
+    );
 }
 
 unsafe extern "C" {
