@@ -1192,6 +1192,11 @@ pub fn patch_paths(&self, paths: &[PathBuf]) {
 
 Step 3 is the important one: a rescan started meanwhile invalidates the patch, so compare the generation captured in step 1 and drop the patch when it moved. Reuse the existing `Inner.generation` field.
 
+Two rules about calling into the tree, both measured during Task 7's review:
+
+- **Resolve the ids from the paths the UI sent, before the guards touch them.** `Tree::find` only matches the spelling the scan itself recorded: a canonicalized path, a case-different spelling on a case-insensitive volume, and NFD where the disk holds NFC all return `None`. `Limits::check` deliberately manufactures two other spellings — `judged` is fully resolved, and `path` carries the caller's own last component — so neither is a key `find` is guaranteed to accept. Hand `find` the path the UI sent, keep the `NodeId` through the batch, and patch by id. Getting this wrong is silent: no patch, and the Explorer goes on showing a directory that is gone.
+- **One call, not one per path.** `replace_subtrees` rebuilds the whole arena, so its cost is per call: 100 patches in one call measured 120 ms on a 3.7M-node tree, while 100 separate calls would cost ten seconds. Collect every patch of the batch and splice once. Peak memory is roughly double the tree while both arenas exist.
+
 `actions.rs` holds the glue:
 
 ```rust
