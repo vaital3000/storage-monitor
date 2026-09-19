@@ -1505,6 +1505,10 @@ git commit -m "feat(desktop): add the Activity screen"
 
 In `explorer.spec.ts`: select two rows, click "Move to Trash", assert the dialog lists both with the total, confirm, and assert both rows disappear while the header total shrinks. Take `explorer-selection.png` while the dialog is open.
 
+**Serve the app's own CSP from the mock server, and fail a spec on any violation.** This is the only place in the project where the policy can be exercised by a test: `just dev` does not apply it (Tauri attaches the header in the `tauri://localhost` handler, which a `devUrl` document never reaches), and CI's `tauri build` compiles the binary without launching it. Set `Content-Security-Policy` as a response header on port 1430 — the same string as `tauri.conf.json` — and register a `securitypolicyviolation` listener that fails the test.
+
+The origin differs, so `'self'` does not mean the same thing here. What transfers is the class that actually breaks: `'unsafe-eval'`, a `blob:` worker, a `data:` font. That matters because `echarts` is a caret range — a `pnpm update` pulling a chart build that uses a blob worker would ship an app whose treemap silently fails to render, with every existing test green.
+
 In `activity.spec.ts`: run a batch, open Activity from the sidebar, assert two entries with the right paths, and write `activity.png`.
 
 **Step 2: Run**
