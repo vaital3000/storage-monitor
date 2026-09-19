@@ -551,19 +551,20 @@ describe('NodeTable selection', () => {
     expect(tickedInOrder()).toEqual([]);
   });
 
-  it('answers Space on a checkbox once, and leaves every other key to the table', () => {
+  it('answers Space on a checkbox once, and never opens a directory from one', () => {
     const changed = vi.fn<Change>();
     const opened = vi.fn();
-    const node = fixtureNodeView(0);
-    render(<Selectable node={node} onSelectionChange={changed} onOpen={opened} />);
+    render(<Selectable node={fixtureNodeView(0)} onSelectionChange={changed} onOpen={opened} />);
     // The browser turns Space on a focused box into a click; the row handler must not
     // toggle it a second time on the way past.
     fireEvent.keyDown(boxFor('Library'), { key: ' ' });
     expect(changed).not.toHaveBeenCalled();
 
-    // Enter is not the box's key: it reaches the row, which opens the directory.
+    // Enter does nothing to a checkbox, and the row would turn that nothing into a
+    // navigation — which costs the user standing here the selection they are building.
     fireEvent.keyDown(boxFor('Library'), { key: 'Enter' });
-    expect(opened).toHaveBeenCalledWith(childId(node, 'Library'));
+    expect(opened).not.toHaveBeenCalled();
+    expect(changed).not.toHaveBeenCalled();
 
     fireEvent.click(boxFor('Library'));
     expect(changed).toHaveBeenCalledTimes(1);
@@ -581,6 +582,23 @@ describe('NodeTable selection', () => {
     expect(rowFor('Downloads')).toHaveFocus();
     fireEvent.keyDown(rowFor('Downloads'), { key: ' ' });
     expect(tickedInOrder()).toEqual(['Downloads']);
+  });
+
+  it('leaves the arrows to the table from the Reveal button too, and the rest to itself', () => {
+    const changed = vi.fn<Change>();
+    const opened = vi.fn();
+    render(<Selectable node={fixtureNodeView(0)} onSelectionChange={changed} onOpen={opened} />);
+    const reveal = within(rowFor('Library')).getByRole('button', { name: 'Reveal in Finder' });
+    reveal.focus();
+
+    fireEvent.keyDown(reveal, { key: 'ArrowDown' });
+    expect(rowFor('Downloads')).toHaveFocus();
+
+    // Enter and Space press the button; the row behind it must neither open nor tick.
+    fireEvent.keyDown(reveal, { key: 'Enter' });
+    fireEvent.keyDown(reveal, { key: ' ' });
+    expect(opened).not.toHaveBeenCalled();
+    expect(changed).not.toHaveBeenCalled();
   });
 
   it('selects a directory the scanner could not read', () => {

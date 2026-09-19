@@ -10,7 +10,16 @@ import {
   TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react';
 import { countLabel, formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
 import type { ChildView, NodeId, NodeKind, NodeView } from '../lib/ipc';
 import { describeNodeError, type NodeErrorMark } from '../lib/nodeErrors';
@@ -269,8 +278,11 @@ const Row = memo(function Row({
     }
   };
   const numeric = `${NUMERIC_PADDING} py-1.5 text-right whitespace-nowrap tabular-nums`;
-  // A 16 px tick is not enough to see a range by, and a row toggled with Space changes a
-  // descendant of the focused element: the row itself has to say that it is selected.
+  // A 16 px tick is not enough to see a range by, so the row says it in a colour too, and
+  // `data-selected` lets a test say it in a value. Neither reaches assistive technology:
+  // a row toggled with Space changes a descendant of the focused element and nothing
+  // announces it, which needs a `grid` and `aria-selected` — deferred to the task that
+  // owns the table's role, so that the e2e selectors move once instead of twice.
   const tone = selected
     ? 'bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/50 dark:hover:bg-blue-900/50'
     : isDir
@@ -304,12 +316,17 @@ const Row = memo(function Row({
                 event.nativeEvent instanceof MouseEvent && event.nativeEvent.shiftKey,
               )
             }
-            // Space is the one key the box answers, and the row would answer it again.
-            // Every other key belongs to the table around it: the arrows that move
-            // between rows run on the body, and a blanket guard here would strand the
-            // focus on the box a selecting user is standing on.
+            // Space is the box's own key, and the row would answer it again. Enter is
+            // held back for a different reason: on a checkbox it does nothing, and the
+            // row would turn that nothing into opening a directory — which costs a user
+            // standing here mid-selection the whole selection, with no undo. A key whose
+            // old cost was zero does not get to start discarding work.
+            //
+            // Everything else belongs to the table around it. The arrows that move
+            // between rows run on the body, and a blanket guard would strand the focus
+            // on the box a selecting user is standing on.
             onKeyDown={(event) => {
-              if (event.key === ' ') event.stopPropagation();
+              if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
             }}
             className={CHECKBOX_CLASS}
           />
@@ -347,7 +364,13 @@ const Row = memo(function Row({
             event.stopPropagation();
             onReveal(path);
           }}
-          onKeyDown={(event) => event.stopPropagation()}
+          // The two keys that press a button, held for the same reasons as at the box:
+          // the row would open the directory on the Enter that revealed the row, and
+          // toggle it on the Space that did. The arrows stay the table's, so the focus
+          // is never stranded on this button either.
+          onKeyDown={(event) => {
+            if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
+          }}
           className="rounded p-0.5 text-muted opacity-35 group-hover:opacity-100 group-focus-visible:opacity-100 hover:text-neutral-700 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-neutral-200"
         >
           <SquareArrowOutUpRight className="size-3.5" />
@@ -435,15 +458,22 @@ export default function NodeTable({
   const someSelected = selectedRows > 0 && selectedRows < sorted.length;
 
   // What a row's handler has to read, kept where a handler that never changes can find it.
-  // Written after every render, which React flushes before it delivers the next event, so
-  // a click always reads the page it landed on.
+  // In a layout effect, which runs as part of the commit: a passive one would also be
+  // flushed before the next click, but only because React flushes those before a discrete
+  // event, which is behaviour and not a promise — and it would leave a caller that is not
+  // a discrete event (a drag-select, a `requestAnimationFrame`, an effect on the page)
+  // reading one commit behind, in the one place where a stale `sorted` means ranging over
+  // rows that are no longer the rows on screen.
   const shown = useRef({ sorted, selecting });
-  useEffect(() => {
+  useLayoutEffect(() => {
     shown.current = { sorted, selecting };
   });
 
   // One handler for every row, stable for the life of the table: 500 rows carrying 500 new
-  // closures would re-render all of them for one tick, whatever `memo` says.
+  // closures would re-render all of them for one tick, whatever `memo` says. `toggleAll`
+  // below needs none of this and keeps reading the render it belongs to — there is one
+  // header box, it re-renders with the table, and a ref there would buy nothing and cost
+  // a second way of reading the same two values.
   const toggleRow = useCallback((id: NodeId, extend: boolean) => {
     const { sorted, selecting } = shown.current;
     if (selecting === null) return;
