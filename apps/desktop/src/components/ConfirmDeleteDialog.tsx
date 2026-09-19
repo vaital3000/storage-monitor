@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { tabStops } from '../lib/focusTrap';
 import { countLabel, formatBytes } from '../lib/format';
 import {
   DELETION_MODES,
@@ -40,6 +41,14 @@ interface ConfirmDeleteDialogProps {
    */
   preview: Omit<Preview, 'mode'>;
   status: BatchStatus;
+  /**
+   * Which mode the dialog opens on; the Trash unless the caller says otherwise. The action
+   * bar has two entry points, and a "Delete permanently" button that opened a dialog
+   * headed "Move 2 items to the Trash?" would be asking about something else. It changes
+   * nothing about safety: a permanent deletion still waits for the acknowledgement, so the
+   * confirm button is disabled on open either way.
+   */
+  initialMode?: DeletionMode;
   onConfirm: (mode: DeletionMode) => void;
   /**
    * Asks the caller to unmount the dialog. It says nothing about whether a batch ran —
@@ -47,26 +56,16 @@ interface ConfirmDeleteDialogProps {
    * cancelled confirmation.
    */
   onClose: () => void;
-  /**
-   * Reveals the Trash folder, when the caller has a way to. Without it the result view
-   * shows no such button, rather than one that cannot keep its promise.
-   *
-   * The dialog holds no path of its own: `AppInfo` carries none, and the home folder is
-   * only reachable through `default_root`, whose meaning is "the folder scanned when the
-   * UI does not pick one" and not "the Trash lives here". Opening a folder outright would
-   * also need `opener:allow-open-path` in `src-tauri/capabilities/default.json`, which is
-   * a privilege grant and not a formality: `open_path` reaches macOS `open`, which
-   * launches applications, so granting it lets the frontend ask the OS to open any path it
-   * can name. That is a decision to take deliberately — with an ADR, on a branch that just
-   * finished closing the Content Security Policy — and not a line added in passing to make
-   * a button work.
-   */
-  onShowInTrash?: () => void;
 }
 
 /**
  * Every `BlockReason` in words, from the guards' own vocabulary
  * (`crates/core/src/action/model.rs`).
+ *
+ * `missing` and `unreadable` are kept apart to the letter, because that is the whole point
+ * of the backend telling them apart: one says the entry is gone, the other that something
+ * on the way to it could not be read, and folding them together sends a user hunting for a
+ * ghost instead of granting Full Disk Access.
  *
  * `nested` keeps the backend's phrasing even though an exact duplicate lands here too and
  * contains nothing: that trade-off is taken and explained in `engine.rs`, and a special
@@ -151,15 +150,19 @@ function removedCount(entries: readonly EntryOutcome[]): number {
   );
 }
 
-/** Tab has to reach these; everything else in the panel is text. */
-const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])';
-
 const PATH_CLASS = 'truncate font-mono text-xs';
+
+/** The height at which a list starts scrolling, and so needs a key to scroll it. */
+const SCROLLER_CLASS = 'max-h-60 overflow-y-auto';
 
 /**
  * One group of the result view, under a heading that says which group it is. The heading
  * and not the colour, because the two mean different things to whoever reads them: a
  * failure may have left a tree half torn down, while a skipped entry was never touched.
+ *
+ * Keyed by path, which is safe here in a way it is not in the preview: one entry has one
+ * outcome, and two lines with the same path would have to be a removed duplicate and a
+ * skipped one — which land in different lists, since a list holds one arm of `EntryResult`.
  */
 function EntryLines({
   lines,
@@ -203,14 +206,15 @@ function EntryLines({
 export default function ConfirmDeleteDialog({
   preview,
   status,
+  initialMode = 'trash',
   onConfirm,
   onClose,
-  onShowInTrash,
 }: ConfirmDeleteDialogProps) {
-  const [mode, setMode] = useState<DeletionMode>('trash');
+  const [mode, setMode] = useState<DeletionMode>(initialMode);
   const [understood, setUnderstood] = useState(false);
   const panel = useRef<HTMLDivElement>(null);
   const titleId = 'confirm-delete-title';
+  const running = status.phase === 'running';
 
   // The element the dialog took the focus from, given it back when the dialog goes. Read
   // in an effect of its own, declared before the one that moves the focus, so that it is
@@ -237,7 +241,69 @@ export default function ConfirmDeleteDialog({
     target?.focus();
   }, [status.phase]);
 
-  const running = status.phase === 'running';
+  // An acknowledgement covers the batch it was given for. A run that failed comes back to
+  // this view with Permanent still selected, and a tick made before it would leave the
+  // irreversible button armed for a second batch the user has not agreed to — the same
+  // rule as the one the mode toggle keeps below, for the same reason.
+  //
+  // Adjusted while rendering rather than in an effect: React re-runs this render before
+  // committing anything, so the button is never painted armed for a single frame, and no
+  // second render is scheduled behind the first (`react-hooks/set-state-in-effect`).
+  const [shownPhase, setShownPhase] = useState(status.phase);
+  if (shownPhase !== status.phase) {
+    setShownPhase(status.phase);
+    if (status.phase !== 'asking') {
+      setUnderstood(false);
+    }
+  }
+
+  // On the document rather than on the panel, because the panel only hears a key while
+  // something inside it has the focus — and a click on the backdrop blurs to the body,
+  // after which Escape would stop closing the dialog and Tab would step into the page
+  // behind it. Modality is not a property of where the focus happens to be.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        // Nothing can stop a batch that is already running, and closing here would throw
+        // away the only report of `recorded` and `treeStale` — and hand the page back,
+        // free to start a second batch over the tree this one is still patching.
+        if (!running) {
+          onClose();
+        }
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const current = panel.current;
+      if (current === null) {
+        return;
+      }
+      const stops = tabStops(current);
+      const first = stops[0];
+      const last = stops[stops.length - 1];
+      const active = document.activeElement;
+      const inside = active instanceof Node && current.contains(active);
+      // The focus has fallen out of the dialog — a click on the backdrop — or there is
+      // nothing inside to land on. Take it back rather than letting Tab step into the page
+      // behind; the panel holds it without being a stop of its own (`tabIndex={-1}`).
+      if (!inside || first === undefined || last === undefined) {
+        event.preventDefault();
+        current.focus();
+        return;
+      }
+      // Three ways the next step would leave: the two ends of the ring, and the panel
+      // itself, which holds the focus whenever the phase change found no control to give
+      // it to. From the panel a browser would step to whatever precedes the whole dialog.
+      if (active === current || (event.shiftKey ? active === first : active === last)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [running, onClose]);
+
   const ready = preview.entries.filter((entry) => entry.status.state === 'ready');
   const blocked = preview.entries.length - ready.length;
 
@@ -248,35 +314,13 @@ export default function ConfirmDeleteDialog({
     setUnderstood(false);
   };
 
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'Escape') {
-      // Nothing can stop a batch that is already running, and closing here would throw
-      // away the only report of `recorded` and `treeStale` — and hand the page back, free
-      // to start a second batch over the tree this one is still patching.
-      if (!running) {
-        onClose();
-      }
-      return;
-    }
-    if (event.key !== 'Tab' || panel.current === null) {
-      return;
-    }
-    // jsdom moves no focus on Tab and a browser moves it out of the dialog: what is
-    // implemented here is only the boundary — the wrap that keeps a modal modal.
-    const focusable = [...panel.current.querySelectorAll<HTMLElement>(FOCUSABLE)];
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (first === undefined || last === undefined) {
-      return;
-    }
-    if (event.shiftKey ? document.activeElement === first : document.activeElement === last) {
-      event.preventDefault();
-      (event.shiftKey ? last : first).focus();
-    }
-  };
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+    // The backdrop takes no click: this dialog stands in front of an irreversible action,
+    // and a mis-click beside the panel must not be the thing that dismisses it.
+    <div
+      data-testid="delete-backdrop"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+    >
       <div
         ref={panel}
         role="dialog"
@@ -284,16 +328,10 @@ export default function ConfirmDeleteDialog({
         aria-labelledby={titleId}
         aria-busy={running}
         tabIndex={-1}
-        onKeyDown={onKeyDown}
         className="flex max-h-full w-full max-w-lg flex-col gap-4 overflow-hidden rounded-xl border border-neutral-200 bg-white p-5 shadow-xl outline-none dark:border-neutral-800 dark:bg-neutral-900"
       >
         {status.phase === 'done' ? (
-          <Report
-            result={status.result}
-            titleId={titleId}
-            onClose={onClose}
-            onShowInTrash={onShowInTrash}
-          />
+          <Report result={status.result} titleId={titleId} onClose={onClose} />
         ) : status.phase === 'failed' ? (
           <RunError message={status.message} titleId={titleId} onClose={onClose} />
         ) : (
@@ -302,34 +340,41 @@ export default function ConfirmDeleteDialog({
               {askTitle(mode, ready.length)}
             </h2>
 
+            {/* A tab stop of its own, so that a user confirming two hundred entries can
+                scroll the list without a pointer — inside a focus trap there is no other
+                way to reach it. */}
             <ul
               data-testid="delete-entries"
-              className="flex max-h-60 flex-col gap-1 overflow-y-auto text-sm"
+              tabIndex={0}
+              aria-label="Entries to delete"
+              className={`flex flex-col gap-1 text-sm ${SCROLLER_CLASS} focus-visible:outline-2 focus-visible:outline-blue-500`}
             >
-              {preview.entries.map((entry) => {
-                const isBlocked = entry.status.state === 'blocked';
-                return (
-                  <li
-                    key={entry.path}
-                    data-state={entry.status.state}
-                    className={`flex min-w-0 flex-col ${isBlocked ? 'text-muted' : ''}`}
-                  >
-                    <span className="flex min-w-0 items-baseline gap-2">
-                      <span className={PATH_CLASS} title={entry.path}>
-                        {entry.path}
-                      </span>
-                      <span className="ml-auto shrink-0 tabular-nums">
-                        {formatBytes(entry.size)}
-                      </span>
+              {preview.entries.map((entry, index) => (
+                // By index, which is right here and wrong almost everywhere else: the list
+                // is the backend's, rendered in its order, never sorted or filtered in
+                // place — and a path is not unique in it. An exact duplicate comes back as
+                // a second entry blocked as `nested` (`engine.rs`), so a path key would
+                // make React drop one of the two rows of the batch the user is confirming.
+                <li
+                  key={index}
+                  data-state={entry.status.state}
+                  className={`flex min-w-0 flex-col ${
+                    entry.status.state === 'blocked' ? 'text-muted' : ''
+                  }`}
+                >
+                  <span className="flex min-w-0 items-baseline gap-2">
+                    <span className={PATH_CLASS} title={entry.path}>
+                      {entry.path}
                     </span>
-                    {entry.status.state === 'blocked' && (
-                      <span data-testid="block-reason" className="text-xs">
-                        {describeBlock(entry.status.reason)}
-                      </span>
-                    )}
-                  </li>
-                );
-              })}
+                    <span className="ml-auto shrink-0 tabular-nums">{formatBytes(entry.size)}</span>
+                  </span>
+                  {entry.status.state === 'blocked' && (
+                    <span data-testid="block-reason" className="text-xs">
+                      {describeBlock(entry.status.reason)}
+                    </span>
+                  )}
+                </li>
+              ))}
             </ul>
 
             <p data-testid="delete-total" className="text-sm font-medium tabular-nums">
@@ -405,11 +450,10 @@ interface ReportProps {
   result: BatchResult;
   titleId: string;
   onClose: () => void;
-  onShowInTrash?: () => void;
 }
 
 /** What a batch that ran did — including the two things it may have to admit afterwards. */
-function Report({ result, titleId, onClose, onShowInTrash }: ReportProps) {
+function Report({ result, titleId, onClose }: ReportProps) {
   const { outcome, recorded, treeStale } = result;
   const failed = failedLines(outcome.entries);
   const skipped = skippedLines(outcome.entries);
@@ -427,7 +471,12 @@ function Report({ result, titleId, onClose, onShowInTrash }: ReportProps) {
         {moved ? `Moved ${items} to the Trash · ${freed}` : `Deleted ${items} · ${freed}`}
       </h2>
 
-      <div className="flex max-h-60 flex-col gap-3 overflow-y-auto">
+      <div
+        tabIndex={0}
+        role="group"
+        aria-label="What the batch did"
+        className={`flex flex-col gap-3 ${SCROLLER_CLASS} focus-visible:outline-2 focus-visible:outline-blue-500`}
+      >
         <EntryLines
           lines={failed}
           title="Could not be deleted"
@@ -448,10 +497,7 @@ function Report({ result, titleId, onClose, onShowInTrash }: ReportProps) {
         </p>
       )}
 
-      <div className="flex justify-end gap-2">
-        {moved && onShowInTrash !== undefined && (
-          <Button onClick={onShowInTrash}>Show in Trash</Button>
-        )}
+      <div className="flex justify-end">
         <Button data-initial-focus="" variant="primary" onClick={onClose}>
           Close
         </Button>

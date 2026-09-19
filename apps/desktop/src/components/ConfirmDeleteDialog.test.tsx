@@ -12,6 +12,7 @@ import {
   type Preview,
   type PreviewEntry,
 } from '../lib/ipc';
+import { tabStops } from '../lib/focusTrap';
 import ConfirmDeleteDialog, { type BatchStatus } from './ConfirmDeleteDialog';
 
 // The mock cannot stage a failure, an unreadable entry, a changed kind, `recorded: false`
@@ -83,25 +84,31 @@ function batch(entries: EntryOutcome[], options: BatchOptions = {}): BatchResult
 
 interface ShowOptions {
   status?: BatchStatus;
+  initialMode?: DeletionMode;
   onConfirm?: (mode: DeletionMode) => void;
   onClose?: () => void;
-  onShowInTrash?: () => void;
-}
-
-function show(preview: DialogPreview, options: ShowOptions = {}) {
-  const { status = { phase: 'asking' }, onConfirm = noop, onClose = noop } = options;
-  return render(
-    <ConfirmDeleteDialog
-      preview={preview}
-      status={status}
-      onConfirm={onConfirm}
-      onClose={onClose}
-      onShowInTrash={options.onShowInTrash}
-    />,
-  );
 }
 
 const noop = () => undefined;
+
+/** Renders the dialog, and can put it through a phase change without remounting it. */
+function show(preview: DialogPreview, options: ShowOptions = {}) {
+  const { status = { phase: 'asking' }, onConfirm = noop, onClose = noop, initialMode } = options;
+  const dialogFor = (phase: BatchStatus) => (
+    <ConfirmDeleteDialog
+      preview={preview}
+      status={phase}
+      initialMode={initialMode}
+      onConfirm={onConfirm}
+      onClose={onClose}
+    />
+  );
+  const view = render(dialogFor(status));
+  return {
+    ...view,
+    setStatus: (next: BatchStatus) => view.rerender(dialogFor(next)),
+  };
+}
 
 function dialog(): HTMLElement {
   return screen.getByRole('dialog');
@@ -111,12 +118,30 @@ function entryItems(): HTMLElement[] {
   return within(screen.getByTestId('delete-entries')).getAllByRole('listitem');
 }
 
+/** The path each row shows, in the order the dialog lists them. */
+function shownPaths(): string[] {
+  return entryItems().map((item) => item.querySelector('[title]')?.textContent ?? '');
+}
+
 function itemFor(path: string): HTMLElement {
   const item = entryItems().find((candidate) => within(candidate).queryByText(path) !== null);
   if (item === undefined) {
-    throw new Error(`no entry for ${path}; entries: ${entryItems().map((e) => e.textContent)}`);
+    throw new Error(`no entry for ${path}; entries: ${shownPaths().join(', ')}`);
   }
   return item;
+}
+
+/**
+ * The dialog's tab ring, named so a test can read it: a radio by the mode it selects, the
+ * acknowledgement as "checkbox", everything else by its label or its words.
+ */
+function ring(): string[] {
+  return tabStops(dialog()).map((element) => {
+    if (element instanceof HTMLInputElement) {
+      return element.type === 'radio' ? `radio:${element.value}` : 'checkbox';
+    }
+    return element.getAttribute('aria-label') ?? element.textContent ?? '';
+  });
 }
 
 function modeRadio(label: string): HTMLInputElement {
@@ -131,6 +156,10 @@ function confirmButton(): HTMLButtonElement {
   return screen.getByTestId<HTMLButtonElement>('confirm-delete');
 }
 
+function cancelButton(): HTMLElement {
+  return screen.getByRole('button', { name: 'Cancel' });
+}
+
 function selectMode(label: string): void {
   fireEvent.click(modeRadio(label));
 }
@@ -139,6 +168,7 @@ describe('ConfirmDeleteDialog', () => {
   it('is a modal dialog named by its own heading', () => {
     show(TWO_READY);
     expect(dialog()).toHaveAttribute('aria-modal', 'true');
+    expect(dialog()).toHaveAttribute('aria-busy', 'false');
     expect(dialog()).toHaveAccessibleName('Move 2 items to the Trash?');
   });
 
@@ -147,11 +177,24 @@ describe('ConfirmDeleteDialog', () => {
     // the last screen before an irreversible action: a list of bare names would not say
     // which of the two is about to go.
     show(previewOf([ready(`${ROOT}/Downloads`, 1e9), ready(`${ROOT}/src/Downloads`, 2e9)]));
-    const shown = entryItems().map((item) => item.textContent);
-    expect(shown).toHaveLength(2);
-    expect(shown[0]).toContain(`${ROOT}/Downloads`);
-    expect(shown[1]).toContain(`${ROOT}/src/Downloads`);
-    expect(shown[1]).not.toContain(`${ROOT}/Downloads `);
+    expect(shownPaths()).toEqual([`${ROOT}/Downloads`, `${ROOT}/src/Downloads`]);
+  });
+
+  it('lists an exact duplicate twice, the way the backend reports it', () => {
+    // Selecting one row twice reaches the guards as two entries, the second blocked as
+    // `nested` (`engine.rs`). Keyed by path, React would drop one of the two rows of the
+    // batch the user is confirming — and say so only in a console warning.
+    const errors: unknown[][] = [];
+    const console_error = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      errors.push(args);
+    });
+    show(previewOf([ready(`${ROOT}/src`, 1e9), blocked(`${ROOT}/src`, 'nested', 1e9)]));
+    console_error.mockRestore();
+
+    expect(shownPaths()).toEqual([`${ROOT}/src`, `${ROOT}/src`]);
+    expect(entryItems()[0]).toHaveAttribute('data-state', 'ready');
+    expect(entryItems()[1]).toHaveAttribute('data-state', 'blocked');
+    expect(JSON.stringify(errors)).not.toContain('same key');
   });
 
   it('shows every entry with its size formatted the way the table formats one', () => {
@@ -173,13 +216,29 @@ describe('ConfirmDeleteDialog', () => {
     expect(keeper).not.toHaveClass('text-muted');
   });
 
-  it('has words for all eight block reasons', () => {
+  it('says each of the eight block reasons in its own words', () => {
+    // Pinned pairwise, and not by a shape a permutation would also satisfy. The pair the
+    // backend most insists on is `missing` against `unreadable` (`ipc.ts`): one sends the
+    // user hunting for a file that is gone, the other to grant Full Disk Access.
+    const words: Record<BlockReason, string> = {
+      outsideRoots: 'Outside the folder that was scanned',
+      denylisted: 'Inside a folder this app never deletes from',
+      malformed: 'Not a path that names an entry',
+      isRoot: 'The scanned folder itself, or one above it',
+      nested: 'Another entry contains it',
+      missing: 'Nothing is there any more',
+      unreadable: 'Cannot be read — it may need Full Disk Access',
+      kindChanged: 'No longer what the preview saw',
+    };
+    // A ninth reason mirrored into `ipc.ts` has to arrive here too, rather than falling
+    // through to the unknown-variant line that exists for older builds in the wild.
+    expect(Object.keys(words).sort()).toEqual([...BLOCK_REASONS].sort());
+
     for (const reason of BLOCK_REASONS) {
       const { unmount } = show(previewOf([blocked(`${ROOT}/thing`, reason)]));
-      const label = within(itemFor(`${ROOT}/thing`)).getByTestId('block-reason').textContent ?? '';
-      // Not the wire name, not empty, and a sentence rather than a word.
-      expect(label).not.toBe(reason);
-      expect(label.length).toBeGreaterThan(8);
+      expect(within(itemFor(`${ROOT}/thing`)).getByTestId('block-reason')).toHaveTextContent(
+        words[reason],
+      );
       unmount();
     }
   });
@@ -224,6 +283,21 @@ describe('ConfirmDeleteDialog', () => {
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
   });
 
+  it('opens on the mode the caller asked for, still behind the acknowledgement', () => {
+    // The action bar has a "Delete permanently" entry point of its own; a dialog that
+    // opened on the Trash would be answering a question nobody asked. Safety is unchanged.
+    const confirmed = vi.fn<(mode: DeletionMode) => void>();
+    show(TWO_READY, { initialMode: 'permanent', onConfirm: confirmed });
+    expect(dialog()).toHaveAccessibleName('Delete 2 items permanently?');
+    expect(modeRadio('Permanent')).toBeChecked();
+    expect(understandBox()).not.toBeChecked();
+    expect(confirmButton()).toBeDisabled();
+
+    fireEvent.click(understandBox());
+    fireEvent.click(confirmButton());
+    expect(confirmed).toHaveBeenCalledExactlyOnceWith('permanent');
+  });
+
   it('holds the permanent deletion until the user says they understand it', () => {
     const confirmed = vi.fn<(mode: DeletionMode) => void>();
     show(TWO_READY, { onConfirm: confirmed });
@@ -261,13 +335,37 @@ describe('ConfirmDeleteDialog', () => {
     expect(confirmButton()).toBeDisabled();
   });
 
+  it('forgets the acknowledgement when a run that failed brings the question back', () => {
+    // The same rule as the mode toggle's, for the same reason: a tick belongs to the batch
+    // it was given for. A rejected `action_run` returns to this view, and the button must
+    // not still be armed by an agreement made before a batch that never ran.
+    const view = show(TWO_READY, { initialMode: 'permanent' });
+    fireEvent.click(understandBox());
+    expect(confirmButton()).toBeEnabled();
+
+    view.setStatus({ phase: 'running' });
+    view.setStatus({ phase: 'failed', message: 'another batch is running' });
+    view.setStatus({ phase: 'asking' });
+
+    expect(dialog()).toHaveAccessibleName('Delete 2 items permanently?');
+    expect(understandBox()).not.toBeChecked();
+    expect(confirmButton()).toBeDisabled();
+  });
+
   it('speaks the selected mode, not the one the preview was computed with', () => {
     // A `Preview` carries the mode it was checked in, and the toggle is local: the guards
-    // never look at the mode, so no verdict here changes with it. The dialog must still
-    // never read that field, or it would explain the Trash over a button armed to delete.
+    // never look at the mode, so no verdict here changes with it. The preview below says
+    // `permanent` while the dialog must open on the Trash — a dialog that seeded itself
+    // from that field, or explained itself from it, would be arming one thing and
+    // describing another.
     const confirmed = vi.fn<(mode: DeletionMode) => void>();
-    const asChecked: Preview = { ...TWO_READY, mode: 'trash' };
+    const asChecked: Preview = { ...TWO_READY, mode: 'permanent' };
     show(asChecked, { onConfirm: confirmed });
+
+    expect(modeRadio('Trash')).toBeChecked();
+    expect(dialog()).toHaveAccessibleName('Move 2 items to the Trash?');
+    expect(screen.getByTestId('mode-explanation')).toHaveTextContent('Space is freed when you');
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
 
     selectMode('Permanent');
     fireEvent.click(understandBox());
@@ -284,10 +382,10 @@ describe('ConfirmDeleteDialog', () => {
     expect(confirmed).toHaveBeenCalledExactlyOnceWith('trash');
   });
 
-  it('refuses a batch in which nothing can be deleted', () => {
+  it('refuses a batch in which nothing can be deleted, and promises no bytes back', () => {
     show(previewOf([blocked(`${ROOT}/Library`, 'denylisted'), blocked('/', 'malformed')]));
     expect(confirmButton()).toBeDisabled();
-    expect(screen.getByTestId('delete-total')).toHaveTextContent('0 items');
+    expect(screen.getByTestId('delete-total')).toHaveTextContent('0 items · 0 B · 2 blocked');
   });
 
   it('cancels on the button and on Escape', () => {
@@ -296,16 +394,37 @@ describe('ConfirmDeleteDialog', () => {
     fireEvent.keyDown(dialog(), { key: 'Escape' });
     expect(closed).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(cancelButton());
     expect(closed).toHaveBeenCalledTimes(2);
+  });
+
+  it('is not dismissed by a click beside the panel, and still hears Escape afterwards', () => {
+    const closed = vi.fn();
+    show(TWO_READY, { onClose: closed });
+    fireEvent.click(screen.getByTestId('delete-backdrop'));
+    expect(closed).not.toHaveBeenCalled();
+    expect(dialog()).toBeInTheDocument();
+
+    // jsdom does not move the focus on a click; a real click on the backdrop blurs to the
+    // body, which is what makes this worth testing — a listener on the panel would never
+    // hear another key.
+    (document.activeElement as HTMLElement | null)?.blur();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(closed).toHaveBeenCalledTimes(1);
   });
 
   it('disables every control while the batch runs and says that it is running', () => {
     show(TWO_READY, { status: { phase: 'running' } });
+    expect(dialog()).toHaveAttribute('aria-busy', 'true');
     expect(screen.getByRole('status')).toHaveTextContent('Moving to the Trash…');
     expect(confirmButton()).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    expect(cancelButton()).toBeDisabled();
     expect(modeRadio('Permanent')).toBeDisabled();
+  });
+
+  it('says which kind of deletion is running', () => {
+    show(TWO_READY, { initialMode: 'permanent', status: { phase: 'running' } });
+    expect(screen.getByRole('status')).toHaveTextContent('Deleting…');
   });
 
   it('ignores Escape while the batch runs, so its report cannot be lost', () => {
@@ -344,32 +463,108 @@ describe('ConfirmDeleteDialog', () => {
     trigger.focus();
     fireEvent.click(trigger);
 
-    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    expect(cancelButton()).toHaveFocus();
     fireEvent.keyDown(dialog(), { key: 'Escape' });
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
   });
 
+  it('moves the focus with the phase, and never leaves it on the page behind', () => {
+    const view = show(TWO_READY);
+    expect(cancelButton()).toHaveFocus();
+
+    // Every control is disabled now, and the button that had the focus is one of them: a
+    // browser drops the focus to the body, from where Tab walks into the Explorer.
+    view.setStatus({ phase: 'running' });
+    expect(dialog()).toHaveFocus();
+
+    view.setStatus({ phase: 'done', result: batch([]) });
+    expect(screen.getByRole('button', { name: 'Close' })).toHaveFocus();
+  });
+
   it('keeps Tab inside itself', () => {
     show(TWO_READY);
-    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    const list = screen.getByTestId('delete-entries');
     const confirm = confirmButton();
 
     confirm.focus();
-    // jsdom moves no focus on a Tab of its own: what is measured here is the boundary
-    // handler — the preventDefault and the focus call that the browser's own Tab would
-    // otherwise carry out of the dialog.
+    // jsdom performs no Tab of its own — `fireEvent` dispatches the key and nothing else —
+    // so what is measured here is the boundary handler: the preventDefault and the focus
+    // call that stand in for the step a browser would otherwise take out of the dialog.
     expect(fireEvent.keyDown(confirm, { key: 'Tab' })).toBe(false);
-    expect(modeRadio('Trash')).toHaveFocus();
+    expect(list).toHaveFocus();
 
-    expect(fireEvent.keyDown(modeRadio('Trash'), { key: 'Tab', shiftKey: true })).toBe(false);
+    expect(fireEvent.keyDown(list, { key: 'Tab', shiftKey: true })).toBe(false);
     expect(confirm).toHaveFocus();
 
     // A Tab in the middle belongs to the browser: the dialog neither stops it nor moves
     // the focus itself.
-    cancel.focus();
-    expect(fireEvent.keyDown(cancel, { key: 'Tab' })).toBe(true);
-    expect(cancel).toHaveFocus();
+    cancelButton().focus();
+    expect(fireEvent.keyDown(cancelButton(), { key: 'Tab' })).toBe(true);
+    expect(cancelButton()).toHaveFocus();
+  });
+
+  it('keeps Tab inside itself while the batch runs, from the panel that holds the focus', () => {
+    // The phase where modality matters most is the one where every control is disabled.
+    // The list of entries stays reachable — a user may still want to read what is going —
+    // and the focus sits on the panel, from where a browser would step backwards into the
+    // page behind the overlay.
+    show(TWO_READY, { status: { phase: 'running' } });
+    expect(ring()).toEqual(['Entries to delete']);
+    expect(dialog()).toHaveFocus();
+
+    const list = screen.getByTestId('delete-entries');
+    expect(fireEvent.keyDown(dialog(), { key: 'Tab' })).toBe(false);
+    expect(list).toHaveFocus();
+
+    // One stop is both ends of the ring: Tab and Shift+Tab both come back to it.
+    expect(fireEvent.keyDown(list, { key: 'Tab', shiftKey: true })).toBe(false);
+    expect(list).toHaveFocus();
+  });
+
+  it('takes Shift+Tab back from the panel too', () => {
+    show(TWO_READY, { status: { phase: 'running' } });
+    expect(dialog()).toHaveFocus();
+    expect(fireEvent.keyDown(dialog(), { key: 'Tab', shiftKey: true })).toBe(false);
+    expect(screen.getByTestId('delete-entries')).toHaveFocus();
+  });
+
+  it('takes Tab back when the focus has fallen out of the dialog', () => {
+    show(TWO_READY);
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(fireEvent.keyDown(document.body, { key: 'Tab' })).toBe(false);
+    expect(dialog()).toHaveFocus();
+  });
+
+  it('counts a radio group as the one stop the browser stops at, and skips disabled buttons', () => {
+    // The ring is asserted rather than tabbed through: jsdom moves no focus on Tab, so the
+    // membership and the order of the two ends cannot be seen from the outside. An
+    // unchecked radio is not a tab stop — a boundary taken from one lets Shift+Tab step
+    // backwards out of the dialog — and neither is a button that is disabled.
+    show(TWO_READY);
+    expect(ring()).toEqual(['Entries to delete', 'radio:trash', 'Cancel', 'Move to the Trash']);
+
+    selectMode('Permanent');
+    expect(ring()).toEqual(['Entries to delete', 'radio:permanent', 'checkbox', 'Cancel']);
+
+    fireEvent.click(understandBox());
+    expect(ring()).toEqual([
+      'Entries to delete',
+      'radio:permanent',
+      'checkbox',
+      'Cancel',
+      'Delete permanently',
+    ]);
+  });
+
+  it('gives the list of entries a key to scroll it by', () => {
+    // Inside a focus trap there is no other way to reach it, and a batch of two hundred
+    // entries is exactly when a user wants to read to the end before confirming.
+    show(TWO_READY);
+    const list = screen.getByTestId('delete-entries');
+    expect(list).toHaveAttribute('tabindex', '0');
+    expect(list).toHaveAccessibleName('Entries to delete');
+    expect(list).toHaveClass('overflow-y-auto');
   });
 });
 
@@ -396,6 +591,9 @@ describe('ConfirmDeleteDialog, after the batch', () => {
       'Moved 2 items to the Trash · 3.0 GB',
     );
     expect(screen.queryByTestId('delete-total')).not.toBeInTheDocument();
+    // `NsFileManager` may leave no "Put Back" entry, so the app never promises one
+    // (design section 11).
+    expect(screen.queryByText(/Put Back/i)).not.toBeInTheDocument();
   });
 
   it('says what a permanent batch did, in its own words', () => {
@@ -479,29 +677,16 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     expect(screen.queryByTestId('tree-stale')).not.toBeInTheDocument();
   });
 
-  it('offers the Trash folder only for a Trash batch, and only to a caller that can open it', () => {
-    const shown = vi.fn();
-    const trashed = batch([MOVED]);
-    const { unmount } = show(TWO_READY, {
-      status: { phase: 'done', result: trashed },
-      onShowInTrash: shown,
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Show in Trash' }));
-    expect(shown).toHaveBeenCalledTimes(1);
-    // The Trash folder, never a single entry: `move_to_trash` returns no post-move URL.
-    expect(screen.queryByText(/Put Back/i)).not.toBeInTheDocument();
-    unmount();
-
-    // A caller with no way to resolve the Trash gets no button that lies about opening it.
-    const { unmount: second } = show(TWO_READY, { status: { phase: 'done', result: trashed } });
-    expect(screen.queryByRole('button', { name: 'Show in Trash' })).not.toBeInTheDocument();
-    second();
-
+  it('gives the report a key to scroll it by', () => {
     show(TWO_READY, {
-      status: { phase: 'done', result: batch([MOVED], { mode: 'permanent' }) },
-      onShowInTrash: shown,
+      status: {
+        phase: 'done',
+        result: batch([outcomeEntry(`${ROOT}/Movies`, { result: 'failed', message: 'denied' })]),
+      },
     });
-    expect(screen.queryByRole('button', { name: 'Show in Trash' })).not.toBeInTheDocument();
+    const report = screen.getByRole('group', { name: 'What the batch did' });
+    expect(report).toHaveAttribute('tabindex', '0');
+    expect(report).toHaveClass('overflow-y-auto');
   });
 
   it('closes the result view on Escape and on its button', () => {
