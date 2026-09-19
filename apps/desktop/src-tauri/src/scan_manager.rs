@@ -250,6 +250,12 @@ impl ScanManager {
         let mut ids: Vec<NodeId> = paths
             .iter()
             .filter_map(|path| result.tree.find(path))
+            // The root is not patchable — an arena without one is not a tree — and
+            // `replace_subtrees` drops such a patch. Dropping it here instead is what keeps
+            // that from costing a full rescan of the scan root first, which is the
+            // 25-second walk this whole mechanism exists to avoid. No batch can produce it:
+            // the guards refuse the root before anything is touched.
+            .filter(|&id| id != Tree::ROOT)
             .collect();
         // One rescan per node: the same directory can arrive twice under two spellings.
         ids.sort_unstable();
@@ -1090,6 +1096,21 @@ mod tests {
             generation,
             "an empty batch of patches is not a splice"
         );
+    }
+
+    /// The root is the one node a splice cannot replace, so a patch naming it is dropped
+    /// before the rescan rather than after: after would mean walking the whole scan root —
+    /// the 25-second rescan the patching exists to avoid — and then throwing the result away.
+    #[test]
+    fn patching_the_scan_root_is_not_a_patch() {
+        let (manager, fixture, _data) = scanned_fixture();
+        let generation = manager.lock().generation;
+        let before = root_children(&manager);
+
+        manager.patch_paths(&[fixture.path().to_path_buf()]);
+
+        assert_eq!(root_children(&manager), before);
+        assert_eq!(manager.lock().generation, generation);
     }
 
     #[test]
