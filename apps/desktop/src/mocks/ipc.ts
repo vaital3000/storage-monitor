@@ -18,6 +18,7 @@ import {
   fixtureNodeView,
   fixtureNodes,
   fixtureStatusDone,
+  type HeldScan,
   mockActionPreview,
   mockActionRun,
   mockActivityTail,
@@ -206,6 +207,17 @@ function scanCancel(): ScanStatus {
 }
 
 /**
+ * What the window holds, as the guards and the plan see it: the root outlives the tree, so a
+ * batch that arrives while a scan runs is guarded by the root and planned without sizes.
+ */
+function heldScan(): HeldScan {
+  if (status.root === null) {
+    return { held: 'nothing' };
+  }
+  return hasResult ? { held: 'tree', root: status.root } : { held: 'root', root: status.root };
+}
+
+/**
  * A batch, with the totals of the scan brought up to date afterwards.
  *
  * `patched_stats` does the same in the app: the files, the folders and the bytes come from
@@ -213,7 +225,7 @@ function scanCancel(): ScanStatus {
  * it the header would go on claiming the bytes of rows that are gone.
  */
 function runBatch(paths: string[], mode: Mode) {
-  const batch = mockActionRun(paths, mode, status.root);
+  const batch = mockActionRun(paths, mode, heldScan());
   if (hasResult) {
     const patched = fixtureStatusDone();
     status = { ...status, files: patched.files, dirs: patched.dirs, bytes: patched.bytes };
@@ -256,7 +268,7 @@ const handle: IpcHandler = (cmd, args) => {
         : [];
     case 'action_preview': {
       const { paths, mode } = batchArguments(args, cmd);
-      return mockActionPreview(paths, mode, status.root);
+      return mockActionPreview(paths, mode, heldScan());
     }
     case 'action_run': {
       const { paths, mode } = batchArguments(args, cmd);

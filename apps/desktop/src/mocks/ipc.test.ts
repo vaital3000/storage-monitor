@@ -259,20 +259,23 @@ describe('the deletion commands', () => {
     await expect(treeNode()).rejects.toBe('no scan result');
     const movies = fixtureNode('Movies');
     const preview = await actionPreview([movies.path], 'trash');
+    // No root and no tree: the guards refuse the path, and the plan behind it is empty —
+    // `with_result` has nothing to read the kind and the size from.
     expect(preview.entries).toEqual([
       {
         path: movies.path,
-        kind: 'dir',
-        size: movies.size,
+        kind: 'other',
+        size: 0,
         status: { state: 'blocked', reason: 'outsideRoots' },
       },
     ]);
     expect(preview.totalBytes).toBe(0);
     const idle = await scanStatus();
     const batch = await actionRun([movies.path], 'trash');
-    expect(batch.outcome.entries[0].result).toEqual({
-      result: 'skipped',
-      reason: 'outsideRoots',
+    expect(batch.outcome.entries[0]).toEqual({
+      path: movies.path,
+      kind: 'other',
+      result: { result: 'skipped', reason: 'outsideRoots' },
     });
     expect(batch.outcome.freedBytes).toBe(0);
     // A batch that deleted nothing has no totals to bring up to date, and an idle window
@@ -283,6 +286,33 @@ describe('the deletion commands', () => {
       entries: [expect.objectContaining({ result: 'skipped', detail: 'outsideRoots' })],
       damaged: 0,
     });
+  });
+
+  it('guard a batch that arrives while a scan runs, without sizes for it', async () => {
+    // The browser pace keeps the scan in flight for the length of the test; `start` clears
+    // the tree and keeps the root, and the mock answers from that state as the manager does.
+    setMockScanDelay(50);
+    const movies = fixtureNode('Movies');
+    expect((await scanStart()).state).toBe('running');
+    await expect(treeNode()).rejects.toBe('no scan result');
+
+    const preview = await actionPreview([movies.path, `${FIXTURE_ROOT}/Library`], 'trash');
+    expect(preview.entries).toEqual([
+      { path: movies.path, kind: 'dir', size: 0, status: { state: 'ready' } },
+      {
+        path: `${FIXTURE_ROOT}/Library`,
+        kind: 'other',
+        size: 0,
+        status: { state: 'blocked', reason: 'denylisted' },
+      },
+    ]);
+    expect(preview.totalBytes).toBe(0);
+
+    const batch = await actionRun([movies.path], 'trash');
+    expect(batch.outcome.entries[0].result).toEqual({ result: 'removed', bytes: 0 });
+    expect(batch.outcome.freedBytes).toBe(0);
+    // Nothing to bring up to date either: the totals of a running scan are the walker's.
+    expect((await scanStatus()).state).toBe('running');
   });
 
   it('reject arguments that are not a list of paths and a mode', async () => {

@@ -10,6 +10,7 @@ import {
   fixtureNodeView,
   fixtureNodes,
   fixtureStatusDone,
+  type HeldScan,
   mockActionLog,
   mockActionPreview,
   mockActionRun,
@@ -262,11 +263,17 @@ describe('fixtureDisk and fixtureStatusDone', () => {
 /** An absolute path under the fixture root, for entries the fixture does not have. */
 const at = (relative: string) => `${FIXTURE_ROOT}/${relative}`;
 
-const preview = (paths: string[], root: string | null = FIXTURE_ROOT) =>
-  mockActionPreview(paths, 'trash', root);
+/** The window after a finished scan of the fixture: a root and the tree that came with it. */
+const scanned = (root: string = FIXTURE_ROOT): HeldScan => ({ held: 'tree', root });
+/** A scan of the fixture root in flight: the root is set and the tree is gone. */
+const scanning = (root: string = FIXTURE_ROOT): HeldScan => ({ held: 'root', root });
+const unscanned: HeldScan = { held: 'nothing' };
 
-const run = (paths: string[], mode: Mode = 'trash', root: string | null = FIXTURE_ROOT) =>
-  mockActionRun(paths, mode, root);
+const preview = (paths: string[], scan: HeldScan = scanned()) =>
+  mockActionPreview(paths, 'trash', scan);
+
+const run = (paths: string[], mode: Mode = 'trash', scan: HeldScan = scanned()) =>
+  mockActionRun(paths, mode, scan);
 
 const blocked = (reason: BlockReason) => ({ state: 'blocked', reason });
 
@@ -285,8 +292,8 @@ describe('mockActionPreview', () => {
   });
 
   it('carries the mode it was asked about', () => {
-    expect(mockActionPreview([], 'permanent', FIXTURE_ROOT).mode).toBe('permanent');
-    expect(mockActionPreview([], 'trash', FIXTURE_ROOT)).toEqual({
+    expect(mockActionPreview([], 'permanent', scanned()).mode).toBe('permanent');
+    expect(mockActionPreview([], 'trash', scanned())).toEqual({
       entries: [],
       totalBytes: 0,
       mode: 'trash',
@@ -411,9 +418,9 @@ describe('mockActionPreview', () => {
   it('keeps the denylist under a scan root of the whole volume', () => {
     // `/` is dropped from the denylist as the ancestor of everything — without that every
     // entry of every batch would be refused — and `/Users` then protects the fixture.
-    expect(statuses(preview([fixtureNode('Movies').path, '/System/Library'], '/').entries)).toEqual(
-      [blocked('denylisted'), blocked('denylisted')],
-    );
+    expect(
+      statuses(preview([fixtureNode('Movies').path, '/System/Library'], scanned('/')).entries),
+    ).toEqual([blocked('denylisted'), blocked('denylisted')]);
   });
 
   it('totals the ready entries only', () => {
@@ -428,10 +435,12 @@ describe('mockActionPreview', () => {
 
   it('refuses every entry as outsideRoots when nothing has been scanned', () => {
     const movies = fixtureNode('Movies');
-    const result = preview([movies.path, at('nope')], null);
+    const result = preview([movies.path, at('nope')], unscanned);
+    // No tree, so no kind and no size for any of them: `refused_preview` copies both from a
+    // plan that `with_result` never filled in.
     expect(result).toEqual({
       entries: [
-        { path: movies.path, kind: 'dir', size: movies.size, status: blocked('outsideRoots') },
+        { path: movies.path, kind: 'other', size: 0, status: blocked('outsideRoots') },
         { path: at('nope'), kind: 'other', size: 0, status: blocked('outsideRoots') },
       ],
       totalBytes: 0,
@@ -439,10 +448,52 @@ describe('mockActionPreview', () => {
     });
   });
 
-  it('blocks the fixture against a scan root of its own elsewhere', () => {
-    expect(statuses(preview([fixtureNode('Movies').path], '/Volumes/Backup').entries)).toEqual([
-      blocked('outsideRoots'),
+  it('guards a batch that arrives while a scan runs, and promises it no bytes', () => {
+    const movies = fixtureNode('Movies');
+    const result = preview([movies.path, fixtureNode('Library').path, at('nope')], scanning());
+    // The root outlives the tree, so the rules are the same ones; the sizes are not there to
+    // be had, and a dialog in this state names no bytes it cannot account for.
+    expect(result.entries).toEqual([
+      { path: movies.path, kind: 'dir', size: 0, status: { state: 'ready' } },
+      { path: fixtureNode('Library').path, kind: 'other', size: 0, status: blocked('denylisted') },
+      { path: at('nope'), kind: 'other', size: 0, status: blocked('missing') },
     ]);
+    expect(result.totalBytes).toBe(0);
+    // The kind of a ready entry still comes from the disk, which no scan state hides.
+    expect(result.entries[0].kind).toBe('dir');
+  });
+
+  it('blocks the fixture against a scan root of its own elsewhere', () => {
+    const result = preview([fixtureNode('Movies').path], scanned('/Volumes/Backup'));
+    // Blocked, and with nothing to say about the entry: the tree of another root cannot
+    // contain this path, whatever the fixture happens to hold.
+    expect(result.entries).toEqual([
+      {
+        path: fixtureNode('Movies').path,
+        kind: 'other',
+        size: 0,
+        status: blocked('outsideRoots'),
+      },
+    ]);
+  });
+
+  it('reads the plan under the spellings Tree::find accepts, and no others', () => {
+    const movies = fixtureNode('Movies');
+    // `.` is noise to `Path::components`, so this is the same node with the same size.
+    expect(preview([at('./Movies')]).entries[0]).toEqual({
+      path: movies.path,
+      kind: 'dir',
+      size: movies.size,
+      status: { state: 'ready' },
+    });
+    // `..` is a component of its own and matches no child: the tree has no entry so spelled,
+    // and the guards still resolve it for the deletion itself.
+    expect(preview([at('Downloads/../Movies')]).entries[0]).toEqual({
+      path: movies.path,
+      kind: 'dir',
+      size: 0,
+      status: { state: 'ready' },
+    });
   });
 
   it('touches nothing: two previews of one path agree', () => {
@@ -563,9 +614,9 @@ describe('mockActionRun', () => {
   it('refuses everything and deletes nothing when nothing has been scanned', () => {
     const movies = fixtureNode('Movies');
     const before = fixtureNodes[0].size;
-    const result = run([movies.path], 'trash', null);
+    const result = run([movies.path], 'trash', unscanned);
     expect(result.outcome.entries).toEqual([
-      { path: movies.path, kind: 'dir', result: { result: 'skipped', reason: 'outsideRoots' } },
+      { path: movies.path, kind: 'other', result: { result: 'skipped', reason: 'outsideRoots' } },
     ]);
     expect(result.outcome.freedBytes).toBe(0);
     expect(fixtureNodes[0].size).toBe(before);
@@ -671,6 +722,7 @@ describe('mockActivityTail', () => {
     delete withoutPath.path;
     // Every line below is that entry with a single field spoiled: a reader that stopped
     // checking any one of them would take that line for an entry of the user's history.
+    // The three at the end are the ones a `u64` and a `DateTime<Utc>` refuse.
     const spoiled = [
       { ...entry, at: 12 },
       withoutPath,
@@ -679,6 +731,9 @@ describe('mockActivityTail', () => {
       { ...entry, result: 'deleted' },
       { ...entry, detail: 7 },
       { ...entry, bytes: '12' },
+      { ...entry, at: 'not a date' },
+      { ...entry, bytes: -1 },
+      { ...entry, bytes: 1.5 },
     ];
     mockActionLog.push(
       JSON.stringify(entry),
@@ -695,6 +750,54 @@ describe('mockActivityTail', () => {
     const tail = mockActivityTail(20);
     expect(tail.entries).toEqual([entry]);
     expect(tail.damaged).toBe(4 + spoiled.length);
+  });
+
+  it('reads the lines serde reads: no detail is null, and an unknown field is ignored', () => {
+    // How a test of a later task writes a `failed` row by hand. `LogEntry::detail` is an
+    // `Option<String>`, which serde fills in when the key is absent, so a line without it is
+    // an ordinary entry in the app and must be one here.
+    mockActionLog.push(
+      JSON.stringify({
+        at: '2026-09-18T09:30:00Z',
+        path: at('a'),
+        kind: 'dir',
+        mode: 'permanent',
+        result: 'removed',
+        bytes: 12,
+      }),
+      JSON.stringify({
+        at: '2026-09-18T09:31:00Z',
+        path: at('b'),
+        kind: 'file',
+        mode: 'trash',
+        result: 'failed',
+        detail: 'cannot move to the Trash',
+        bytes: 0,
+        future: 'a field this version does not know',
+      }),
+    );
+    const tail = mockActivityTail(10);
+    expect(tail.damaged).toBe(0);
+    expect(tail.entries).toEqual([
+      {
+        at: '2026-09-18T09:31:00Z',
+        path: at('b'),
+        kind: 'file',
+        mode: 'trash',
+        result: 'failed',
+        detail: 'cannot move to the Trash',
+        bytes: 0,
+      },
+      {
+        at: '2026-09-18T09:30:00Z',
+        path: at('a'),
+        kind: 'dir',
+        mode: 'permanent',
+        result: 'removed',
+        detail: null,
+        bytes: 12,
+      },
+    ]);
   });
 });
 

@@ -15,6 +15,7 @@ import type {
   Delta,
   DiskUsage,
   EntryOutcome,
+  LogResult,
   LogTail,
   Mode,
   NodeId,
@@ -503,32 +504,60 @@ function checkPath(path: string, root: string): { judged: string } | { reason: B
 }
 
 /**
+ * What the window holds when a batch arrives — which is two questions, not one, because the
+ * backend asks two different seams: `ScanManager::root` decides the guards, and
+ * `with_result` decides whether the plan can carry a kind and a size at all.
+ *
+ * The states are the ones `limits_of` documents. A scan that is **running**, and one that
+ * **failed**, hold a root and no tree: `start` clears the result and keeps the root. The
+ * guards are then exactly the rules the user's choice of root implies, while every entry of
+ * the plan is `(other, 0)` — `with_result` answers `None` and `plan_for` has nothing to read.
+ * A **cancelled** scan installs its partial tree like a finished one and is `tree`. A tree
+ * without a root is not representable here, because the manager cannot be in that state.
+ */
+export type HeldScan =
+  { held: 'nothing' } | { held: 'root'; root: string } | { held: 'tree'; root: string };
+
+/**
+ * `Tree::find`: the node the scan recorded, under the spelling the caller sent.
+ *
+ * Two rules of it are visible from here. The tree describes its own root, so a path outside
+ * that root is not in it whatever else exists — `find` strips the root's path first. And
+ * `Path::components` treats `.` and `//` as noise while a `..` is a component of its own
+ * that matches no child, so `a/b/.` names the same node as `a/b` and `a/x/../b` names none.
+ */
+function treeFind(path: string, root: string): FixtureNode | undefined {
+  const spelled = `/${componentsOf(path).join('/')}`;
+  return isAtOrUnder(spelled, root) ? byPath.get(spelled) : undefined;
+}
+
+/**
  * `preview_batch`: every path against the guards and the fixture, with nothing touched.
  *
- * `root` is the scan root the window holds; `null` is the state where nothing has been
- * scanned, which `refused_preview` answers by blocking every entry as `outsideRoots` —
- * nothing is inside a root that does not exist.
+ * With no scan root — nothing scanned at all — `refused_preview` blocks every entry as
+ * `outsideRoots`, because nothing is inside a root that does not exist. It copies the kind
+ * and the size from the plan, which in that state has neither.
  */
-export function mockActionPreview(
-  paths: readonly string[],
-  mode: Mode,
-  root: string | null,
-): Preview {
+export function mockActionPreview(paths: readonly string[], mode: Mode, scan: HeldScan): Preview {
   const entries: PreviewEntry[] = [];
   /** Where each still-ready entry sits, and the form the batch comparison needs. */
   const ready: Array<{ index: number; judged: string }> = [];
   for (const path of paths) {
-    // `plan_for`: the kind and the size come from the tree, under the spelling the caller
-    // sent, which is the spelling the scan recorded. A path it does not know carries neither.
-    const planned = byPath.get(path);
+    // `plan_for`: the kind and the size come from the tree the window holds. Without one —
+    // while a scan runs, or after a failed one — every entry of the plan is `(other, 0)`,
+    // and the dialog promises no bytes it cannot name.
+    const planned = scan.held === 'tree' ? treeFind(path, scan.root) : undefined;
     const kind = planned?.kind ?? 'other';
     const size = planned?.size ?? 0;
-    const checked = root === null ? { reason: 'outsideRoots' as const } : checkPath(path, root);
+    const checked =
+      scan.held === 'nothing' ? { reason: 'outsideRoots' as const } : checkPath(path, scan.root);
     if ('reason' in checked) {
       // Without a normalized path, the only honest thing to show is what was asked for.
       entries.push({ path, kind, size, status: { state: 'blocked', reason: checked.reason } });
       continue;
     }
+    // The disk, not the tree: `check_entry` stats the entry whatever the window holds. The
+    // fixture is both here, so an entry the scan could not list does not exist here either.
     const onDisk = byPath.get(checked.judged);
     if (onDisk === undefined) {
       const status = { state: 'blocked', reason: 'missing' } as const;
@@ -565,12 +594,8 @@ export function mockActionPreview(
  * no log that can fail to be written and no patch that can be dropped, so a batch that got
  * this far did all three.
  */
-export function mockActionRun(
-  paths: readonly string[],
-  mode: Mode,
-  root: string | null,
-): BatchResult {
-  const preview = mockActionPreview(paths, mode, root);
+export function mockActionRun(paths: readonly string[], mode: Mode, scan: HeldScan): BatchResult {
+  const preview = mockActionPreview(paths, mode, scan);
   // One instant for the whole batch, read before the first deletion.
   const at = new Date().toISOString();
   const entries: EntryOutcome[] = [];
@@ -656,7 +681,17 @@ const RESULTS: readonly string[] = ['removed', 'failed', 'skipped'];
 const oneOf = (field: unknown, names: readonly string[]) =>
   typeof field === 'string' && names.includes(field);
 
-/** One line of the log, or `null` when it is not an entry — which is what serde answers. */
+/**
+ * One line of the log, or `null` when it is not an entry — as far as possible the line serde
+ * refuses, measured against the real `LogEntry` rather than guessed:
+ *
+ * - a **missing `detail`** is an entry with `detail: null`. Every other field is required,
+ *   but `Option<String>` is one serde fills in, and a line written by hand for a test — the
+ *   natural way to get a `failed` row on screen — does not have to carry it;
+ * - an unknown field is ignored, so a line from a later version still reads;
+ * - `at` has to be a timestamp, not any string; `bytes` a whole number that is not negative,
+ *   because the field is a `u64` and serde takes neither `-1` nor `1.5`.
+ */
 function parseLogLine(line: string): ActivityEntry | null {
   let value: unknown;
   try {
@@ -668,15 +703,31 @@ function parseLogLine(line: string): ActivityEntry | null {
     return null;
   }
   const entry = value as Record<string, unknown>;
+  const detail = entry.detail ?? null;
   const complete =
     typeof entry.at === 'string' &&
+    !Number.isNaN(Date.parse(entry.at)) &&
     typeof entry.path === 'string' &&
     oneOf(entry.kind, KINDS) &&
     oneOf(entry.mode, MODES) &&
     oneOf(entry.result, RESULTS) &&
-    (entry.detail === null || typeof entry.detail === 'string') &&
-    typeof entry.bytes === 'number';
-  return complete ? (value as ActivityEntry) : null;
+    (detail === null || typeof detail === 'string') &&
+    typeof entry.bytes === 'number' &&
+    Number.isInteger(entry.bytes) &&
+    entry.bytes >= 0;
+  if (!complete) {
+    return null;
+  }
+  // Field by field, so that an unknown one is dropped the way serde drops it.
+  return {
+    at: entry.at as string,
+    path: entry.path as string,
+    kind: entry.kind as NodeKind,
+    mode: entry.mode as Mode,
+    result: entry.result as LogResult,
+    detail: detail as string | null,
+    bytes: entry.bytes as number,
+  };
 }
 
 /**
