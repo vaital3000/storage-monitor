@@ -281,8 +281,12 @@ const Row = memo(function Row({
   // A 16 px tick is not enough to see a range by, so the row says it in a colour too, and
   // `data-selected` lets a test say it in a value. Neither reaches assistive technology:
   // a row toggled with Space changes a descendant of the focused element and nothing
-  // announces it, which needs a `grid` and `aria-selected` — deferred to the task that
-  // owns the table's role, so that the e2e selectors move once instead of twice.
+  // announces it, which would need a `grid` and `aria-selected`.
+  //
+  // Phase 2a decided not to promote this table (Task 14, and the plan's Task 14 section
+  // says why): `role="grid"` is a contract for one tab stop and cell navigation, and every
+  // row here is a tab stop. Until that changes, what a screen reader hears when a row is
+  // ticked is the page's live count over the action bar, not the row.
   const tone = selected
     ? 'bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/50 dark:hover:bg-blue-900/50'
     : isDir

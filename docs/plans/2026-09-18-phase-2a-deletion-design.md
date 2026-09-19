@@ -271,6 +271,21 @@ checkbox selects everything visible.
 A non-empty selection reveals an action bar above the table: "12 selected ·
 4.3 GB", "Move to Trash", and "Delete permanently" in a danger style.
 
+The table stays an implicit `table` in phase 2a rather than becoming a
+`role="grid"`: the role is a contract for one tab stop and cell navigation, and
+this table gives every row a tab stop. So a ticked row carries no
+`aria-selected`, and the count in the action bar is what announces a selection —
+a `role="status"` region mounted whether or not anything is ticked, with the
+visible copy of the same words `aria-hidden` so they are heard once. Promoting
+the table, with the roving tab stop that has to come with it, is a follow-up.
+
+After a batch the Explorer goes back to the root of the tree. The splice
+rebuilds the arena, and `replace_subtrees` re-sorts the sibling group of every
+ancestor of a deletion, so the id the page was navigating by can name a
+different directory afterwards — refetching it would open one silently. Nothing
+moves for a batch that removed and failed nothing, which is exactly when the
+splice was handed no paths.
+
 The confirmation dialog is our own component (Radix is not a dependency):
 `role="dialog"`, `aria-modal`, a focus trap, Escape closes, and the initial
 focus is on Cancel rather than on the confirming button. Escape has one

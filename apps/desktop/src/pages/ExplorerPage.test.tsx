@@ -485,7 +485,10 @@ describe('ExplorerPage deleting the selection', () => {
 
   it('shows the count and the summed size of the ticked rows, and announces them', async () => {
     await scanned();
-    const announcement = screen.getByTestId('selection-status');
+    // By role, because a live region is what it is: an element that says its content when
+    // the content changes. `data-testid` names it; `role` is what makes it work.
+    const announcement = screen.getByRole('status');
+    expect(announcement).toHaveAttribute('data-testid', 'selection-status');
     expect(announcement.textContent).toBe('');
     expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
 
@@ -583,6 +586,24 @@ describe('ExplorerPage deleting the selection', () => {
 
     release();
     expect(await within(dialog).findByTestId('result-summary')).toBeInTheDocument();
+  });
+
+  it('is ready for the next batch once one is done', async () => {
+    await scanned();
+    const first = await ask(['Downloads'], 'Move to Trash');
+    fireEvent.click(confirmButton(first));
+    await within(first).findByTestId('result-summary');
+    fireEvent.click(within(first).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(names()).not.toContain('Downloads'));
+
+    // The guard that keeps two batches from overlapping is a ref, and a ref nobody puts
+    // back is an app that deletes once and then quietly does nothing for the rest of the
+    // session — with both buttons still enabled.
+    const second = await ask(['Movies'], 'Move to Trash');
+    fireEvent.click(confirmButton(second));
+    await within(second).findByTestId('result-summary');
+    fireEvent.click(within(second).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(names()).not.toContain('Movies'));
   });
 
   it('re-reads the tree and the volume the batch changed', async () => {
