@@ -503,8 +503,13 @@ describe('ExplorerPage deleting the selection', () => {
     expect(announcement).toHaveAttribute('data-testid', 'selection-status');
     expect(announcement.textContent).toBe('');
     expect(barShows()).toBe(false);
-    // Hidden means hidden: a bar nobody can see holds no buttons anyone can reach.
+    // Hidden means hidden: a bar nobody can see holds no buttons anyone can reach, by any
+    // of the three ways there are to reach one — the accessibility tree, the tab order and
+    // a click through whatever is drawn over it.
     expect(screen.queryByRole('button', { name: 'Move to Trash' })).not.toBeInTheDocument();
+    for (const button of within(bar()).getAllByRole('button', { hidden: true })) {
+      expect(button).toBeDisabled();
+    }
 
     const total = fixtureNode('Downloads').size + fixtureNode('Movies').size;
     fireEvent.click(box('Downloads'));
@@ -847,6 +852,27 @@ describe('ExplorerPage deleting the selection', () => {
     expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Movies/family-2025.mov`]);
   });
 
+  it('takes the next directory’s question while the abandoned one is still in flight', async () => {
+    await scanned();
+    // Never released: the abandoned preview is still on the wire for the whole test.
+    holdReply('action_preview');
+    const commands = recordCommands();
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    fireEvent.click(box('family-2025.mov'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // A page that looks idle and ignores the click is worse than a page that looks busy:
+    // the guard belongs to the batch, and a preview left behind must not hold it.
+    expect(commands.filter((cmd) => cmd === 'action_preview')).toHaveLength(2);
+    expect(screen.getByTestId('selection-status')).toHaveTextContent(
+      'Checking what would be deleted…',
+    );
+  });
+
   it('goes back to the top from any depth, not one level up', async () => {
     await scanned();
     fireEvent.click(row('Documents'));
@@ -962,9 +988,9 @@ describe('ExplorerPage deleting the selection', () => {
     const commands = recordCommands();
 
     fireEvent.click(confirmButton(dialog));
-    expect(await within(dialog).findByTestId('result-failed')).toHaveTextContent(
-      'Operation not permitted',
-    );
+    // Waited for, not asserted on: what the report says about a failure is the dialog's
+    // own test. What this one is about is the two lines below.
+    await within(dialog).findByTestId('result-failed');
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
 
     await waitFor(() => expect(crumbs()).toEqual(['demo']));
