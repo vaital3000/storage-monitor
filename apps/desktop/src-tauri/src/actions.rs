@@ -11,8 +11,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
 use storage_monitor_core::action::{
-    ActionLog, BlockReason, EntryOutcome, EntryResult, EntryStatus, Limits, Mode, Outcome, Plan,
-    PlanEntry, Preview, PreviewEntry, execute, preview,
+    ActionLog, BlockReason, EntryOutcome, EntryResult, EntryStatus, Limits, LogTail, Mode, Outcome,
+    Plan, PlanEntry, Preview, PreviewEntry, execute, preview,
 };
 use storage_monitor_core::scan::NodeKind;
 use storage_monitor_core::system::System;
@@ -145,6 +145,31 @@ fn stale_after(patched: Result<TreeState, Box<dyn Any + Send>>) -> bool {
             true
         }
     }
+}
+
+/// How many entries the Activity screen is given when it asks for no number of its own.
+const DEFAULT_ACTIVITY_LIMIT: usize = 100;
+
+/// The end of the record for the Activity screen: at most `limit` entries, newest first,
+/// and how many lines of the stretch that was read could not be parsed.
+///
+/// `Err` keeps the meaning it has for a batch — *the thing did not happen* — and the thing
+/// here is the read. It is never "there is nothing to show": flattening a failed read into
+/// an empty list would put *No actions yet* over a log full of the user's deletions, which
+/// is the silent loss [`LogTail::damaged`] exists to prevent, one layer up. So the screen
+/// gets an error it can say out loud, and the two answers that are *not* that stay inside
+/// the `Ok`, because there the read did happen:
+///
+/// - no log file at all — nothing has been deleted yet — is an empty tail and no error;
+/// - a line that could not be parsed is one more `damaged` beside the entries around it.
+pub fn activity(log: &ActionLog, limit: Option<usize>) -> Result<LogTail, String> {
+    log.tail(limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT))
+        .map_err(|err| {
+            format!(
+                "cannot read the action log at {}: {err}",
+                log.path().display()
+            )
+        })
 }
 
 /// The batch as the engine takes it.
@@ -621,6 +646,151 @@ mod tests {
             vec!["keep.bin"],
             "and the row that left the tree is the one that was removed"
         );
+    }
+
+    /// One batch of removals in `log`, as a run would have written it.
+    fn record(log: &ActionLog, mode: Mode, paths: &[&str]) {
+        let entries: Vec<EntryOutcome> = paths
+            .iter()
+            .map(|path| EntryOutcome {
+                path: PathBuf::from(path),
+                kind: NodeKind::File,
+                result: EntryResult::Removed { bytes: 1_024 },
+            })
+            .collect();
+        let freed_bytes = 1_024 * entries.len() as u64;
+        log.append(&Outcome {
+            entries,
+            freed_bytes,
+            at: Utc::now(),
+            mode,
+        })
+        .expect("the log is written");
+    }
+
+    fn paths_of(tail: &LogTail) -> Vec<&str> {
+        tail.entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_activity_log_is_the_end_of_the_record_newest_first() {
+        let data = tempfile::tempdir().unwrap();
+        let log = log_in(&data);
+        record(&log, Mode::Trash, &["/h/first"]);
+        record(&log, Mode::Permanent, &["/h/second", "/h/third"]);
+
+        let tail = activity(&log, Some(1)).expect("the log reads");
+        assert_eq!(tail.entries.len(), 1, "the limit is a limit: {tail:?}");
+        let newest = &tail.entries[0];
+        assert_eq!(newest.path, "/h/third");
+        assert_eq!(newest.mode, Mode::Permanent);
+        assert_eq!(newest.result, LogResult::Removed);
+        assert_eq!(newest.bytes, 1_024);
+        assert_eq!(newest.kind, NodeKind::File);
+        assert_eq!(tail.damaged, 0);
+
+        let whole = activity(&log, Some(10)).expect("the log reads");
+        assert_eq!(
+            paths_of(&whole),
+            ["/h/third", "/h/second", "/h/first"],
+            "every line of both batches, in the order the file has them"
+        );
+    }
+
+    /// Nothing has been deleted yet, which is not a failure and has to read as the empty
+    /// screen it is.
+    #[test]
+    fn a_log_that_was_never_written_is_no_actions_and_not_an_error() {
+        let data = tempfile::tempdir().unwrap();
+        let log = log_in(&data);
+        assert!(!log.path().exists(), "nothing has written it");
+        assert_eq!(
+            activity(&log, Some(10)).expect("a log that does not exist yet is not an error"),
+            LogTail::default()
+        );
+    }
+
+    /// The failure this command exists to keep apart from the one above. "No actions yet"
+    /// over a log full of the user's deletions is the silent loss `damaged` was added to
+    /// prevent, one layer up: the read did not happen, so the screen must not draw an empty
+    /// list as though it had.
+    #[test]
+    fn a_log_that_cannot_be_read_is_an_error_and_never_an_empty_list() {
+        let data = tempfile::tempdir().unwrap();
+        // A path that is a directory: every way of reading it fails, for root as well as
+        // for anyone else, so this holds on the CI container too.
+        let log = ActionLog::new(data.path().to_path_buf());
+        let err = activity(&log, Some(10))
+            .expect_err("a read that failed is not a log with nothing in it");
+        assert!(
+            err.contains(&data.path().display().to_string()),
+            "the message names the file: {err}"
+        );
+        assert!(err.contains("action log"), "{err}");
+    }
+
+    /// The other half of that pair: a line that could not be parsed is a warning beside the
+    /// entries that could, not the end of the read.
+    #[test]
+    fn a_damaged_line_comes_back_counted_beside_the_entries_around_it() {
+        let data = tempfile::tempdir().unwrap();
+        let log = log_in(&data);
+        record(&log, Mode::Trash, &["/h/a"]);
+        let written = fs::read_to_string(log.path()).unwrap();
+        fs::write(log.path(), format!("{written}{{ half a line\n")).unwrap();
+        record(&log, Mode::Trash, &["/h/b"]);
+
+        let tail = activity(&log, Some(10)).expect("a damaged line does not fail the read");
+        assert_eq!(paths_of(&tail), ["/h/b", "/h/a"]);
+        assert_eq!(tail.damaged, 1, "the hole is reported, not hidden");
+    }
+
+    #[test]
+    fn the_limit_defaults_to_a_hundred_entries() {
+        let data = tempfile::tempdir().unwrap();
+        let log = log_in(&data);
+        let paths: Vec<String> = (0..101).map(|i| format!("/h/{i:03}")).collect();
+        record(
+            &log,
+            Mode::Trash,
+            &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        let tail = activity(&log, None).expect("the log reads");
+        assert_eq!(tail.entries.len(), 100);
+        assert_eq!(tail.entries[0].path, "/h/100", "newest first");
+        assert_eq!(tail.entries[99].path, "/h/001", "a hundred back");
+        assert!(
+            !paths_of(&tail).contains(&"/h/000"),
+            "and the hundred and first is over the edge"
+        );
+    }
+
+    /// The two halves of the record meet: the batch writes the file and the Activity screen
+    /// reads it, through the one [`ActionLog`] the app manages.
+    #[test]
+    fn a_batch_is_in_the_activity_log_as_soon_as_it_has_run() {
+        let sys = TestSystem::new();
+        let root = sys.root().to_path_buf();
+        write_file(&root.join("cache/blob.bin"), 8_192);
+        let (manager, data) = scanned(&root);
+        let log = log_in(&data);
+        let cache = root.join("cache");
+        let cache_size = child_size(&root_view(&manager), "cache");
+
+        let batch = run_one(&manager, &sys, &log, vec![cache.clone()], Mode::Trash);
+        assert!(batch.recorded, "the batch was recorded");
+
+        let tail = activity(&log, None).expect("the log reads");
+        assert_eq!(tail.entries.len(), 1, "{tail:?}");
+        assert_eq!(tail.entries[0].path, cache.to_string_lossy());
+        assert_eq!(tail.entries[0].result, LogResult::Removed);
+        assert_eq!(tail.entries[0].bytes, cache_size);
+        assert_eq!(tail.entries[0].at, batch.outcome.at);
+        assert_eq!(tail.damaged, 0);
     }
 
     /// The rescan after a batch reports what this app did, not what the disk looks like. An

@@ -24,6 +24,9 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+# `tauri::test::mock_app`: the command tests call a command over the state the app
+# manages. The feature adds no dependency and is off in every build but the tests.
+tauri = { version = "2", features = ["test"] }
 tempfile = { workspace = true }
 # `TestSystem`: deletion tests run against a temporary filesystem, never the real one.
 storage-monitor-core = { workspace = true, features = ["testing"] }

@@ -40,6 +40,7 @@ pub fn run() {
             commands::top_growers,
             commands::action_preview,
             commands::action_run,
+            commands::activity_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

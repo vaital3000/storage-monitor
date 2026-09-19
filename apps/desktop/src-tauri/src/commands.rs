@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use storage_monitor_core::action::{ActionLog, Mode, Preview};
+use storage_monitor_core::action::{ActionLog, LogTail, Mode, Preview};
 use storage_monitor_core::disk::{self, DiskUsage};
 use storage_monitor_core::paths;
 use storage_monitor_core::scan::{NodeId, Tree};
@@ -133,6 +133,17 @@ pub async fn action_run(
         .await
 }
 
+/// What the app has deleted, for the Activity screen: the last `limit` entries of the
+/// action log, newest first (default 100), and how many lines could not be read.
+///
+/// An `Err` means the log could not be read — the same meaning [`action_run`] gives it, one
+/// stage on: the read did not happen. It is not the answer for a log with nothing in it,
+/// which is an empty list and no error, and the screen must not draw the two the same way.
+#[tauri::command]
+pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Result<LogTail, String> {
+    actions::activity(log.inner(), limit)
+}
+
 fn to_paths(paths: Vec<String>) -> Vec<PathBuf> {
     paths.into_iter().map(PathBuf::from).collect()
 }
@@ -177,5 +188,56 @@ mod tests {
         let root = default_root().unwrap();
         assert_eq!(Some(PathBuf::from(&root)), paths::home_dir());
         assert!(root.starts_with('/'), "{root}");
+    }
+
+    /// The command over the [`ActionLog`] the app manages, where the meaning of `Err` is
+    /// fixed for the screen that Task 11 and the Activity page are written against: a log
+    /// nothing has written yet resolves as an empty list, and a log that cannot be read
+    /// rejects. The same file, in both states, so nothing but the read can explain the
+    /// difference.
+    #[test]
+    fn the_activity_command_reads_the_log_the_app_manages() {
+        use storage_monitor_core::action::{EntryOutcome, EntryResult, Outcome};
+        use storage_monitor_core::scan::NodeKind;
+        use tauri::Manager;
+
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions.jsonl");
+        app.manage(ActionLog::new(path.clone()));
+
+        assert_eq!(
+            activity_log(app.state(), None).expect("nothing has been deleted yet"),
+            LogTail::default(),
+            "a log that was never written is an empty list, not a failure"
+        );
+
+        let entry = |name: &str| EntryOutcome {
+            path: PathBuf::from(name),
+            kind: NodeKind::File,
+            result: EntryResult::Removed { bytes: 1_024 },
+        };
+        ActionLog::new(path.clone())
+            .append(&Outcome {
+                entries: vec![entry("/h/older"), entry("/h/newer")],
+                freed_bytes: 2_048,
+                at: chrono::Utc::now(),
+                mode: Mode::Trash,
+            })
+            .expect("the log is written");
+        let tail = activity_log(app.state(), Some(1)).expect("the log reads");
+        assert_eq!(
+            tail.entries.len(),
+            1,
+            "the limit reaches the read: {tail:?}"
+        );
+        assert_eq!(tail.entries[0].path, "/h/newer", "newest first");
+
+        // The same log, now impossible to read: a directory in its place.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = activity_log(app.state(), None)
+            .expect_err("a read that failed must not reach the screen as an empty list");
+        assert!(err.contains("action log"), "{err}");
     }
 }
