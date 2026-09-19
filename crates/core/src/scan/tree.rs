@@ -1270,6 +1270,10 @@ mod tests {
         // The identity case is the cheapest check that the rebuild itself is faithful: an
         // arena that came out of `flatten` must come out of `replace_subtrees` unchanged.
         let tree = nested();
+        // Both sides of the equality: every other call checks a patched tree, so without
+        // this one the leaf rule ("a rebuilt leaf looks like a walked leaf") would pin only
+        // the half the rebuild produces.
+        assert_invariants(&tree);
         let patched = replace_subtrees(&tree, vec![]);
         assert_invariants(&patched);
         assert_same_subtree(&patched, Tree::ROOT, &tree, Tree::ROOT);
@@ -1534,6 +1538,13 @@ mod tests {
             totals_of(&patched, "/root/zz").0,
             totals_of(&patched, "/root/m.bin").0,
             "the fixture only proves anything while the two tie",
+        );
+        assert!(
+            "zz" > "m.bin" && "/root/zz" < "m.bin",
+            "and only while the kept name and the patch's path fall on opposite sides of \
+             the partner: rename either to anything starting with a dot and both halves of \
+             the comparator go unmeasured, since '.' sorts below the '/' a patch root opens \
+             with",
         );
         assert_eq!(
             names(&patched, patched.children(Tree::ROOT)),
