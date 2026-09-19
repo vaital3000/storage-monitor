@@ -40,7 +40,7 @@ const run = (paths: string[], mode: DeletionMode = 'trash', scan: HeldScan = sca
 
 const blocked = (reason: BlockReason) => ({ state: 'blocked', reason });
 
-const statuses = (entries: PreviewEntry[]) => entries.map((entry) => entry.status);
+const statuses = (entries: readonly PreviewEntry[]) => entries.map((entry) => entry.status);
 
 describe('mockActionPreview', () => {
   it('reports a path of the tree as ready, with the kind and size the tree has', () => {

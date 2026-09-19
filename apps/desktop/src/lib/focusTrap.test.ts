@@ -39,6 +39,41 @@ describe('tabStops', () => {
     expect(names(tabStops(host))).toEqual(['enabled', 'reachable']);
   });
 
+  it('leaves out a control its fieldset disabled, which carries no attribute of its own', () => {
+    // The reason the selector uses the pseudo-class: `[disabled]` matches neither of these
+    // — the attribute is on the fieldset — and `input.disabled` is `false` for them too.
+    // Swapping the two would put dead elements at the ends of the ring.
+    const host = container(`
+      <fieldset disabled>
+        <input data-name="off" type="radio" checked />
+        <button data-name="dead"></button>
+      </fieldset>
+      <button data-name="live"></button>
+    `);
+    expect(host.querySelector<HTMLInputElement>('[data-name="off"]')!.disabled).toBe(false);
+    expect(names(tabStops(host))).toEqual(['live']);
+  });
+
+  it('looks only inside the container it is given', () => {
+    // The ends of a trap's ring have to be elements of the dialog; a stop found on the page
+    // behind it is the trap handing the focus out through its own boundary.
+    const behind = container(`<button data-name="behind"></button>`);
+    const host = container(`<button data-name="inside"></button>`);
+    expect(names(tabStops(host))).toEqual(['inside']);
+    expect(tabStops(host)).not.toContain(behind.firstElementChild);
+  });
+
+  it('answers for half a radio group as surely as for a whole one', () => {
+    // `checked` and never `name`: a group can be split across containers, and the half
+    // inside this one still has to be answered without seeing the rest of it.
+    container(`<input data-name="outside" type="radio" name="mode" checked />`);
+    const host = container(`<input data-name="inside" type="radio" name="mode" />`);
+    expect(names(tabStops(host))).toEqual([]);
+
+    host.querySelector<HTMLInputElement>('[data-name="inside"]')!.checked = true;
+    expect(names(tabStops(host))).toEqual(['inside']);
+  });
+
   it('counts a radio group as one stop, the checked radio', () => {
     // The reason this is a function rather than a selector. An end of the ring taken from
     // an unchecked radio sits where the browser never stops, and the Tab that should have

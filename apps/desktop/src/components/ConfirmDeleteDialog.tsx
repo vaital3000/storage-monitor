@@ -241,18 +241,22 @@ export default function ConfirmDeleteDialog({
     target?.focus();
   }, [status.phase]);
 
-  // An acknowledgement covers the batch it was given for. A run that failed comes back to
-  // this view with Permanent still selected, and a tick made before it would leave the
-  // irreversible button armed for a second batch the user has not agreed to — the same
-  // rule as the one the mode toggle keeps below, for the same reason.
+  // An acknowledgement covers the batch it was given for. Whatever happened to that batch,
+  // the question coming back is a new one, and a tick made for the old one would leave the
+  // irreversible button armed for a batch the user has not agreed to — the same rule as
+  // the one the mode toggle keeps below, for the same reason.
   //
-  // Adjusted while rendering rather than in an effect: React re-runs this render before
-  // committing anything, so the button is never painted armed for a single frame, and no
-  // second render is scheduled behind the first (`react-hooks/set-state-in-effect`).
+  // On the way back in rather than on the way out, so that the run itself still shows the
+  // tick that authorised it: clearing on the way out paints an unticked "I understand"
+  // above "Deleting…", which reads like the app forgetting why it is deleting.
+  //
+  // Adjusted while rendering rather than in an effect, which is what
+  // `react-hooks/set-state-in-effect` asks for: no second render is scheduled behind the
+  // first.
   const [shownPhase, setShownPhase] = useState(status.phase);
   if (shownPhase !== status.phase) {
     setShownPhase(status.phase);
-    if (status.phase !== 'asking') {
+    if (status.phase === 'asking') {
       setUnderstood(false);
     }
   }
@@ -284,18 +288,22 @@ export default function ConfirmDeleteDialog({
       const last = stops[stops.length - 1];
       const active = document.activeElement;
       const inside = active instanceof Node && current.contains(active);
-      // The focus has fallen out of the dialog — a click on the backdrop — or there is
-      // nothing inside to land on. Take it back rather than letting Tab step into the page
-      // behind; the panel holds it without being a stop of its own (`tabIndex={-1}`).
-      if (!inside || first === undefined || last === undefined) {
+      // Nothing inside to land on, so the panel takes the focus itself — it holds it
+      // without being a stop of its own (`tabIndex={-1}`). Unreachable while the list of
+      // entries is a stop, which it always is here; the branch stays because `tabStops`
+      // belongs to `lib/` and its contract allows an empty ring, and a dialog should not
+      // lean on its own markup forever.
+      if (first === undefined || last === undefined) {
         event.preventDefault();
         current.focus();
         return;
       }
-      // Three ways the next step would leave: the two ends of the ring, and the panel
-      // itself, which holds the focus whenever the phase change found no control to give
-      // it to. From the panel a browser would step to whatever precedes the whole dialog.
-      if (active === current || (event.shiftKey ? active === first : active === last)) {
+      // Three ways the next step would leave the dialog: the two ends of the ring, the
+      // panel itself, which holds the focus whenever a phase change found no control to
+      // give it to, and a focus that has already fallen outside — a click on the backdrop,
+      // which blurs to the body. All three land on the end the direction asks for, rather
+      // than on the panel, which would cost another keypress to get anywhere.
+      if (!inside || active === current || (event.shiftKey ? active === first : active === last)) {
         event.preventDefault();
         (event.shiftKey ? last : first).focus();
       }
@@ -350,11 +358,17 @@ export default function ConfirmDeleteDialog({
               className={`flex flex-col gap-1 text-sm ${SCROLLER_CLASS} focus-visible:outline-2 focus-visible:outline-blue-500`}
             >
               {preview.entries.map((entry, index) => (
-                // By index, which is right here and wrong almost everywhere else: the list
-                // is the backend's, rendered in its order, never sorted or filtered in
-                // place — and a path is not unique in it. An exact duplicate comes back as
-                // a second entry blocked as `nested` (`engine.rs`), so a path key would
+                // By index, which is right here and wrong almost everywhere else. A path is
+                // not unique in this list — an exact duplicate comes back from the guards
+                // as a second entry blocked as `nested` (`engine.rs`) — so a path key would
                 // make React drop one of the two rows of the batch the user is confirming.
+                //
+                // An index key is safe because of what a row is, not because of the order
+                // it arrives in: every `<li>` is text derived from its entry, with no local
+                // state, no ref and nothing focusable in it. Reusing one position for a
+                // different entry is then indistinguishable from keying it, even under a
+                // reorder. Give a row state — a per-row checkbox, say — and this has to
+                // become a key that identifies the entry, which the path cannot.
                 <li
                   key={index}
                   data-state={entry.status.state}

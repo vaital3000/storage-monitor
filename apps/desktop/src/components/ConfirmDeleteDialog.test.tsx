@@ -375,6 +375,28 @@ describe('ConfirmDeleteDialog', () => {
     expect(confirmButton()).toBeDisabled();
   });
 
+  it('forgets the acknowledgement on a route back that never ran anything', () => {
+    // asking -> failed -> asking, with no running in between. The rule is about the
+    // question coming back, not about the phase it travelled through: a batch that was
+    // refused outright is exactly when a user is likeliest to press the button again.
+    const view = show(TWO_READY, { initialMode: 'permanent' });
+    fireEvent.click(understandBox());
+    view.setStatus({ phase: 'failed', message: 'another batch is running' });
+    view.setStatus({ phase: 'asking' });
+    expect(understandBox()).not.toBeChecked();
+    expect(confirmButton()).toBeDisabled();
+  });
+
+  it('keeps the tick on screen while the batch it authorised runs', () => {
+    // Cleared on the way back in, not on the way out: an unticked "I understand" above
+    // "Deleting…" reads like the app forgetting why it is deleting.
+    const view = show(TWO_READY, { initialMode: 'permanent' });
+    fireEvent.click(understandBox());
+    view.setStatus({ phase: 'running' });
+    expect(understandBox()).toBeChecked();
+    expect(understandBox()).toBeDisabled();
+  });
+
   it('speaks the selected mode, not the one the preview was computed with', () => {
     // A `Preview` carries the mode it was checked in, and the toggle is local: the guards
     // never look at the mode, so no verdict here changes with it. The preview below says
@@ -449,6 +471,23 @@ describe('ConfirmDeleteDialog', () => {
     show(TWO_READY, { initialMode: 'permanent', status: { phase: 'running' } });
     expect(screen.getByRole('status')).toHaveTextContent('Deleting…');
     expect(understandBox()).toBeDisabled();
+  });
+
+  it('ignores Escape when the batch starts under an already open dialog', () => {
+    // Every other Escape test mounts straight into the phase it measures. This is the
+    // route a user actually takes, and the one a handler that read `running` once, when it
+    // was still false, gets wrong — closing the dialog mid-batch and throwing away the
+    // only report of `recorded` and `treeStale`.
+    const closed = vi.fn();
+    const view = show(TWO_READY, { onClose: closed });
+    view.setStatus({ phase: 'running' });
+    fireEvent.keyDown(dialog(), { key: 'Escape' });
+    expect(closed).not.toHaveBeenCalled();
+
+    // And hears it again as soon as there is a report to dismiss.
+    view.setStatus({ phase: 'done', result: batch([MOVED]) });
+    fireEvent.keyDown(dialog(), { key: 'Escape' });
+    expect(closed).toHaveBeenCalledTimes(1);
   });
 
   it('ignores Escape while the batch runs, so its report cannot be lost', () => {
@@ -553,11 +592,38 @@ describe('ConfirmDeleteDialog', () => {
     expect(screen.getByTestId('delete-entries')).toHaveFocus();
   });
 
-  it('takes Tab back when the focus has fallen out of the dialog', () => {
+  it('takes Tab back to the end the direction asks for when the focus has fallen out', () => {
     show(TWO_READY);
     (document.activeElement as HTMLElement | null)?.blur();
     expect(fireEvent.keyDown(document.body, { key: 'Tab' })).toBe(false);
-    expect(dialog()).toHaveFocus();
+    expect(screen.getByTestId('delete-entries')).toHaveFocus();
+
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(fireEvent.keyDown(document.body, { key: 'Tab', shiftKey: true })).toBe(false);
+    expect(confirmButton()).toHaveFocus();
+  });
+
+  it('never takes a tab stop from the page it covers', () => {
+    // The ring is read inside the panel, and the trap's two ends have to be elements of
+    // the dialog: an end found on the page behind it is the trap handing the focus out
+    // through its own boundary.
+    render(
+      <>
+        <button type="button">Behind</button>
+        <ConfirmDeleteDialog
+          preview={TWO_READY}
+          status={{ phase: 'asking' }}
+          onConfirm={noop}
+          onClose={noop}
+        />
+      </>,
+    );
+    expect(tabStops(dialog())).not.toContain(screen.getByRole('button', { name: 'Behind' }));
+    expect(ring()).toEqual(['Entries to delete', 'radio:trash', 'Cancel', 'Move to the Trash']);
+
+    confirmButton().focus();
+    expect(fireEvent.keyDown(confirmButton(), { key: 'Tab' })).toBe(false);
+    expect(screen.getByTestId('delete-entries')).toHaveFocus();
   });
 
   it('counts a radio group as the one stop the browser stops at, and skips disabled buttons', () => {

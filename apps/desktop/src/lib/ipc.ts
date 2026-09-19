@@ -145,8 +145,12 @@ export interface PreviewEntry {
 
 /** A checked batch: nothing was touched, so it is safe to show and to throw away. */
 export interface Preview {
-  /** Every path that was asked about, in order, blocked ones included. */
-  entries: PreviewEntry[];
+  /**
+   * Every path that was asked about, in the order they were asked about, blocked ones
+   * included. Readonly because that order is the backend's answer: a screen that sorted it
+   * in place would renumber rows another screen is still holding.
+   */
+  entries: readonly PreviewEntry[];
   /** Sum of `size` over the ready entries only. */
   totalBytes: number;
   mode: DeletionMode;
