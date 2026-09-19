@@ -1,5 +1,5 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
-import { screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ActivityEntry } from '../lib/ipc';
 import { createQueryClient } from '../lib/queryClient';
@@ -81,12 +81,16 @@ describe('ActivityPage', () => {
   it('shows when an entry was deleted, what it was, how, and what it freed', async () => {
     record({ path: under('Movies/holiday.mov'), mode: 'permanent', bytes: 4_000_000_000 });
     show();
-    const cell = cells((await shown())[0]);
+    const row = (await shown())[0];
+    const cell = cells(row);
     expect(cell[0]).toHaveTextContent(AT_SHOWN);
     expect(cell[1]).toHaveTextContent(under('Movies/holiday.mov'));
     expect(cell[2]).toHaveTextContent('Permanent');
     expect(cell[3]).toHaveTextContent('Removed');
     expect(cell[4]).toHaveTextContent('4.0 GB');
+    // The verdict in a value, for a reader that is not reading the words: the e2e specs
+    // and anything that later wants to style a row by what became of it.
+    expect(row).toHaveAttribute('data-result', 'removed');
   });
 
   it('reads the record from its end, in the order the log read it and never by `at`', async () => {
@@ -116,8 +120,25 @@ describe('ActivityPage', () => {
     show();
     await shown();
     const row = rowFor(under('locked'));
+    expect(row).toHaveAttribute('data-result', 'failed');
     expect(cells(row)[3]).toHaveTextContent('Failed');
     expect(row).toHaveTextContent(message);
+  });
+
+  it('marks a failure as one, and wears the mark', async () => {
+    // Both halves, the way `Button.test.tsx` holds `data-variant` to its colours: on its
+    // own the attribute pins the decision and would stay truthful with every line painted
+    // the same, which is the emphasis a reader of a record of deletions needs most.
+    record({ path: under('locked'), result: 'failed', detail: 'no', bytes: 0 });
+    record({ path: under('Library'), result: 'skipped', detail: 'denylisted', bytes: 0 });
+    show();
+    await shown();
+    const failure = within(rowFor(under('locked'))).getByTestId('activity-detail');
+    const reason = within(rowFor(under('Library'))).getByTestId('activity-detail');
+    expect(failure).toHaveAttribute('data-detail', 'failure');
+    expect(failure).toHaveClass('text-red-700');
+    expect(reason).toHaveAttribute('data-detail', 'reason');
+    expect(reason).toHaveClass('text-muted');
   });
 
   it('reads `result` first, so a failure that reads like a reason stays a failure', async () => {
@@ -159,11 +180,15 @@ describe('ActivityPage', () => {
     // A line that failed and freed bytes is not one the backend writes; the rule is about
     // the number and not about the verdict, so it cannot hide one that is there.
     record({ path: under('half'), result: 'failed', detail: 'half a tree', bytes: 4_096 });
+    // Removed and freed nothing — an empty folder — which is a number and not an absence:
+    // the row says what it did, and the dash is kept for the rows that did not do it.
+    record({ path: under('empty'), result: 'removed', bytes: 0 });
     show();
     await shown();
     expect(cells(rowFor(under('gone')))[4]).toHaveTextContent('512 B');
     expect(cells(rowFor(under('kept')))[4]).toHaveTextContent('—');
     expect(cells(rowFor(under('half')))[4]).toHaveTextContent('4.1 KB');
+    expect(cells(rowFor(under('empty')))[4]).toHaveTextContent('0 B');
   });
 
   it('shows a stamp it cannot read as the record wrote it', async () => {
@@ -206,6 +231,28 @@ describe('ActivityPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(message);
     expect(screen.queryByTestId('activity-empty')).not.toBeInTheDocument();
     expect(screen.queryByTestId('activity-rows')).not.toBeInTheDocument();
+  });
+
+  it('reads the record again when the error offers to, and shows it', async () => {
+    // The one control on the error screen. A read can fail for a reason that goes away —
+    // a network volume that was not mounted yet, `STORAGE_MONITOR_DATA_DIR` on one — and
+    // a button that only looks like a way out of it is worse than no button.
+    mockIPC((cmd) => {
+      if (cmd === 'activity_log') {
+        throw 'cannot read the action log at /tmp/actions.jsonl: permission denied';
+      }
+      throw new Error(`Unmocked IPC command: ${cmd}`);
+    });
+    show();
+    await screen.findByRole('alert');
+
+    installIpcMock();
+    record({ path: under('gone') });
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+    await shown();
+    expect(paths()).toEqual([under('gone')]);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('reads the record again every time the screen is opened', async () => {

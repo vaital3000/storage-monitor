@@ -105,6 +105,13 @@ function Row({ entry }: { entry: ActivityEntry }) {
           // alternative is guessing at which part of someone else's sentence is a path.
           <span
             data-testid="activity-detail"
+            // Which of the two kinds of sentence this is, in a value a test can read —
+            // the same trade `Button`'s `data-variant` makes, for the same reason: that a
+            // failure reads as a failure is a decision about meaning, while what red
+            // looks like is the stylesheet's business. Both branches below read the one
+            // boolean, and the test asserts the pair, so an attribute cannot end up on a
+            // line painted the other way.
+            data-detail={detail.failure ? 'failure' : 'reason'}
             className={`block text-xs break-words ${
               detail.failure ? 'text-red-700 dark:text-red-400' : 'text-muted'
             }`}
