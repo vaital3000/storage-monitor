@@ -84,9 +84,11 @@ applied, the scan ran.
 
 **What the guard test does and does not prove.** It proves the line is still
 there and still closed. It cannot prove the app runs under it, because nothing
-automated launches the app. The Playwright suite serves the same policy from
-the mock server so a browser enforces something close, but the origin differs,
-so `'self'` does not mean there what it means in the packaged app. What
+automated launches the app. Task 16 adds the nearest available substitute —
+the Playwright mock server serving this same policy, so a browser enforces
+something close — but that substitute is weaker than it looks: the origin
+differs, so `'self'` does not mean there what it means in the packaged app.
+What
 transfers is the class that actually breaks — `'unsafe-eval'`, a `blob:`
 worker, a `data:` font — and that is worth having, because `echarts` is a caret
 range: a `pnpm update` pulling a chart build that reaches for a blob worker
