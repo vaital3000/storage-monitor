@@ -157,6 +157,25 @@ function treeFind(path: string, root: string): FixtureNode | undefined {
   return isAtOrUnder(spelled, root) ? fixtureEntry(spelled) : undefined;
 }
 
+/**
+ * `drop_nested`: per entry, in input order, `false` when another entry of the batch contains
+ * it. A strict ancestor always wins; between two spellings of one entry, the earlier one.
+ *
+ * Takes the judged forms `checkPath` returned, never the paths that get deleted: those keep
+ * the caller's spelling of the last component, and two spellings of one directory would then
+ * look like two entries — which would promise their bytes twice and then fail to delete
+ * whichever came second.
+ *
+ * A function rather than a loop inside the preview, because it is one in the Rust: the cases
+ * of `guard-cases.json` call it directly on both sides.
+ */
+export function dropNested(paths: readonly string[]): boolean[] {
+  return paths.map(
+    (path, i) =>
+      !paths.some((other, j) => i !== j && isAtOrUnder(path, other) && (other !== path || j < i)),
+  );
+}
+
 /** The root the guards judge against, or null when nothing has been scanned. */
 function rootOf(scan: HeldScan): string | null {
   return scan.held === 'nothing' ? null : scan.root;
@@ -212,15 +231,11 @@ export function mockActionPreview(
     // stale kind deletes the wrong thing.
     entries.push({ path: checked.judged, kind: onDisk.kind, size, status: { state: 'ready' } });
   }
-  // `drop_nested`, over the still-ready entries only: one that will not be deleted cannot
-  // swallow the one below it. A strict ancestor always wins; between two spellings of one
-  // entry, the earlier one does.
+  // Over the still-ready entries only: one that will not be deleted cannot swallow the one
+  // below it. Selecting a folder and something inside it is one click in a tree view.
+  const kept = dropNested(ready.map(({ judged }) => judged));
   for (const [i, entry] of ready.entries()) {
-    const swallowed = ready.some(
-      ({ judged }, j) =>
-        i !== j && isAtOrUnder(entry.judged, judged) && (judged !== entry.judged || j < i),
-    );
-    if (swallowed) {
+    if (!kept[i]) {
       entries[entry.index].status = { state: 'blocked', reason: 'nested' };
     }
   }

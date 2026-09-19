@@ -287,6 +287,15 @@ mod tests {
     #[derive(Deserialize)]
     struct GuardCases {
         scenarios: Vec<GuardScenario>,
+        nesting: Vec<NestingCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct NestingCase {
+        /// Relative to the scenario root each side uses; `drop_nested` takes absolute paths.
+        paths: Vec<String>,
+        keep: Vec<bool>,
+        why: String,
     }
 
     #[derive(Deserialize)]
@@ -364,6 +373,14 @@ mod tests {
                     "root" => under(&root, &case.path),
                     "home" => under(&home, &case.path),
                     "parent" => under(&parent, &case.path),
+                    // The root's own path with the case appended to its last component: the
+                    // neighbour whose name begins with the root's, which only a comparison
+                    // that is not component-wise would call "inside".
+                    "sibling" => {
+                        let mut name = root.as_os_str().to_owned();
+                        name.push(&case.path);
+                        PathBuf::from(name)
+                    }
                     "absolute" => PathBuf::from(&case.path),
                     other => panic!("unknown base {other} in the shared cases"),
                 };
@@ -377,6 +394,33 @@ mod tests {
                     case.why
                 );
             }
+        }
+        the_shared_nesting_cases(&file.nesting);
+    }
+
+    /// The other half of the shared set: which entries of one batch swallow the others.
+    ///
+    /// `drop_nested` needs no disk and no `System`, so it is on this side of the boundary
+    /// the shared cases keep — it only sat outside it because the boundary was drawn by
+    /// which file a function lives in.
+    fn the_shared_nesting_cases(cases: &[NestingCase]) {
+        assert!(!cases.is_empty(), "there are nesting cases to run");
+        let root = PathBuf::from("/h");
+        for case in cases {
+            assert_eq!(
+                case.paths.len(),
+                case.keep.len(),
+                "a nesting case answers every path it lists: {}",
+                case.why
+            );
+            let paths: Vec<PathBuf> = case.paths.iter().map(|path| under(&root, path)).collect();
+            assert_eq!(
+                drop_nested(&paths),
+                case.keep,
+                "{:?} — {}",
+                case.paths,
+                case.why
+            );
         }
     }
 

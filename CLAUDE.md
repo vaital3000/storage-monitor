@@ -162,7 +162,9 @@ both use the same store. Cancelled scans are not persisted. Format details:
   tree and by `apps/desktop/src/mocks/actions.test.ts` over the fixture. Changing
   a placement rule means changing both sides, which is the point: the mock is the
   oracle every UI test of the deletion is written against. The file covers the six
-  numbered rules of `Limits::check` and stops there.
+  numbered rules of `Limits::check` and the `drop_nested` tie-break — everything
+  the guards decide without a disk — and stops where a `System` would be needed:
+  the stat behind `missing`, and `kindChanged`.
 - Rust walker tests (`crates/core/tests/walker.rs`) build temp trees: hard
   links, sparse files, permission-denied and partially readable directories,
   symlinks, deep nesting.

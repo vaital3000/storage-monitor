@@ -166,11 +166,6 @@ export function mockActivityTail(limit: number): LogTail {
   return { entries, damaged };
 }
 
-/**
- * Puts every node of the tree back as it was built and forgets the log. `resetIpcMock` calls
- * it, and so does the test setup, so a batch in one test is never visible in the next.
- */
-
 /** An empty log, with nothing a batch of an earlier test wrote. Half of `resetMockActions`. */
 export function resetActionLog(): void {
   mockActionLog.length = 0;

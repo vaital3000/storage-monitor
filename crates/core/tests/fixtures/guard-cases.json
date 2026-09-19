@@ -16,7 +16,12 @@
     "`root` and `home` are relative to the scenario's base: the temp directory in Rust, the",
     "fixture root in TypeScript. Every path of `tree` must exist in both, so the entries here",
     "are a subset of the fixture. A case's `base` is one of: `root`, `home`, `parent` (the",
-    "parent of the root) or `absolute` (the path as written)."
+    "parent of the root), `sibling` (the root's own path with the case's path appended to its",
+    "last component) or `absolute` (the path as written).",
+    "",
+    "`nesting` is the other half: `drop_nested` decides which entries of one batch survive the",
+    "others, takes nothing but paths, and its tie-break is one predicate on each side. Its",
+    "paths are relative to each side's root, and `keep` is its answer, entry by entry."
   ],
   "scenarios": [
     {
@@ -81,6 +86,18 @@
           "path": "Library/Caches",
           "expect": "denylisted",
           "why": "and everything below it"
+        },
+        {
+          "base": "root",
+          "path": "Library2",
+          "expect": "ready",
+          "why": "a name that starts with a denied name is not inside it: rule 6 compares components, and a bare string prefix would refuse this one. Nothing need be there — the rules judge placement, and rule 2 resolves the parent, not the entry"
+        },
+        {
+          "base": "sibling",
+          "path": "2",
+          "expect": "outsideRoots",
+          "why": "and rule 5 the same way round: a neighbour of the root whose name begins with the root's is outside it"
         },
         {
           "base": "home",
@@ -201,6 +218,38 @@
           "why": "a sibling of the root is outside it"
         }
       ]
+    }
+  ],
+  "nesting": [
+    {
+      "paths": ["Movies", "Movies/family-2025.mov"],
+      "keep": [true, false],
+      "why": "selecting a folder and something inside it is one click in a tree view"
+    },
+    {
+      "paths": ["Movies/family-2025.mov", "Movies"],
+      "keep": [false, true],
+      "why": "a strict ancestor always wins, whichever order the two arrive in"
+    },
+    {
+      "paths": ["Movies", "Movies"],
+      "keep": [true, false],
+      "why": "of several copies of one path the first survives — the tie-break, and the line most likely to be simplified away"
+    },
+    {
+      "paths": ["Library", "Library2"],
+      "keep": [true, true],
+      "why": "component-wise again: neither of these contains the other"
+    },
+    {
+      "paths": ["Movies", "Documents", "Movies/family-2025.mov", "Documents/Design"],
+      "keep": [true, true, false, false],
+      "why": "each entry is judged against every other, not only against its neighbour"
+    },
+    {
+      "paths": ["Documents/Design", "Documents", "Documents/Design"],
+      "keep": [false, true, false],
+      "why": "a later ancestor takes both copies of the entry below it"
     }
   ]
 }

@@ -11,6 +11,7 @@ import {
 } from './fixtures';
 import {
   checkPath,
+  dropNested,
   limitsFor,
   type HeldScan,
   mockActionPreview,
@@ -453,12 +454,21 @@ interface GuardScenario {
   cases: GuardCase[];
 }
 
+interface NestingCase {
+  paths: string[];
+  keep: boolean[];
+  why: string;
+}
+
 /**
  * The cases `crates/core/src/action/guards.rs` answers as well, read from the crate rather
  * than copied: a rule that changes on one side alone reddens whichever test was not updated.
  * The file says what it covers and what `ready` means in it.
  */
-const SHARED = sharedCases as unknown as { scenarios: GuardScenario[] };
+const SHARED = sharedCases as unknown as {
+  scenarios: GuardScenario[];
+  nesting: NestingCase[];
+};
 
 const join = (base: string, relative: string) => (relative === '' ? base : `${base}/${relative}`);
 
@@ -491,11 +501,24 @@ describe('the guard cases shared with the Rust', () => {
               ? join(home, shared.path)
               : shared.base === 'parent'
                 ? join(parent, shared.path)
-                : shared.path;
+                : // The root's own path with the case appended to its last component.
+                  shared.base === 'sibling'
+                  ? `${root}${shared.path}`
+                  : shared.path;
         const checked = checkPath(limits, path);
         const verdict = 'judged' in checked ? 'ready' : checked.reason;
         expect(verdict, `${shared.base} ${shared.path} — ${shared.why}`).toBe(shared.expect);
       }
     });
   }
+
+  it('answers the nesting cases the same way', () => {
+    expect(SHARED.nesting.length).toBeGreaterThan(0);
+    for (const nesting of SHARED.nesting) {
+      const paths = nesting.paths.map((path) => join(FIXTURE_ROOT, path));
+      expect(dropNested(paths), `${nesting.paths.join(', ')} — ${nesting.why}`).toEqual(
+        nesting.keep,
+      );
+    }
+  });
 });
