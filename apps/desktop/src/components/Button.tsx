@@ -27,5 +27,16 @@ export default function Button({
   type = 'button',
   ...rest
 }: ButtonProps) {
-  return <button type={type} className={`${BASE} ${VARIANTS[variant]} ${className}`} {...rest} />;
+  return (
+    <button
+      type={type}
+      // The variant, in a value a test can read. Which variant a button wears is a decision
+      // about what it means — the way on, or something that cannot be taken back — and one
+      // worth pinning; what each of them looks like is the stylesheet's business, and a test
+      // that asserted the classes would pin that instead.
+      data-variant={variant}
+      className={`${BASE} ${VARIANTS[variant]} ${className}`}
+      {...rest}
+    />
+  );
 }

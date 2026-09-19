@@ -302,6 +302,21 @@ describe('ConfirmDeleteDialog', () => {
     expect(confirmed).toHaveBeenCalledExactlyOnceWith('permanent');
   });
 
+  it('wears the danger style only where it means a permanent deletion', () => {
+    // The emphasis of `primary` says "this is the way on", which is the right thing for a
+    // reversible move to the Trash and the wrong thing for the most dangerous button on
+    // the screen — the more so since the entry point that opened this dialog is red.
+    // `data-variant` pins the choice; what red looks like stays the stylesheet's business.
+    show(TWO_READY);
+    expect(confirmButton()).toHaveAttribute('data-variant', 'primary');
+
+    selectMode('Permanent');
+    expect(confirmButton()).toHaveAttribute('data-variant', 'danger');
+
+    selectMode('Trash');
+    expect(confirmButton()).toHaveAttribute('data-variant', 'primary');
+  });
+
   it('holds the permanent deletion until the user says they understand it', () => {
     const confirmed = vi.fn<(mode: DeletionMode) => void>();
     show(TWO_READY, { onConfirm: confirmed });

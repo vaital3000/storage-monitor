@@ -446,7 +446,12 @@ export default function ConfirmDeleteDialog({
               </Button>
               <Button
                 data-testid="confirm-delete"
-                variant="primary"
+                // Red for the deletion that cannot be taken back, and the ordinary emphasis
+                // for the one that can. `primary` for both was the original choice, made
+                // before a `danger` style existed; leaving it there would put the blue
+                // "this is the way on" on the most dangerous control in the app, under a
+                // red button that only opened a dialog.
+                variant={mode === 'permanent' ? 'danger' : 'primary'}
                 disabled={running || ready.length === 0 || (mode === 'permanent' && !understood)}
                 onClick={() => onConfirm(mode)}
               >

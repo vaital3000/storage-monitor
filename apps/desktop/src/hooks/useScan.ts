@@ -96,6 +96,9 @@ export function useScan(): ScanController {
   // Set once an event or a command reply was applied, so that a slow reply to the initial
   // `scan_status` cannot overwrite fresher state.
   const touched = useRef(false);
+  // The generation as it is now, readable from a callback that was made in an earlier
+  // render — which is what `refresh` needs to tell the tree it read from the one on screen.
+  const live = useRef(generation);
 
   useEffect(() => {
     let active = true;
@@ -110,8 +113,10 @@ export function useScan(): ScanController {
     const done = onScanDone((final) => {
       if (!active) return;
       touched.current = true;
+      const next = nextGeneration();
+      live.current = next;
       setStatus(final);
-      setGeneration(nextGeneration());
+      setGeneration(next);
       setCancelling(false);
       setReady(true);
     }).catch(unsubscribed);
@@ -168,6 +173,10 @@ export function useScan(): ScanController {
   }, [status.state]);
 
   const refresh = useCallback(async () => {
+    // Which tree this read is about. A reply is always older than it looks — it was read
+    // before it was sent — and "terminal" cannot tell the finished scan it was read from
+    // the newer finished scan that replaced it meanwhile. The generation can.
+    const asked = live.current;
     let next: ScanStatus;
     try {
       next = await scanStatus();
@@ -176,11 +185,12 @@ export function useScan(): ScanController {
       // place to turn a finished scan into a failed one.
       return;
     }
+    if (live.current !== asked) return;
     touched.current = true;
-    // Never over a running scan: `scan:progress` is fresher than any reply — the reply was
-    // read before it was sent — and a walk in flight reports its own counters anyway. The
-    // state is read inside the updater rather than from the render this callback was made
-    // in, so a scan that started while the reply was on its way is seen.
+    // And never over a running scan: `scan:progress` is fresher for the same reason, and a
+    // walk in flight reports its own counters anyway. A scan that *started* while the reply
+    // was on its way moves no generation, so the state is what rules that one out — read
+    // inside the updater rather than from the render this callback was made in.
     setStatus((current) => (isTerminal(current.state) ? next : current));
   }, []);
 

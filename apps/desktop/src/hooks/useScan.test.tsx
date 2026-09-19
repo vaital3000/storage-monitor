@@ -252,6 +252,27 @@ describe('useScan', () => {
     expect(result.current.status).toEqual(running);
   });
 
+  it('drops a refresh that a finished scan overtook', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    await act(() => result.current.start());
+    await waitFor(() => expect(result.current.status.state).toBe('done'));
+
+    const release = holdReply('scan_status');
+    let refreshing!: Promise<void>;
+    act(() => {
+      refreshing = result.current.refresh();
+    });
+    // A scan finished while the reply was on its way. "Terminal" cannot tell the state that
+    // was read from the newer one that replaced it, so the reply has to name the tree it
+    // was read from — otherwise the counters of a scan two generations old land on screen.
+    const newer: ScanStatus = { ...fixtureStatusDone(), bytes: 1, files: 1, dirs: 1 };
+    await act(() => emit(SCAN_DONE_EVENT, newer));
+    release();
+    await act(() => refreshing);
+    expect(result.current.status).toEqual(newer);
+  });
+
   it('keeps the counters when the refresh is refused', async () => {
     const { result } = renderScan();
     await ready(result);

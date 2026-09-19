@@ -46,6 +46,12 @@ interface Selection {
   ids: ReadonlySet<NodeId>;
 }
 
+/** The tree and the directory a piece of this page's state belongs to. */
+interface Scope {
+  generation: number;
+  node: NodeId;
+}
+
 /**
  * How far this page has got with a deletion: one at a time, from the click to the report.
  *
@@ -54,10 +60,19 @@ interface Selection {
  * a preview that never arrives — have to be said here; a rejected `action_preview` is not a
  * `{ phase: 'failed' }` batch, which is the far more alarming sentence "the deletion ran and
  * could not finish".
+ *
+ * Both carry the scope they were started in, and die with it like the ticks do: a "Checking
+ * what would be deleted…" over another directory's rows narrates a batch nobody asked for,
+ * and a banner about rows that are gone can outlive a navigation, a rescan and the ticks it
+ * names — taking Backspace with it, since a deletion on screen holds the key.
+ *
+ * `confirming` carries none, deliberately: it is modal, so nothing can move the scope under
+ * it, and the report it ends on has to survive the one thing that does — this page sending
+ * itself back to the root when the batch patched the tree.
  */
 type Deletion =
-  | { phase: 'previewing' }
-  | { phase: 'previewFailed'; message: string }
+  | ({ phase: 'previewing' } & Scope)
+  | ({ phase: 'previewFailed'; message: string } & Scope)
   | {
       phase: 'confirming';
       /** The mode the entry point asked for; the dialog's toggle may move away from it. */
@@ -67,6 +82,13 @@ type Deletion =
       preview: Preview;
       status: BatchStatus;
     };
+
+function outOfScope(deletion: Deletion, scope: Scope): boolean {
+  return (
+    deletion.phase !== 'confirming' &&
+    (deletion.generation !== scope.generation || deletion.node !== scope.node)
+  );
+}
 
 /** Backspace in a text field edits the text; anywhere else it goes up one directory. */
 function isEditable(target: EventTarget | null): boolean {
@@ -148,63 +170,89 @@ function ResultHeader({ status, disk, onRescan }: ResultHeaderProps) {
 }
 
 /**
- * What the ticked rows are and what may be done to them. Two entry points, because a button
- * that opened a dialog headed "Move 2 items to the Trash?" would be asking about something
- * else; the safety gate does not move with them — a permanent deletion still waits for the
- * acknowledgement inside the dialog, so the danger button opens a dialog armed for nothing.
+ * A refused `action_preview`: the guards never ran, so nothing was even proposed — which is
+ * a different and much smaller thing than a batch that ran and failed, and has to read like
+ * one. The ticks stay, so the two buttons beside this are a retry.
+ *
+ * One line, inside the bar rather than under it, because a block of its own would push the
+ * table down a second time — asynchronously, while the pointer is over a row.
  */
-function SelectionBar({
-  summary,
-  busy,
-  onDelete,
-}: {
-  summary: string;
-  busy: boolean;
-  onDelete: (mode: DeletionMode) => void;
-}) {
+function PreviewError({ message }: { message: string }) {
   return (
-    <div
-      data-testid="selection-bar"
-      className="flex flex-wrap items-center gap-3 rounded-lg border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900"
+    <p
+      role="alert"
+      data-testid="preview-error"
+      className="flex min-w-0 items-baseline gap-2 text-sm"
     >
-      {/* The same words the live region above announces, so they are not read twice. */}
-      <p aria-hidden="true" className="text-sm font-medium tabular-nums">
-        {summary}
-      </p>
-      <div className="ml-auto flex gap-2">
-        <Button disabled={busy} onClick={() => onDelete('trash')}>
-          Move to Trash
-        </Button>
-        <Button variant="danger" disabled={busy} onClick={() => onDelete('permanent')}>
-          Delete permanently
-        </Button>
-      </div>
-    </div>
+      <span className="shrink-0 font-medium text-red-700 dark:text-red-400">
+        Could not check what would be deleted
+      </span>
+      <span className="truncate font-mono text-xs text-red-700 dark:text-red-300" title={message}>
+        {message}
+      </span>
+      <span className="shrink-0 text-muted">Nothing was deleted.</span>
+    </p>
   );
 }
 
 /**
- * A refused `action_preview`: the guards never ran, so nothing was even proposed — which is
- * a different and much smaller thing than a batch that ran and failed, and has to read like
- * one. The ticks stay, so the two buttons are a retry.
+ * What the ticked rows are and what may be done to them. Two entry points, because a button
+ * that opened a dialog headed "Move 2 items to the Trash?" would be asking about something
+ * else; the safety gate does not move with them — a permanent deletion still waits for the
+ * acknowledgement inside the dialog, so the danger button opens a dialog armed for nothing.
+ *
+ * It keeps its place in the layout when it has nothing to say. Measured at 1280 px, showing
+ * it moves everything below by 61.4 px against a row of 34.5 px: the first tick would slide
+ * the next row the user is aiming at almost two rows up, on the one screen in this app that
+ * deletes things. `invisible` also takes the buttons out of the tab order, and `aria-hidden`
+ * out of the accessibility tree, so a bar nobody can see is not a trap either.
  */
-function PreviewError({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+function SelectionBar({
+  summary,
+  shown,
+  busy,
+  error,
+  onDelete,
+  onDismiss,
+}: {
+  summary: string;
+  shown: boolean;
+  busy: boolean;
+  error: string | null;
+  onDelete: (mode: DeletionMode) => void;
+  onDismiss: () => void;
+}) {
   return (
     <div
-      role="alert"
-      data-testid="preview-error"
-      className="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm dark:border-red-900 dark:bg-red-950/40"
+      data-testid="selection-bar"
+      role="toolbar"
+      aria-label="Selection"
+      aria-hidden={shown ? undefined : true}
+      className={`flex items-center gap-3 rounded-lg border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900 ${
+        shown ? '' : 'invisible'
+      }`}
     >
-      <div className="min-w-0">
-        <p className="font-medium text-red-800 dark:text-red-300">
-          Could not check what would be deleted
+      {error === null ? (
+        // The same words the live region above announces, so they are not read twice.
+        <p aria-hidden="true" className="truncate text-sm font-medium tabular-nums">
+          {summary}
         </p>
-        <p className="font-mono text-xs break-words text-red-700 dark:text-red-300">{message}</p>
+      ) : (
+        <PreviewError message={error} />
+      )}
+      <div className="ml-auto flex shrink-0 gap-2">
+        {error !== null && (
+          <Button disabled={!shown} onClick={onDismiss}>
+            Dismiss
+          </Button>
+        )}
+        <Button disabled={busy || !shown} onClick={() => onDelete('trash')}>
+          Move to Trash
+        </Button>
+        <Button variant="danger" disabled={busy || !shown} onClick={() => onDelete('permanent')}>
+          Delete permanently
+        </Button>
       </div>
-      <p className="text-muted">Nothing was deleted.</p>
-      <Button className="ml-auto" onClick={onDismiss}>
-        Dismiss
-      </Button>
     </div>
   );
 }
@@ -241,6 +289,9 @@ export default function ExplorerPage() {
     [generation, isKeyboard],
   );
 
+  // What everything below is scoped to: one tree, one directory.
+  const scope: Scope = { generation, node: current.id };
+
   const [picked, setPicked] = useState<Selection>({
     generation,
     node: ROOT_ID,
@@ -261,10 +312,10 @@ export default function ExplorerPage() {
     setPicked({ generation, node: current.id, ids: NO_SELECTION });
   }
   const selection = stale ? NO_SELECTION : picked.ids;
-  const select = useCallback(
-    (ids: ReadonlySet<NodeId>) => setPicked({ generation, node: current.id, ids }),
-    [generation, current.id],
-  );
+  // Not memoized: `NodeTable` reads this through a ref of its own and hands its rows one
+  // stable handler, so a new identity per render costs nothing and a `useCallback` here
+  // only gives the React compiler a dependency list to disagree with.
+  const select = (ids: ReadonlySet<NodeId>) => setPicked({ ...scope, ids });
 
   const [deletion, setDeletion] = useState<Deletion | null>(null);
   // One call of a deletion in flight, and a ref because that has to be true before React
@@ -272,6 +323,30 @@ export default function ExplorerPage() {
   // two overlapping `action_run` calls resolve their ids against one generation — whichever
   // splices second is dropped, and its rows stay in the tree until the next scan.
   const calling = useRef(false);
+  // Which preview a reply may still open a dialog for. Bumped whenever the scope moves, so
+  // a reply that was in flight across a navigation finds itself stale and is dropped
+  // instead of opening a modal over rows the user is no longer looking at.
+  const request = useRef(0);
+  // The other half of the same rule, in state: the "Checking…" and the banner it may end
+  // with are dropped when the scope they were started in is gone. Same shape as the ticks
+  // above — adjusted while rendering, and read through `pending` in this render too.
+  const orphaned = deletion !== null && outOfScope(deletion, scope);
+  if (orphaned) {
+    setDeletion(null);
+  }
+  const pending = orphaned ? null : deletion;
+
+  // A deletion that has not become a dialog belongs where it was started. Its state is
+  // dropped while rendering, below; the two refs cannot be touched there — rendering has to
+  // stay pure — and they belong together anyway.
+  useEffect(() => {
+    request.current += 1;
+    // Freeing the guard here is what keeps the next directory's buttons from doing nothing
+    // at all while an abandoned preview is still on the wire. It cannot free a running
+    // batch by accident: the dialog is modal, so no scope moves under one — and the only
+    // move that happens during a batch is this page's own, after the outcome is in hand.
+    calling.current = false;
+  }, [generation, current.id]);
 
   const root = useQuery({ queryKey: ['defaultRoot'], queryFn: defaultRoot, staleTime: Infinity });
   // `tree_node` rejects with "no scan result" until a scan is done or cancelled.
@@ -300,8 +375,10 @@ export default function ExplorerPage() {
 
   // The dialog is modal, and this listener is on the window: without the guard, Backspace
   // would walk the Explorer up a directory behind an open dialog — taking the selection the
-  // dialog is asking about with it.
-  const asking = deletion !== null;
+  // dialog is asking about with it. The preview round trip counts, and is the only part of
+  // this with no backdrop of its own to stop the key. A banner does not: it is a message,
+  // not a dialog, and a page that holds the keyboard until someone finds Dismiss is stuck.
+  const asking = pending !== null && pending.phase !== 'previewFailed';
   useEffect(() => {
     if (parentId === null || asking) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -325,7 +402,7 @@ export default function ExplorerPage() {
   // from the ids alone, so that a row this directory does not have cannot reach a batch.
   const ticked = view === undefined ? [] : view.children.filter((child) => selection.has(child.id));
   const tickedBytes = ticked.reduce((sum, child) => sum + child.size, 0);
-  const checking = deletion?.phase === 'previewing';
+  const checking = pending?.phase === 'previewing';
   const summary = checking
     ? 'Checking what would be deleted…'
     : `${countLabel(ticked.length, 'item')} selected · ${formatBytes(tickedBytes)}`;
@@ -334,14 +411,23 @@ export default function ExplorerPage() {
   const askToDelete = (mode: DeletionMode) => {
     if (view === undefined || ticked.length === 0 || calling.current) return;
     calling.current = true;
-    setDeletion({ phase: 'previewing' });
+    const asked = { ...scope, token: request.current };
+    setDeletion({ phase: 'previewing', ...scope });
     // `ChildView` carries no path of its own: a row is its parent's path and its name.
     const paths = ticked.map((child) => `${view.path}/${child.name}`);
     void actionPreview(paths, mode)
       .then(
-        (preview) =>
-          setDeletion({ phase: 'confirming', mode, paths, preview, status: { phase: 'asking' } }),
-        (e: unknown) => setDeletion({ phase: 'previewFailed', message: String(e) }),
+        (preview) => {
+          // The user left while this was on the wire. Opening the dialog now would put a
+          // modal about another directory's rows in front of them, and a `previewFailed`
+          // would name rows that are no longer on screen; both are the reply's to drop.
+          if (request.current !== asked.token) return;
+          setDeletion({ phase: 'confirming', mode, paths, preview, status: { phase: 'asking' } });
+        },
+        (e: unknown) => {
+          if (request.current !== asked.token) return;
+          setDeletion({ phase: 'previewFailed', message: String(e), ...asked });
+        },
       )
       .finally(() => {
         calling.current = false;
@@ -364,19 +450,28 @@ export default function ExplorerPage() {
     // in the cache still holds ids from the arena the splice threw away, and the Explorer
     // would go on drawing a tree that no longer exists.
     void queries.invalidateQueries({ queryKey: ['treeNode', generation] });
-    void queries.invalidateQueries({ queryKey: ['diskUsage'] });
+    void queries.invalidateQueries({ queryKey: ['diskUsage', generation] });
     // A batch emits no event, so the header's bytes and counters have to be asked for.
     void scan.refresh();
     // And the id this page navigates by is one of the ids that moved: `install_patches`
     // rebuilds the arena, and `replace_subtrees` re-sorts every sibling group holding a node
     // whose size changed — which is every ancestor of the deletion. Refetching the old id
     // would silently open another directory. The root is the one id a splice cannot move.
+    //
+    // `treeStale: true` is the case this is deliberately too careful for: the splice was
+    // dropped, so the old ids still mean what they did and the Explorer could have stayed
+    // where it was. It is not worth telling the two apart — `treeStale` also covers a patch
+    // that installed after an incomplete rescan, where the ids did move.
     setNav({ generation, id: ROOT_ID, focus: false });
   };
 
   /** Runs the batch the dialog is showing, in the mode its toggle now stands at. */
   const runDeletion = (mode: DeletionMode) => {
-    if (deletion?.phase !== 'confirming' || calling.current) return;
+    // Two guards for one rule, because they fail in different directions: `calling` is the
+    // only thing two clicks in one task can see, and the status is the only thing left if
+    // the guard was freed by a scope that moved under a batch — which nothing can do today.
+    if (deletion?.phase !== 'confirming' || deletion.status.phase !== 'asking') return;
+    if (calling.current) return;
     calling.current = true;
     const asked = deletion;
     setDeletion({ ...asked, status: { phase: 'running' } });
@@ -449,12 +544,14 @@ export default function ExplorerPage() {
           <p role="status" data-testid="selection-status" className="sr-only">
             {ticked.length > 0 ? summary : ''}
           </p>
-          {ticked.length > 0 && (
-            <SelectionBar summary={summary} busy={checking} onDelete={askToDelete} />
-          )}
-          {deletion?.phase === 'previewFailed' && (
-            <PreviewError message={deletion.message} onDismiss={() => setDeletion(null)} />
-          )}
+          <SelectionBar
+            summary={summary}
+            shown={ticked.length > 0}
+            busy={checking}
+            error={pending?.phase === 'previewFailed' ? pending.message : null}
+            onDelete={askToDelete}
+            onDismiss={() => setDeletion(null)}
+          />
           <NodeTable
             node={view}
             focusFirstRow={current.focus}
@@ -463,13 +560,13 @@ export default function ExplorerPage() {
             selection={selection}
             onSelectionChange={select}
           />
-          {deletion?.phase === 'confirming' && (
+          {pending?.phase === 'confirming' && (
             <ConfirmDeleteDialog
               // A whole `Preview` where `Omit<Preview, 'mode'>` is asked for, and no cast:
               // the dialog simply cannot read the mode the guards were called with.
-              preview={deletion.preview}
-              status={deletion.status}
-              initialMode={deletion.mode}
+              preview={pending.preview}
+              status={pending.status}
+              initialMode={pending.mode}
               onConfirm={runDeletion}
               // "Unmount me", in every phase, and no claim about whether a batch ran — this
               // page knows that from `deletion.status`, and has already acted on it.

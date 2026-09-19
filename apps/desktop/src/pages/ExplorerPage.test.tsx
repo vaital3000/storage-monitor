@@ -454,6 +454,18 @@ describe('ExplorerPage after a scan', () => {
 });
 
 describe('ExplorerPage deleting the selection', () => {
+  /**
+   * The action bar, which is in the layout whether or not it has anything to say: the first
+   * tick must not move the rows under the pointer. `aria-hidden` is how it says which.
+   */
+  function bar(): HTMLElement {
+    return screen.getByTestId('selection-bar');
+  }
+
+  function barShows(): boolean {
+    return bar().getAttribute('aria-hidden') === null;
+  }
+
   /** Ticks every row of `rows` and opens the dialog from one of the bar's two buttons. */
   async function ask(rows: string[], button: string): Promise<HTMLElement> {
     for (const name of rows) {
@@ -490,22 +502,31 @@ describe('ExplorerPage deleting the selection', () => {
     const announcement = screen.getByRole('status');
     expect(announcement).toHaveAttribute('data-testid', 'selection-status');
     expect(announcement.textContent).toBe('');
-    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
+    // Hidden means hidden: a bar nobody can see holds no buttons anyone can reach.
+    expect(screen.queryByRole('button', { name: 'Move to Trash' })).not.toBeInTheDocument();
 
     const total = fixtureNode('Downloads').size + fixtureNode('Movies').size;
     fireEvent.click(box('Downloads'));
     fireEvent.click(box('Movies'));
-    const bar = screen.getByTestId('selection-bar');
-    expect(bar).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
+    expect(barShows()).toBe(true);
+    expect(bar()).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
     // A row cannot carry `aria-selected` while the table is not a grid, so the count is what
     // a screen reader hears when Space ticks a row — once, from the region that is always
     // mounted, and not a second time from the words next to the buttons.
     expect(announcement).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
-    expect(within(bar).getByText(/selected/)).toHaveAttribute('aria-hidden', 'true');
+    expect(within(bar()).getByText(/selected/)).toHaveAttribute('aria-hidden', 'true');
+    // Named, because it is the only place in the app where a selection can be acted on.
+    expect(bar()).toHaveAttribute('role', 'toolbar');
+    expect(bar()).toHaveAccessibleName('Selection');
+    expect(within(bar()).getByRole('button', { name: 'Delete permanently' })).toHaveAttribute(
+      'data-variant',
+      'danger',
+    );
 
     fireEvent.click(box('Downloads'));
     fireEvent.click(box('Movies'));
-    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
     expect(announcement.textContent).toBe('');
   });
 
@@ -546,7 +567,7 @@ describe('ExplorerPage deleting the selection', () => {
     );
 
     await waitFor(() => expect(names()).not.toContain('Downloads'));
-    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
     await waitFor(() =>
       expect(screen.getByTestId('scan-summary')).toHaveTextContent(
         formatBytes(scanned0.bytes - downloads),
@@ -652,17 +673,17 @@ describe('ExplorerPage deleting the selection', () => {
     expect(names()).toContain('Downloads');
     // The ticks are still there: nothing was deleted, so nothing about them is stale.
     expect(box('Downloads')).toBeChecked();
-    expect(screen.getByTestId('selection-bar')).toBeInTheDocument();
+    expect(barShows()).toBe(true);
   });
 
   it('drops the selection when the directory changes', async () => {
     await scanned();
     fireEvent.click(box('Downloads'));
-    expect(screen.getByTestId('selection-bar')).toBeInTheDocument();
+    expect(barShows()).toBe(true);
 
     fireEvent.click(row('Movies'));
     await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
-    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
 
     fireEvent.click(
       within(screen.getByRole('navigation', { name: 'Breadcrumb' })).getByRole('button', {
@@ -671,20 +692,20 @@ describe('ExplorerPage deleting the selection', () => {
     );
     await waitFor(() => expect(crumbs()).toEqual(['demo']));
     expect(box('Downloads')).not.toBeChecked();
-    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
   });
 
   it('drops the selection when a rescan renumbers the tree', async () => {
     await scanned();
     fireEvent.click(box('Downloads'));
-    expect(screen.getByTestId('selection-bar')).toBeInTheDocument();
+    expect(barShows()).toBe(true);
 
     fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
     await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
     // A `NodeId` means nothing across a scan: the row that takes id 6 in the new tree is not
     // the row that was ticked in the old one.
     await waitFor(() => expect(box('Downloads')).not.toBeChecked());
-    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
   });
 
   it('says it is checking while the preview is on its way, and checks once', async () => {
@@ -747,6 +768,99 @@ describe('ExplorerPage deleting the selection', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(names()).toContain('Downloads');
     expect(box('Downloads')).toBeChecked();
+
+    // A refusal is one of the four ways out of a batch, and the guard has to come back from
+    // every one of them. A page that deletes, meets a refusal and then quietly refuses for
+    // the rest of the session looks exactly like a page that is working.
+    const retry = await ask([], 'Move to Trash');
+    fireEvent.click(confirmButton(retry));
+    expect(await within(retry).findByTestId('result-summary')).toBeInTheDocument();
+  });
+
+  it('drops a refused preview when the directory changes', async () => {
+    await scanned();
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    await screen.findByTestId('preview-error');
+
+    // It names rows of a directory the user has left, whose ticks the page has dropped.
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    expect(screen.queryByTestId('preview-error')).not.toBeInTheDocument();
+  });
+
+  it('keeps Backspace working while a refused preview is on screen', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('q3-report.pdf'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    await screen.findByTestId('preview-error');
+
+    // Nothing here is modal: the banner is a message, not a dialog, and a page that holds
+    // the keyboard until someone finds the Dismiss button is a page that is stuck.
+    fireEvent.keyDown(document.body, { key: 'Backspace' });
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+  });
+
+  it('holds Backspace from the moment the preview is asked for', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const release = holdReply('action_preview');
+    fireEvent.click(box('q3-report.pdf'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // The one window with no backdrop to stop the key: the dialog is not up yet, and the
+    // preview on its way is about the directory this would walk out of.
+    fireEvent.keyDown(document.body, { key: 'Backspace' });
+    await settle();
+    expect(crumbs()).toEqual(['demo', 'Downloads']);
+
+    release();
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('forgets a preview whose directory the user left, and takes the next one', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    release();
+    await settle();
+    // No dialog over rows nobody is looking at, and no "Checking…" about them either.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    fireEvent.click(box('family-2025.mov'));
+    expect(bar()).toHaveTextContent('1 item selected');
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Movies/family-2025.mov`]);
+  });
+
+  it('goes back to the top from any depth, not one level up', async () => {
+    await scanned();
+    fireEvent.click(row('Documents'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Documents']));
+    fireEvent.click(row('Design'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Documents', 'Design']));
+
+    const dialog = await ask(['mockups.sketch'], 'Move to Trash');
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    // The parent is as renumbered as the row that went; only the root is fixed.
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
   });
 
   it('runs one batch, whatever the dialog manages to ask for', async () => {
@@ -816,7 +930,7 @@ describe('ExplorerPage deleting the selection', () => {
     expect(names()).toContain('q3-report.pdf');
     expect(commands).not.toContain('tree_node');
     // The selection goes anyway: the question it was asked for has been answered.
-    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
   });
 
   it('patches the tree for an entry that failed, although nothing was removed', async () => {
