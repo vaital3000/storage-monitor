@@ -52,6 +52,16 @@ export interface ScanController {
   /** Starts a scan of `root` (default: the home folder). Never throws; failures land in `status`. */
   start: (root?: string) => Promise<void>;
   cancel: () => Promise<void>;
+  /**
+   * Re-reads `scan_status` without starting anything, and without bumping the generation.
+   *
+   * A deletion patches the tree and the counters behind it (`patched_stats`) and emits no
+   * event at all, so nothing else here would ever hear about it: the header would go on
+   * reporting the bytes and the folder count of rows that are gone. The generation stays
+   * where it is on purpose — the scan did not change, and bumping it would throw away every
+   * tree query of a tree that is still the one on screen.
+   */
+  refresh: () => Promise<void>;
 }
 
 let generations = 0;
@@ -157,6 +167,23 @@ export function useScan(): ScanController {
     }
   }, [status.state]);
 
+  const refresh = useCallback(async () => {
+    let next: ScanStatus;
+    try {
+      next = await scanStatus();
+    } catch {
+      // A read that failed says nothing about the counters on screen, and a batch is not the
+      // place to turn a finished scan into a failed one.
+      return;
+    }
+    touched.current = true;
+    // Never over a running scan: `scan:progress` is fresher than any reply — the reply was
+    // read before it was sent — and a walk in flight reports its own counters anyway. The
+    // state is read inside the updater rather than from the render this callback was made
+    // in, so a scan that started while the reply was on its way is seen.
+    setStatus((current) => (isTerminal(current.state) ? next : current));
+  }, []);
+
   return {
     status,
     ready,
@@ -165,5 +192,6 @@ export function useScan(): ScanController {
     cancelling,
     start,
     cancel,
+    refresh,
   };
 }

@@ -222,6 +222,49 @@ describe('useScan', () => {
     expect(result.current.status.error).toBe('Error: boom');
   });
 
+  it('refreshes the counters of a finished scan without bumping the generation', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    await act(() => result.current.start());
+    await waitFor(() => expect(result.current.status.state).toBe('done'));
+    const generation = result.current.generation;
+    const bytes = result.current.status.bytes;
+
+    // What a batch leaves behind: the manager's counters have moved and no event says so.
+    const patched: ScanStatus = { ...fixtureStatusDone(), bytes: bytes - 1, files: 3, dirs: 2 };
+    replyOnce('scan_status', () => patched);
+    await act(() => result.current.refresh());
+    expect(result.current.status).toEqual(patched);
+    // The scan did not change, so no tree query may be thrown away.
+    expect(result.current.generation).toBe(generation);
+  });
+
+  it('leaves a running scan alone when refreshed: the events are fresher', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    setMockScanDelay(10_000);
+    await act(() => result.current.start());
+    const running: ScanStatus = { ...result.current.status, files: 42, currentPath: '/x' };
+    await act(() => emit(SCAN_PROGRESS_EVENT, running));
+
+    replyOnce('scan_status', () => ({ ...IDLE_STATUS, state: 'running', root: FIXTURE_ROOT }));
+    await act(() => result.current.refresh());
+    expect(result.current.status).toEqual(running);
+  });
+
+  it('keeps the counters when the refresh is refused', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    await act(() => result.current.start());
+    await waitFor(() => expect(result.current.status.state).toBe('done'));
+
+    replyOnce('scan_status', () => {
+      throw 'no scan result';
+    });
+    await act(() => result.current.refresh());
+    expect(result.current.status).toEqual(fixtureStatusDone());
+  });
+
   it('stops listening after unmount, without leaking a listener', async () => {
     const warn = vi.spyOn(console, 'warn');
     try {
