@@ -1331,11 +1331,12 @@ export type EntryResult =
 export interface PreviewEntry { path: string; kind: NodeKind; size: number; status: EntryStatus }
 export interface Preview { entries: PreviewEntry[]; totalBytes: number; mode: Mode }
 export interface EntryOutcome { path: string; kind: NodeKind; result: EntryResult }
-export interface Outcome { entries: EntryOutcome[]; freedBytes: number; at: string }
+export interface Outcome { entries: EntryOutcome[]; freedBytes: number; at: string; mode: Mode }
+export interface BatchResult { outcome: Outcome; recorded: boolean; treeStale: boolean }
 export interface ActivityEntry { at: string; path: string; kind: NodeKind; mode: Mode; result: 'removed' | 'failed' | 'skipped'; detail: string | null; bytes: number }
 
 export function actionPreview(paths: string[], mode: Mode): Promise<Preview>
-export function actionRun(paths: string[], mode: Mode): Promise<Outcome>
+export function actionRun(paths: string[], mode: Mode): Promise<BatchResult>
 export function activityLog(limit?: number): Promise<{ entries: ActivityEntry[]; damaged: number }>
 ```
 
@@ -1397,7 +1398,7 @@ git commit -m "feat(desktop): select rows in the node table"
 
 **Step 1: Write the failing tests**
 
-The dialog lists every preview entry with its formatted size; blocked entries are shown with their reason and are visually muted; the total counts only the ready entries; the Trash option explains that space is freed when the Trash is emptied; choosing Permanent disables the confirm button until the "I understand" checkbox is ticked, and switching back to Trash re-enables it and clears the checkbox; Escape calls `onCancel`; focus lands on Cancel when the dialog opens; the confirm button reports the mode it was confirmed with; while the batch runs the buttons are disabled and a busy label is shown; when an outcome arrives the dialog switches to the result view, listing failures with their messages.
+The dialog lists every preview entry with its formatted size; blocked entries are shown with their reason and are visually muted; the total counts only the ready entries; the Trash option explains that space is freed when the Trash is emptied; choosing Permanent disables the confirm button until the "I understand" checkbox is ticked, and switching back to Trash re-enables it and clears the checkbox; Escape calls `onCancel`; focus lands on Cancel when the dialog opens; the confirm button reports the mode it was confirmed with; while the batch runs the buttons are disabled and a busy label is shown; when an outcome arrives the dialog switches to the result view, listing failures with their messages, and — because a batch can succeed at deleting and still fail to tell anyone — saying so when `recorded` is false ("deleted, but not recorded") and when `treeStale` is true ("the Explorer may be stale until the next scan"). Neither is an error in the deletion; both are the app admitting the record or the view no longer matches the disk.
 
 Use `@testing-library/user-event` for the keyboard assertions — it is already a dependency through `@testing-library/dom`. If it is not, add `@testing-library/user-event` to `devDependencies`.
 
@@ -1468,7 +1469,7 @@ git commit -m "feat(desktop): delete selected entries from the Explorer"
 
 **Step 1: Write the failing tests**
 
-An empty log renders "No actions yet"; entries render newest first with a formatted time, the path, the mode and the size; a failed entry shows its message; a **skipped** entry shows its reason, mapped from `detail` — and the map reads `result` first, because `detail` carries a failure message for `Failed` and a block reason for `Skipped`, so a failure whose message reads `denylisted` is not a blocked entry; a non-zero `damaged` count renders as "N damaged entries hidden", never silently; a log that could not be read renders as an error rather than as an empty list; the page refetches when it is opened after a batch.
+An empty log renders "No actions yet"; entries render newest first with a formatted time, the path, the mode and the size; a failed entry shows its message; a row's path is the one the guards normalized, which under a symlinked scan root is **not** the spelling the Explorer showed — so do not try to match an Activity row back to a tree row by string; a **skipped** entry shows its reason, mapped from `detail` — and the map reads `result` first, because `detail` carries a failure message for `Failed` and a block reason for `Skipped`, so a failure whose message reads `denylisted` is not a blocked entry; a non-zero `damaged` count renders as "N damaged entries hidden", never silently; a log that could not be read renders as an error rather than as an empty list; the page refetches when it is opened after a batch.
 
 **Step 2: Run to verify failure**
 
