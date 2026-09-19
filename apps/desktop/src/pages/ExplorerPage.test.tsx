@@ -1,7 +1,8 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
+import type { BatchResult } from '../lib/ipc';
 import {
   DIFFERENT_VOLUME,
   FIXTURE_ROOT,
@@ -14,7 +15,7 @@ import {
 } from '../mocks/fixtures';
 import { installIpcMock, revealed, setMockScanDelay } from '../mocks/ipc';
 import { charts, lastChart } from '../test/echarts';
-import { holdReply, replyOnce } from '../test/invoke';
+import { holdReply, recordCommands, replyOnce } from '../test/invoke';
 import { renderWithClient } from '../test/render';
 import ExplorerPage from './ExplorerPage';
 
@@ -40,8 +41,20 @@ function rows(): HTMLElement[] {
   return within(screen.getByTestId('node-rows')).getAllByRole('row');
 }
 
+/**
+ * The cells of a row that hold data, numbered from the name: name, size, %, Δ, files,
+ * modified, actions. The checkbox the page hands the table sits in front of them, so the
+ * numbering is taken from the end — where it stays put whether or not a column is added in
+ * front of it.
+ */
+const DATA_CELLS = 7;
+
+function cellsOf(row: HTMLElement): HTMLElement[] {
+  return within(row).getAllByRole('cell').slice(-DATA_CELLS);
+}
+
 function nameOf(row: HTMLElement): string {
-  return within(row).getAllByRole('cell')[0].textContent ?? '';
+  return cellsOf(row)[0].textContent ?? '';
 }
 
 function names(): string[] {
@@ -57,7 +70,12 @@ function row(name: string): HTMLElement {
 }
 
 function cells(name: string): HTMLElement[] {
-  return within(row(name)).getAllByRole('cell');
+  return cellsOf(row(name));
+}
+
+/** The tick box of a row, by the label the table gives it. */
+function box(name: string): HTMLElement {
+  return within(row(name)).getByRole('checkbox');
 }
 
 function crumbs(): string[] {
@@ -432,5 +450,330 @@ describe('ExplorerPage after a scan', () => {
     release();
     await waitFor(() => expect(crumbs()).toEqual(['demo']));
     expect(names()[0]).toBe('Library');
+  });
+});
+
+describe('ExplorerPage deleting the selection', () => {
+  /** Ticks every row of `rows` and opens the dialog from one of the bar's two buttons. */
+  async function ask(rows: string[], button: string): Promise<HTMLElement> {
+    for (const name of rows) {
+      fireEvent.click(box(name));
+    }
+    fireEvent.click(screen.getByRole('button', { name: button }));
+    return screen.findByRole('dialog');
+  }
+
+  /** The dialog's confirming button, which is not the bar's button of the same name. */
+  function confirmButton(dialog: HTMLElement): HTMLElement {
+    return within(dialog).getByTestId('confirm-delete');
+  }
+
+  /** The paths listed in the dialog, in the order it shows them. */
+  function listed(dialog: HTMLElement): string[] {
+    return within(within(dialog).getByTestId('delete-entries'))
+      .getAllByTitle(new RegExp(`^${FIXTURE_ROOT}`))
+      .map((entry) => entry.textContent ?? '');
+  }
+
+  /** Two clicks React cannot re-render between, which is what a state guard would miss. */
+  function clickTwice(button: HTMLElement): void {
+    act(() => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+  }
+
+  it('shows the count and the summed size of the ticked rows, and announces them', async () => {
+    await scanned();
+    const announcement = screen.getByTestId('selection-status');
+    expect(announcement.textContent).toBe('');
+    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+
+    const total = fixtureNode('Downloads').size + fixtureNode('Movies').size;
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(box('Movies'));
+    const bar = screen.getByTestId('selection-bar');
+    expect(bar).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
+    // A row cannot carry `aria-selected` while the table is not a grid, so the count is what
+    // a screen reader hears when Space ticks a row.
+    expect(announcement).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
+
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(box('Movies'));
+    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    expect(announcement.textContent).toBe('');
+  });
+
+  it('opens the dialog over exactly the ticked rows, in the Trash mode', async () => {
+    await scanned();
+    const total = fixtureNode('Downloads').size + fixtureNode('Movies').size;
+    const dialog = await ask(['Downloads', 'Movies'], 'Move to Trash');
+
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Downloads`, `${FIXTURE_ROOT}/Movies`]);
+    expect(within(dialog).getByTestId('delete-total')).toHaveTextContent(
+      `2 items · ${formatBytes(total)}`,
+    );
+    expect(within(dialog).getByRole('radio', { name: 'Trash' })).toBeChecked();
+    expect(confirmButton(dialog)).toBeEnabled();
+  });
+
+  it('opens in the Permanent mode from the danger button, still behind the tick', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Delete permanently');
+
+    expect(within(dialog).getByRole('radio', { name: 'Permanent' })).toBeChecked();
+    expect(within(dialog).getByTestId('mode-explanation')).toHaveTextContent('cannot be undone');
+    expect(confirmButton(dialog)).toBeDisabled();
+
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /I understand/ }));
+    expect(confirmButton(dialog)).toBeEnabled();
+  });
+
+  it('deletes the ticked rows, drops the selection and shrinks the header', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').size;
+    const scanned0 = fixtureStatusDone();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+
+    fireEvent.click(confirmButton(dialog));
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent(
+      `Moved 1 item to the Trash · ${formatBytes(downloads)}`,
+    );
+
+    await waitFor(() => expect(names()).not.toContain('Downloads'));
+    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId('scan-summary')).toHaveTextContent(
+        formatBytes(scanned0.bytes - downloads),
+      ),
+    );
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('re-reads the tree and the volume the batch changed', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const commands = recordCommands();
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+
+    // The cache is keyed by a generation the splice never reaches, so nothing upstream
+    // refetches: without these three the Explorer keeps drawing the tree that was thrown
+    // away, the disk bar keeps the free space of before, and the header keeps the bytes.
+    await waitFor(() => expect(commands).toContain('tree_node'));
+    await waitFor(() => expect(commands).toContain('disk_usage'));
+    await waitFor(() => expect(commands).toContain('scan_status'));
+  });
+
+  it('deletes what it can when one entry is blocked, and names the blocked one', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').size;
+    const dialog = await ask(['Library', 'Downloads'], 'Move to Trash');
+    expect(within(dialog).getByTestId('delete-total')).toHaveTextContent('1 blocked');
+
+    fireEvent.click(confirmButton(dialog));
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent(
+      `Moved 1 item to the Trash · ${formatBytes(downloads)}`,
+    );
+    const skipped = within(dialog).getByTestId('result-skipped');
+    expect(skipped).toHaveTextContent(`${FIXTURE_ROOT}/Library`);
+    expect(skipped).toHaveTextContent('Inside a folder this app never deletes from');
+
+    await waitFor(() => expect(names()).not.toContain('Downloads'));
+    expect(names()).toContain('Library');
+  });
+
+  it('leaves everything alone when the dialog is cancelled', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const commands = recordCommands();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await settle();
+    expect(commands).not.toContain('action_run');
+    expect(names()).toContain('Downloads');
+    // The ticks are still there: nothing was deleted, so nothing about them is stale.
+    expect(box('Downloads')).toBeChecked();
+    expect(screen.getByTestId('selection-bar')).toBeInTheDocument();
+  });
+
+  it('drops the selection when the directory changes', async () => {
+    await scanned();
+    fireEvent.click(box('Downloads'));
+    expect(screen.getByTestId('selection-bar')).toBeInTheDocument();
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Breadcrumb' })).getByRole('button', {
+        name: 'demo',
+      }),
+    );
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(box('Downloads')).not.toBeChecked();
+    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+  });
+
+  it('drops the selection when a rescan renumbers the tree', async () => {
+    await scanned();
+    fireEvent.click(box('Downloads'));
+    expect(screen.getByTestId('selection-bar')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    // A `NodeId` means nothing across a scan: the row that takes id 6 in the new tree is not
+    // the row that was ticked in the old one.
+    await waitFor(() => expect(box('Downloads')).not.toBeChecked());
+    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+  });
+
+  it('says it is checking while the preview is on its way, and checks once', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    const commands = recordCommands();
+    fireEvent.click(box('Downloads'));
+    clickTwice(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    expect(screen.getByTestId('selection-status')).toHaveTextContent(
+      'Checking what would be deleted…',
+    );
+    expect(screen.getByRole('button', { name: 'Move to Trash' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete permanently' })).toBeDisabled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    release();
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('radio', { name: 'Trash' })).toBeChecked();
+    expect(commands.filter((cmd) => cmd === 'action_preview')).toHaveLength(1);
+  });
+
+  it('says a refused preview for what it is: nothing was deleted', async () => {
+    await scanned();
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Could not check what would be deleted');
+    expect(alert).toHaveTextContent('no scan result');
+    expect(alert).toHaveTextContent('Nothing was deleted.');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    // The sentence of a batch that ran and failed belongs to a batch that ran.
+    expect(screen.queryByText('The deletion did not run')).not.toBeInTheDocument();
+
+    // A second attempt is allowed, and takes the error away with it.
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(screen.queryByTestId('preview-error')).not.toBeInTheDocument();
+  });
+
+  it('keeps the rows and the ticks when the batch itself is refused', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    replyOnce('action_run', () => {
+      throw 'the volume went away';
+    });
+
+    fireEvent.click(confirmButton(dialog));
+    expect(await within(dialog).findByTestId('run-error')).toHaveTextContent(
+      'the volume went away',
+    );
+    expect(within(dialog).getByRole('heading', { name: 'The deletion did not run' })).toBeVisible();
+    expect(within(dialog).queryByTestId('result-summary')).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(names()).toContain('Downloads');
+    expect(box('Downloads')).toBeChecked();
+  });
+
+  it('runs one batch, whatever the dialog manages to ask for', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const commands = recordCommands();
+
+    // Two overlapping batches resolve their ids against one generation, and whichever
+    // splices second is dropped — leaving rows for entries that are gone. The dialog cannot
+    // stop this: it renders the status it is handed, and neither click has been answered.
+    clickTwice(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    expect(commands.filter((cmd) => cmd === 'action_run')).toHaveLength(1);
+  });
+
+  it('goes back to the top of the tree, because the splice renumbered it', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    // `replace_subtrees` rebuilds the arena and re-sorts every group holding a node whose
+    // size changed, so the id this page navigates by can name another directory now. The
+    // root is the one id a splice cannot move.
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(names()).toContain('Downloads');
+  });
+
+  it('stays where it is when the batch removed nothing', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+
+    // What the guards cannot see coming: an entry that goes missing between the preview and
+    // the syscall. Nothing was removed and nothing failed, so `touched` sends the splice no
+    // paths at all and every id the page holds still means what it did.
+    const skippedOnly: BatchResult = {
+      outcome: {
+        entries: [
+          {
+            path: `${FIXTURE_ROOT}/Downloads/q3-report.pdf`,
+            kind: 'file',
+            result: { result: 'skipped', reason: 'missing' },
+          },
+        ],
+        freedBytes: 0,
+        at: '2026-09-18T09:31:00Z',
+        mode: 'trash',
+      },
+      recorded: true,
+      treeStale: false,
+    };
+    replyOnce('action_run', () => skippedOnly);
+    const commands = recordCommands();
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await settle();
+
+    expect(crumbs()).toEqual(['demo', 'Downloads']);
+    expect(names()).toContain('q3-report.pdf');
+    expect(commands).not.toContain('tree_node');
+    // The selection goes anyway: the question it was asked for has been answered.
+    expect(screen.queryByTestId('selection-bar')).not.toBeInTheDocument();
+  });
+
+  it('leaves Backspace alone while the dialog is open', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    await ask(['q3-report.pdf'], 'Move to Trash');
+
+    fireEvent.keyDown(document.body, { key: 'Backspace' });
+    await settle();
+    expect(crumbs()).toEqual(['demo', 'Downloads']);
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
   });
 });

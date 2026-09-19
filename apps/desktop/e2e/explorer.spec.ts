@@ -15,8 +15,9 @@ function crumbs(page: Page): Locator {
 }
 
 // The name cell holds the name in a span titled with it; the lock/info markers next to
-// it are spans too, told apart by `data-marker`.
-const NAME_SPAN = 'td:first-child span[title]:not([data-marker])';
+// it are spans too, told apart by `data-marker`. It is the second cell, not the first: the
+// Explorer hands the table a selection, which puts a column of tick boxes in front.
+const NAME_SPAN = 'td:nth-child(2) span[title]:not([data-marker])';
 
 /** The names in the table, in display order. */
 function names(page: Page): Locator {
@@ -30,8 +31,9 @@ function row(page: Page, name: string): Locator {
     .filter({ has: page.locator(`${NAME_SPAN}[title="${name}"]`) });
 }
 
+/** The Δ cell: tick box, name, size, %, Δ. */
 function delta(page: Page, name: string): Locator {
-  return row(page, name).getByRole('cell').nth(3);
+  return row(page, name).getByRole('cell').nth(4);
 }
 
 /** Opens the app, starts a scan and waits for the table of the root. */
