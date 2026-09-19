@@ -250,9 +250,12 @@ export default function ExplorerPage() {
   // a directory the user comes back to shows the table as they left it everywhere else, and
   // ticks that reappear are ticks nobody is looking at while a batch is being confirmed.
   //
-  // Adjusted while rendering rather than in an effect (`react-hooks/set-state-in-effect`),
-  // and read through `stale` in the same render: no commit ever carries a selection from
-  // another tree or another directory, not even the one before an effect could run.
+  // Adjusted while rendering rather than in an effect (`react-hooks/set-state-in-effect`):
+  // React re-runs the component with the new state before committing, so nothing with ticks
+  // from elsewhere ever reaches the screen. Reading it through `stale` below is belt and
+  // braces on top of that, and invisible to any test — the render it corrects is the one
+  // React throws away. It is here for the day someone moves the adjustment into an effect,
+  // which is where this started and where a committed stale selection would come back.
   const stale = picked.generation !== generation || picked.node !== current.id;
   if (stale && picked.ids.size > 0) {
     setPicked({ generation, node: current.id, ids: NO_SELECTION });
