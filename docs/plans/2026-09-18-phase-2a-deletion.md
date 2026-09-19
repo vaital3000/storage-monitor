@@ -1327,7 +1327,15 @@ Run: `pnpm --filter @storage-monitor/desktop test src/mocks/fixtures.test.ts`
 
 ```ts
 export type Mode = 'trash' | 'permanent';
-export type BlockReason = 'outsideRoots' | 'denylisted' | 'isRoot' | 'nested' | 'missing' | 'kindChanged';
+export type BlockReason =
+  | 'outsideRoots'
+  | 'denylisted'
+  | 'isRoot'
+  | 'nested'
+  | 'missing'
+  | 'unreadable'
+  | 'kindChanged'
+  | 'malformed';
 export type EntryStatus = { state: 'ready' } | { state: 'blocked'; reason: BlockReason };
 export type EntryResult =
   | { result: 'removed'; bytes: number }
@@ -1346,7 +1354,17 @@ export function actionRun(paths: string[], mode: Mode): Promise<BatchResult>
 export function activityLog(limit?: number): Promise<{ entries: ActivityEntry[]; damaged: number }>
 ```
 
-The mock implements the same rules against the fixture: `outsideRoots` for anything not under `/Users/demo`, `isRoot` for `/Users/demo` itself, `nested` for a descendant of another entry in the same batch, `missing` for an unknown path. `actionRun` deletes the nodes from the in-memory fixture, subtracts their sizes from the ancestors and appends to a mock log array that `activityLog` reads. Export a `resetMockActions()` helper for tests, and call it from `src/test/setup.ts` between tests.
+The mock implements the same rules against the fixture, **including the denylist**: `outsideRoots` for anything not under `/Users/demo`, `isRoot` for `/Users/demo` itself, `nested` for a descendant of another entry in the same batch, `missing` for an unknown path, and `denylisted` for `/Users/demo/Library` and everything under it — which is most of the fixture's bulk, DerivedData and Docker.raw included, because the scan root is the home folder and `Limits` keeps `~/Library` denied.
+
+That last one is not a detail. A mock that allows what the backend refuses makes every UI test after this one green against a fiction, and the first real deletion of a DerivedData row comes back refused.
+
+**What the mock can and cannot stage, for Tasks 12–16.**
+
+- `Library` is denied and `Downloads` is ready, and they are the root listing's two largest rows — that pairing is Task 14's "a batch where one entry is blocked still deletes the other". Any test wanting a clean batch picks rows outside `Library`.
+- `.Trash` is ready although it carries a scan error, so Task 12's "a locked directory is still selectable" holds.
+- The mock cannot produce `failed`, `unreadable`, `kindChanged`, `recorded: false`, `treeStale: true`, or a rejected `activityLog`. `mockActionLog` is exported as raw JSONL lines, so Task 15 can push a `failed` line or a torn one to get `damaged > 0`; a rejected `activityLog` needs a stubbed wrapper.
+- **The header total does not shrink by itself.** `scan_status` returns patched totals, but `useScan` reads it once on mount and is otherwise fed by events, and a batch emits none. Take the total from the invalidated root `NodeView` — `treeNode().size`, which the mock does shrink — or add a refresh seam to `ScanController`.
+- `treeNode(id)` of a deleted node rejects with `unknown node <id>`, as the arena does after a splice. `actionRun` deletes the nodes from the in-memory fixture, subtracts their sizes from the ancestors and appends to a mock log array that `activityLog` reads. Export a `resetMockActions()` helper for tests, and call it from `src/test/setup.ts` between tests.
 
 **Step 4: Run the tests and commit**
 
