@@ -1232,6 +1232,8 @@ Both clone what they need and run the body inside `tauri::async_runtime::spawn_b
 
 **A rejected `actionRun` and a warning inside a resolved one mean opposite things, and the UI must not render them the same way.** `Err` means the batch **did not run** — the body panicked before doing the work, and the message reads "the batch did not finish". A batch that did run always resolves, and reports afterwards through `recorded: false` (deleted, no record) or `treeStale: true` (deleted, the view is behind). Showing an error for that second pair would tell the user nothing happened at the moment 40 GB went.
 
+That is a **release-build** statement, and a rule rather than a fact: debug assertions in `touched` and in `execute` fire *after* the entries are deleted, so a developer build can reject a batch that ran. Keep it true by keeping it a rule — anything added to `run_batch` after `execute` must not be able to panic out of it, which is why the splice is caught. The first person who adds a step between the deletion and the return breaks the contract the UI is written against, and breaks it silently.
+
 **Step 4: Run the tests**
 
 Run: `cargo test -p storage-monitor-desktop`
