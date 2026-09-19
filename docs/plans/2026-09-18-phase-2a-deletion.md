@@ -1474,7 +1474,11 @@ Run: `pnpm --filter @storage-monitor/desktop test src/pages/ExplorerPage.test.ts
 
 **Step 3: Implement**
 
-The page holds `selection` and the dialog state. Paths are built from the current node: `` `${view.path}/${child.name}` `` — `ChildView` carries no path of its own.
+The page holds `selection` and the dialog state.
+
+**Drop the selection on a new generation, not only on a navigation.** A `NodeId` means nothing across a scan or a splice — `ScanManager` bumps its generation for exactly that reason, "because both replace every id in it". A selection that survives a rescan silently points at different files: measured in `NodeTable`, selecting the sixth row and rescanning leaves the row that took id 6 ticked, and a batch built from `${view.path}/${child.name}` then deletes it. The table drops its range anchor on the same signal; the selection is the page's half of the same rule.
+
+**Decide the grid question here or in Task 16, and record it.** The table is an implicit `table` whose rows already carry `tabIndex` and arrow navigation — it behaves like a grid without saying so, which is why a selected row cannot carry `aria-selected` today. Promoting it to `role="grid"` with `aria-multiselectable` is the accessible answer and moves the e2e selectors a second time, so it belongs in whichever of these two tasks takes it, deliberately, rather than drifting past both. Paths are built from the current node: `` `${view.path}/${child.name}` `` — `ChildView` carries no path of its own.
 
 After a successful run, invalidate the tree queries of the current generation and the disk usage query so both refetch; do not bump the generation, since the scan itself did not change. The action bar sits between the breadcrumbs and the table, and disappears when the selection empties.
 
