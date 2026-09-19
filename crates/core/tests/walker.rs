@@ -4,7 +4,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use storage_monitor_core::scan::{
-    Node, NodeKind, ScanError, ScanOptions, ScanProgress, Tree, rescan_path, scan,
+    Node, NodeKind, ScanError, ScanOptions, ScanProgress, Tree, replace_subtrees, rescan_path, scan,
 };
 use storage_monitor_core::snapshot::{Snapshot, deltas, top_growers};
 use tempfile::TempDir;
@@ -842,6 +842,159 @@ fn rescan_re_attributes_hard_links_inside_the_branch() {
         b_node.size + data,
         "so the branch weighs {data} bytes more than the scan says"
     );
+}
+
+/// A fixture with everything a walk can meet, so a splice over it is not a toy: an
+/// unreadable directory, an empty one, symlinks (one dangling) and a deep branch.
+fn splice_fixture(as_root: bool) -> TempDir {
+    let dir = fixture();
+    let docs = dir.path().join("docs");
+    write(&docs.join("deep/nested/leaf.bin"), 4_096);
+    fs::create_dir_all(docs.join("empty")).unwrap();
+    std::os::unix::fs::symlink(docs.join("report.txt"), docs.join("link")).unwrap();
+    std::os::unix::fs::symlink(docs.join("gone"), docs.join("dangling")).unwrap();
+    let locked = docs.join("locked");
+    write(&locked.join("inside.bin"), 10);
+    if !as_root {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    dir
+}
+
+fn unlock(dir: &TempDir, as_root: bool) {
+    if !as_root {
+        let locked = dir.path().join("docs/locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn splicing_an_unchanged_branch_rebuilds_the_tree_node_for_node() {
+    // Nothing was deleted, so the patch describes what the tree already holds and the
+    // rebuild has to give it back whole: the same nodes in the same order, the same
+    // aggregates — the own blocks of every ancestor included — and the same error table.
+    let as_root = unsafe { libc_geteuid() } == 0;
+    let dir = splice_fixture(as_root);
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let full = scan(&options, &ScanProgress::default());
+    let patch = rescan_path(&dir.path().join("docs"), &options);
+    unlock(&dir, as_root);
+    let full = full.unwrap().tree;
+    let patch = patch.unwrap().unwrap();
+
+    let docs = full.find(&dir.path().join("docs")).unwrap();
+    let patched = replace_subtrees(&full, vec![(docs, Some(patch))]);
+
+    assert_eq!(&*patched.root().name, &*full.root().name);
+    assert_same_subtree(&patched, Tree::ROOT, &full, Tree::ROOT);
+    assert_eq!(patched.len(), full.len());
+    assert!(patched.len() >= 15, "a trivial fixture proves nothing");
+    assert_eq!(patched.errors(), full.errors());
+}
+
+#[test]
+fn a_spliced_deletion_matches_a_full_rescan() {
+    // The claim the Explorer relies on: after a deletion, tree plus patch is the tree the
+    // walker would build today. Only `docs` and the root are above the deletion, and the
+    // patch brings `docs` back fresh, so every node has to match to the byte.
+    let as_root = unsafe { libc_geteuid() } == 0;
+    let dir = splice_fixture(as_root);
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let before = scan(&options, &ScanProgress::default()).unwrap().tree;
+
+    fs::remove_dir_all(dir.path().join("docs/notes")).unwrap();
+    fs::remove_file(dir.path().join("docs/deep/nested/leaf.bin")).unwrap();
+    let docs = dir.path().join("docs");
+    let patch = rescan_path(&docs, &options);
+    let after = scan(&options, &ScanProgress::default());
+    unlock(&dir, as_root);
+    let patch = patch.unwrap().unwrap();
+    let after = after.unwrap().tree;
+
+    let patched = replace_subtrees(&before, vec![(before.find(&docs).unwrap(), Some(patch))]);
+    assert_same_subtree(&patched, Tree::ROOT, &after, Tree::ROOT);
+    assert_eq!(patched.len(), after.len());
+    assert_eq!(patched.errors().len(), after.errors().len());
+    assert!(patched.root().size < before.root().size, "the root shrank");
+    assert_eq!(patched.find(&docs.join("notes")), None);
+    assert!(patched.find(&docs.join("deep/nested")).is_some());
+}
+
+#[test]
+fn a_dropped_branch_leaves_the_rest_of_the_tree_alone() {
+    // The whole branch is gone, so the root is the only node above the change. A full scan
+    // would also see the root's new mtime; the splice keeps the old one and re-aggregates
+    // nothing else, which is what the arithmetic below pins.
+    let as_root = unsafe { libc_geteuid() } == 0;
+    let dir = splice_fixture(as_root);
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let before = scan(&options, &ScanProgress::default()).unwrap().tree;
+    let docs = dir.path().join("docs");
+    let (docs_id, docs_node) = child(&before, Tree::ROOT, "docs");
+    let (docs_size, docs_logical, docs_files) =
+        (docs_node.size, docs_node.logical_size, docs_node.file_count);
+
+    // The scan has already recorded the unreadable directory; unlock it so the branch can
+    // actually be deleted, which is what the Trash would have done to it.
+    unlock(&dir, as_root);
+    if !as_root {
+        assert_eq!(before.errors().len(), 1, "the unreadable directory in docs");
+    }
+    fs::remove_dir_all(&docs).unwrap();
+    let patch = rescan_path(&docs, &options).unwrap();
+    assert!(patch.is_none(), "the branch is gone");
+    let after = scan(&options, &ScanProgress::default()).unwrap().tree;
+    let patched = replace_subtrees(&before, vec![(docs_id, None)]);
+
+    assert_eq!(patched.len(), before.len() - subtree_size(&before, docs_id));
+    assert_eq!(patched.len(), after.len());
+    assert_eq!(patched.find(&docs), None);
+    assert!(
+        patched.errors().is_empty(),
+        "the errors of the dropped branch went with it: {:?}",
+        patched.errors()
+    );
+    assert_eq!(patched.root().size, before.root().size - docs_size);
+    assert_eq!(
+        patched.root().logical_size,
+        before.root().logical_size - docs_logical
+    );
+    assert_eq!(
+        patched.root().file_count,
+        before.root().file_count - docs_files
+    );
+    assert_eq!(
+        patched.root().mtime,
+        before.root().mtime,
+        "the splice re-aggregates the three totals and nothing else"
+    );
+    for (patched_child, after_child) in patched.children(Tree::ROOT).zip(after.children(Tree::ROOT))
+    {
+        assert_eq!(
+            &*patched.get(patched_child).unwrap().name,
+            &*after.get(after_child).unwrap().name
+        );
+        assert_same_subtree(&patched, patched_child, &after, after_child);
+    }
+}
+
+#[test]
+fn find_round_trips_the_path_of_every_scanned_node() {
+    // How a deletion batch reaches the tree: a path from the UI, which came from
+    // `Tree::path`, has to name the node it came from again.
+    let as_root = unsafe { libc_geteuid() } == 0;
+    let dir = splice_fixture(as_root);
+    let options = ScanOptions::new(dir.path().to_path_buf());
+    let tree = scan(&options, &ScanProgress::default());
+    unlock(&dir, as_root);
+    let tree = tree.unwrap().tree;
+    for (id, _) in tree.iter() {
+        let path = tree.path(id);
+        assert_eq!(tree.find(&path), Some(id), "{}", path.display());
+    }
+    assert_eq!(tree.find(dir.path()), Some(Tree::ROOT));
+    assert_eq!(tree.find(&dir.path().join("docs/gone")), None);
+    assert_eq!(tree.find(Path::new("/elsewhere")), None);
 }
 
 unsafe extern "C" {
