@@ -1267,7 +1267,7 @@ Run: `cargo test -p storage-monitor-desktop activity`
 
 ```rust
 #[tauri::command]
-pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> LogTail
+pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Result<LogTail, String>
 ```
 
 Default limit 100. A **damaged line** is already handled below the command — `tail` skips it and counts it in `LogTail::damaged`. A **read error** is different and must not be flattened into an empty list: "No actions yet" over a log that exists and is full of the user's deletions is the same silent-loss failure `damaged` was added to prevent, one layer up. Surface it, so the screen can say the log could not be read.
@@ -1295,7 +1295,9 @@ git commit -m "feat(desktop): expose the action log to the UI"
 
 Tailwind injects styles at runtime, hence `'unsafe-inline'` for styles only. `ipc:` and `http://ipc.localhost` are what Tauri 2 uses for its own channel on macOS.
 
-**Verification:** `just dev`, open the window, scan a small folder, and confirm the console shows no CSP violation and the treemap still renders. Then `just build-web && just e2e` (the mocked UI runs in a plain browser and does not exercise the CSP, so the manual check is the one that counts).
+**Verification.** `just dev` **cannot** verify this: Tauri attaches the header only in the `tauri://localhost` handler for the embedded frontend, and with `devUrl` the document comes from Vite and never passes through it. Build the real vehicle instead — `pnpm tauri build --debug --no-bundle`, which is what CI smoke-tests — and run that binary.
+
+And verify with a **positive control**, not with absence: plant an `eval` and confirm it is blocked. Without one, "no violations in the console" is indistinguishable from "no policy at all". Then confirm the treemap really painted (a canvas with opaque pixels, not merely an element), and that a scan crossed IPC under the policy.
 
 **Commit:**
 

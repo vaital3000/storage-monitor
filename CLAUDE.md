@@ -118,8 +118,12 @@ both use the same store. Cancelled scans are not persisted. Format details:
   other links report 0 bytes.
 - CLI output: write through a locked `stdout` and treat `BrokenPipe` as a
   quiet exit, so `storage-monitor ... --json | head` never panics.
-- Before the first destructive command ships, set a Content Security Policy
-  in `tauri.conf.json` (still `null` after phase 1).
+- The Content Security Policy in `tauri.conf.json` is set. `just dev` does not
+  apply it — Tauri attaches the header only in the `tauri://localhost` handler
+  for the embedded frontend, so a `devUrl` document never passes through it.
+  Verify a change with `pnpm tauri build --debug --no-bundle`, and with a
+  positive control: plant an `eval` and confirm it is blocked, or "no
+  violations" proves nothing.
 - Do not add dependencies for something the standard library or an existing
   dependency already does.
 
