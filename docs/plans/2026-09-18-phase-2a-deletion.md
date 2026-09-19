@@ -1445,6 +1445,10 @@ The page holds `selection` and the dialog state. Paths are built from the curren
 
 After a successful run, invalidate the tree queries of the current generation and the disk usage query so both refetch; do not bump the generation, since the scan itself did not change. The action bar sits between the breadcrumbs and the table, and disappears when the selection empties.
 
+**That invalidation is not optional, and nothing upstream does it for you.** The generation the backend bumps after a splice is `Inner.generation`, which never crosses the wire — `ScanStatus` has no field for it, and `useScan().generation` is a front-end counter bumped by `scan:done`. Its only job is to stop one patch being spliced onto an arena another patch already replaced. So when `actionRun` resolves, every `['treeNode', generation, id]` entry in the cache still holds `NodeId`s from the arena the splice threw away: the Explorer goes on rendering a tree that no longer exists, which is the symptom this whole phase is built to avoid, arriving through the cache instead of through the splice.
+
+**Do not let a second batch start while one is running.** Two overlapping `action_run` calls end with the second patch dropped by the generation check, so that batch's rows stay in the tree until the next scan. Nothing is lost or mis-spliced — it is the documented behaviour of `patch_paths` step 3 — but the dialog can rule it out entirely by staying busy until its outcome arrives.
+
 **Step 4: Run the tests and commit**
 
 ```bash
