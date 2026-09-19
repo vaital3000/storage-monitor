@@ -187,15 +187,20 @@ Two shapes were questioned in review and deliberately left as they are:
 
 ```rust
 /// A fresh subtree for `path`; `None` when the path is gone.
-pub fn rescan_path(path: &Path, options: &ScanOptions) -> Result<Option<Subtree>, ScanError>
+pub fn rescan_path(path: &Path, options: &ScanOptions) -> Result<Option<Tree>, ScanError>
 
 /// A new arena with the given nodes replaced (or dropped) and ancestors reaggregated.
-pub fn replace_subtrees(tree: &Tree, patches: &[(NodeId, Option<Subtree>)]) -> Tree
+pub fn replace_subtrees(tree: &Tree, patches: Vec<(NodeId, Option<Tree>)>) -> Tree
 ```
 
 Three outcomes are covered: the path is gone (the node is dropped), a file or
 symlink remains, or a directory remains with whatever could not be deleted —
 which lands in the tree as the exact remainder.
+
+The path is normalized **before** it is stat'ed, and that ordering is what makes
+"a symlink is never followed" true: `symlink_metadata` on a path with a trailing
+separator follows the link and answers about its target — and answers `NotFound`
+for a dangling one, which would report a link that is still there as gone.
 
 The rebuild copies the arena: 3.7M nodes of 64 B is roughly 240 MB and a few
 hundred milliseconds, with a transient doubling of that memory. In exchange

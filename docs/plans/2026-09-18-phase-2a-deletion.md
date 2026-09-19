@@ -918,7 +918,7 @@ fn rescan_of_a_single_file_returns_one_node() {
     let tree = rescan_path(&file, &options).unwrap().unwrap();
     assert_eq!(tree.len(), 1);
     assert_eq!(tree.root().kind, NodeKind::File);
-    assert_eq!(tree.root().logical_size, 20_000);
+    assert_eq!(tree.root().logical_size, 40_000);
 }
 
 #[test]
@@ -954,7 +954,7 @@ Export it from `crates/core/src/scan/mod.rs`.
 **Step 4: Run the tests**
 
 Run: `cargo test -p storage-monitor-core --test walker`
-Expected: 14 passed.
+Expected: the whole walker file, the 18 tests phase 1 left included — not only the ones this task adds.
 
 **Step 5: Commit**
 
