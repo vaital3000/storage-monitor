@@ -209,8 +209,12 @@ mod tests {
     #[test]
     fn every_command_answers_over_the_ipc() {
         let dir = tempfile::tempdir().unwrap();
+        // The scan at the end of this test walks this directory and has to find a file in
+        // it: `blob.bin` is what makes `done["files"] > 0` true. Deleting it does not fail
+        // here, it fails there.
         std::fs::write(dir.path().join("blob.bin"), vec![b'x'; 4_096]).unwrap();
         let log = ActionLog::new(dir.path().join("actions.jsonl"));
+        let at = chrono::Utc::now();
         // A line only this log has, so a tail that comes back cannot have been read from
         // the user's own record — which is also what the temp dir is for.
         log.append(&Outcome {
@@ -220,7 +224,7 @@ mod tests {
                 result: EntryResult::Removed { bytes: 7 },
             }],
             freed_bytes: 7,
-            at: chrono::Utc::now(),
+            at,
             mode: Mode::Trash,
         })
         .expect("the log is written");
@@ -279,7 +283,7 @@ mod tests {
         assert_eq!(
             tail["entries"],
             json!([{
-                "at": tail["entries"][0]["at"],
+                "at": serde_json::to_value(at).unwrap(),
                 "path": "/h/sentinel",
                 "kind": "file",
                 "mode": "trash",
@@ -299,13 +303,18 @@ mod tests {
         // impl this crate made generic, and which nothing else exercises at run time.
         // Recorded as they are emitted: the worker thread calls a Rust listener directly,
         // so nothing here waits on an event loop.
-        let events: Arc<Mutex<Vec<(&str, Value)>>> = Arc::default();
+        let events: Arc<Mutex<Vec<(&str, String)>>> = Arc::default();
         for event in [PROGRESS_EVENT, DONE_EVENT] {
             let events = Arc::clone(&events);
+            // The payload is recorded, never parsed here: this runs on the scan's worker
+            // thread, where a panic would poison a lock `ScanManager::lock` recovers from
+            // and leave the poll below to finish normally — a test that passes while its
+            // listener died. Parsing happens on the test thread, where failing is failing.
             webview.listen(event, move |received| {
-                let status = serde_json::from_str(received.payload())
-                    .unwrap_or_else(|err| panic!("{event} carried no status: {err}"));
-                events.lock().expect("the recorder").push((event, status));
+                events
+                    .lock()
+                    .expect("the recorder")
+                    .push((event, received.payload().to_owned()));
             });
         }
 
@@ -335,7 +344,27 @@ mod tests {
         // already returned by now: no sleep, no flake. An emitter whose body does nothing
         // passes every other test in this crate — every manager test carries a recorder of
         // its own — and costs the real window its live progress.
-        let seen = events.lock().expect("the recorder");
+        //
+        // That one lock carries the delivery as well as the ordering. Tauri's `emit_filter`
+        // takes its handler map with `try_lock` and, on contention, puts the emit in a
+        // pending queue that only a later emit *which dispatched a handler* flushes — so a
+        // deferred last emit strands, and `scan:done` is the last one. Emitting under the
+        // manager lock is what keeps two of ours from contending for that map. An emit
+        // added outside that lock breaks the ordering and the delivery together.
+        //
+        // Parsed here, on the test thread, and copied out of the lock: nothing below needs
+        // the recorder, and a lock held across assertions is a hang waiting for the next
+        // emit to be added.
+        let seen: Vec<(&str, Value)> = events
+            .lock()
+            .expect("the recorder")
+            .iter()
+            .map(|(name, payload)| {
+                let status = serde_json::from_str(payload)
+                    .unwrap_or_else(|err| panic!("{name} carried no status: {err} in {payload}"));
+                (*name, status)
+            })
+            .collect();
         let of = |event| seen.iter().filter(move |(name, _)| *name == event);
         let finished: Vec<&Value> = of(DONE_EVENT).map(|(_, status)| status).collect();
         assert_eq!(
@@ -375,35 +404,21 @@ mod tests {
     /// never launches it, and Vitest and Playwright run in a plain browser. Without this,
     /// removing the `csp` line leaves every gate green.
     ///
-    /// The reasons the grants are what they are live here too, because JSON has nowhere to
-    /// write them, and this is the test that fails under the hand that would change them:
+    /// The evidence behind each grant — the measurements, the two positive controls the
+    /// policy was verified with, and why `require-trusted-types-for` is left out — belongs
+    /// in `docs/adr/0006-content-security-policy.md`. What stays here is the part that
+    /// cannot be guessed from the line someone is about to edit:
     ///
-    /// - **`script-src` takes neither `'unsafe-eval'` nor `'unsafe-inline'`.** That is the
-    ///   whole point of the policy. Nothing in the bundle needs either: Tauri itself adds
-    ///   the `sha256-` hash of the one inline script in the built `index.html`.
-    /// - **`style-src` keeps `'unsafe-inline'`, and not because of Tailwind.** Tailwind v4
-    ///   compiles at build time into a static stylesheet; measured, `dist/index.html` links
-    ///   it and injects nothing. The real consumers are inline style *attributes* —
-    ///   `DiskUsageBar.tsx`, `NodeTable.tsx` (`style={{ width }}`) and the one `cssText`
-    ///   ECharts writes for its tooltip — which `style-src-attr` inherits from `style-src`.
-    ///   Dropping the grant breaks the disk bar and the tooltip **in the packaged app
-    ///   only**, where nothing but a run of the real thing would notice. What makes the
-    ///   grant tolerable is the company it keeps: with no remote origin in `img-src`, an
-    ///   injected `url()` has nowhere to beacon to, and `font-src 'self'` closes the same
-    ///   door for `@font-face`.
-    /// - **`img-src 'self'` alone.** The `data:`, `asset:` and `http://asset.localhost`
-    ///   grants this policy was drafted with were for nothing: the app has no `<img>`, the
-    ///   built CSS has no `url(`, and nothing calls `convertFileSrc`. They come back with
-    ///   the feature that needs them, deliberately, rather than standing open for it.
-    /// - **`object-src 'none'` and `form-action 'none'`.** `default-src` backstops
-    ///   `frame-src`, `worker-src`, `media-src`, `manifest-src` and `child-src`, but
-    ///   `form-action` falls back to nothing at all, and a `<form action="https://…">` with
-    ///   a synthetic submit is the way out of a policy that is otherwise sealed.
-    /// - **`connect-src` names no remote origin.** `ipc:` and `http://ipc.localhost` are
-    ///   Tauri's own channel on macOS; nothing else may be dialled.
-    /// - **`require-trusted-types-for` is left out on purpose, not forgotten.** ECharts'
-    ///   tooltip writes `innerHTML`, so adopting it needs that audit first, and WebKit
-    ///   ignores it on most of the macOS versions this ships to.
+    /// - **`style-src`'s `'unsafe-inline'` is for style *attributes*, not for Tailwind**,
+    ///   which compiles at build time and injects nothing. `DiskUsageBar`, `NodeTable`'s
+    ///   `style={{ width }}` and ECharts' tooltip `cssText` are the consumers, through
+    ///   `style-src-attr`, and they break in the packaged app only.
+    /// - **`form-action` falls back to nothing.** `default-src` backstops the directives
+    ///   that are absent here; this one has no fallback, so removing the line opens a
+    ///   `<form action="https://…">` out of an otherwise sealed policy.
+    /// - **`img-src` is narrow because the grants it dropped were dead**, measured: no
+    ///   `<img>`, no `url(` in the built CSS, no `convertFileSrc`. `data:` and `asset:`
+    ///   come back with the feature that needs them, not before.
     #[test]
     fn the_content_security_policy_stays_closed() {
         let config: Value = serde_json::from_str(include_str!("../tauri.conf.json"))
@@ -427,6 +442,32 @@ mod tests {
                 .clone()
         };
 
+        // The directive names themselves, as a closed set. Every assertion below reads the
+        // sources of a directive it names, and a list checked item by item cannot notice an
+        // addition — which is the whole reason `every_command!` carries a completeness
+        // assertion. Here the addition is the attack: `script-src-elem` does not add to
+        // `script-src`, it *replaces* it for `<script>` elements, so one more directive
+        // defeats the assertion under it while every line here still passes. Same shape for
+        // `style-src-attr` over `style-src`, and `sandbox`, `frame-src` and `worker-src`
+        // answer for themselves. A directive nobody decided on fails here, by name.
+        let named: BTreeSet<&str> = directives.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            named,
+            BTreeSet::from([
+                "base-uri",
+                "connect-src",
+                "default-src",
+                "font-src",
+                "form-action",
+                "frame-ancestors",
+                "img-src",
+                "object-src",
+                "script-src",
+                "style-src",
+            ]),
+            "the policy has a directive nobody decided on, or is missing one: {policy}"
+        );
+
         assert_eq!(sources("default-src"), ["'self'"], "the backstop");
         assert_eq!(sources("script-src"), ["'self'"]);
         assert_eq!(sources("object-src"), ["'none'"]);
@@ -441,14 +482,31 @@ mod tests {
             ["'self'", "ipc:", "http://ipc.localhost"]
         );
 
-        // Not only in the directives named above: a source that names a host this app does
-        // not serve is a way out of the policy wherever it is written.
+        // And every source of every directive, whatever the equalities above allow: a
+        // quoted keyword, Tauri's own `ipc:`, or a host under `localhost`. A CSP source
+        // needs no scheme to name a host — `evil.com` and `evil.com:443` are valid sources,
+        // and a bare `https:` is a valid scheme source — so nothing here may be recognised
+        // by looking for `//`, which is what the first version of this did.
+        let local = |source: &str| {
+            if source.starts_with('\'') && source.ends_with('\'') {
+                return true; // 'self', 'none', 'unsafe-inline', a hash, a nonce
+            }
+            if source == "ipc:" {
+                return true; // the other half of Tauri's channel
+            }
+            let host = source
+                .rsplit_once("//")
+                .map_or(source, |(_scheme, rest)| rest)
+                .split(['/', ':'])
+                .next()
+                .unwrap_or_default();
+            host == "localhost" || host.ends_with(".localhost")
+        };
         for (directive, sources) in &directives {
             for source in sources {
-                let host = source.split("//").nth(1).unwrap_or_default();
                 assert!(
-                    host.is_empty() || host == "localhost" || host.ends_with(".localhost"),
-                    "{directive} names a remote origin: {source}"
+                    local(source),
+                    "{directive} names something this app does not serve: {source}"
                 );
                 assert!(
                     !source.contains('*'),

@@ -193,9 +193,11 @@ mod tests {
         assert!(root.starts_with('/'), "{root}");
     }
 
-    /// The command over the [`ActionLog`] the app manages: a batch is written and read
-    /// back through `State<'_, ActionLog>`, which is what proves the state resolves and
-    /// that `log.inner()` forwards the log the app was given rather than some other one.
+    /// The command over the [`ActionLog`] the app manages. The batch is written through an
+    /// `ActionLog` of this test's own, built over the same path, and read back through the
+    /// command's `State<'_, ActionLog>` — and the two being separate handles is the point:
+    /// what comes back proves that the state resolves and that `log.inner()` forwards the
+    /// log the app was given, rather than proving that one object can see its own writes.
     ///
     /// The three answers themselves are pinned in `actions.rs`, against
     /// [`actions::activity_tail`] directly, and the registration of this command is pinned

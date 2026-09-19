@@ -119,11 +119,18 @@ both use the same store. Cancelled scans are not persisted. Format details:
 - CLI output: write through a locked `stdout` and treat `BrokenPipe` as a
   quiet exit, so `storage-monitor ... --json | head` never panics.
 - The Content Security Policy in `tauri.conf.json` stays closed: no
-  `'unsafe-eval'` or `'unsafe-inline'` in `script-src`, no remote origin in any
-  directive. `the_content_security_policy_stays_closed` (`src-tauri/src/lib.rs`)
-  holds that and carries the reason for every grant — including why `style-src`
-  keeps `'unsafe-inline'`, which is inline style _attributes_ and not Tailwind.
-  Loosening a directive means changing that test, deliberately.
+  `'unsafe-eval'` or `'unsafe-inline'` in `script-src`, no source anywhere that
+  is not a keyword, Tauri's `ipc:` or a `localhost` host, and no directive
+  beyond the ten that are there — `script-src-elem` replaces `script-src` for
+  `<script>` elements rather than adding to it, so an eleventh directive can
+  defeat the tenth. `the_content_security_policy_stays_closed`
+  (`src-tauri/src/lib.rs`) holds all three, and the reasoning is in
+  `docs/adr/0006-content-security-policy.md`. Loosening the policy means
+  changing that test, deliberately.
+- `tauri.conf.json` takes no comments: it is plain JSON, and an extra key —
+  `"_csp"` beside `"csp"`, say — makes `tauri-build` reject the config outright,
+  so the config cannot carry its own reasons. That is why they live in the ADR
+  and, for the three that are not guessable from the line, in the test.
 - Nothing runs the app under that policy by itself. `just dev` cannot: Tauri
   attaches the header in the `tauri://localhost` handler for the embedded
   frontend, and a `devUrl` document is served by Vite and never passes through
