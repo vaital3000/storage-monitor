@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use storage_monitor_core::action::{ActionLog, Mode, Outcome, Preview};
+use storage_monitor_core::action::{ActionLog, Mode, Preview};
 use storage_monitor_core::disk::{self, DiskUsage};
 use storage_monitor_core::paths;
 use storage_monitor_core::scan::{NodeId, Tree};
@@ -12,9 +12,9 @@ use storage_monitor_core::snapshot::Delta;
 use storage_monitor_core::system::RealSystem;
 use tauri::{AppHandle, State};
 
-use crate::actions;
+use crate::actions::{self, BatchLock};
 use crate::scan_manager::ScanManager;
-use crate::views::{NodeView, ScanStatus};
+use crate::views::{BatchResult, NodeView, ScanStatus};
 
 const DEFAULT_CHILDREN_LIMIT: usize = 500;
 const DEFAULT_GROWERS_LIMIT: usize = 10;
@@ -108,7 +108,8 @@ pub async fn action_preview(
     off_the_event_loop(move || actions::preview_batch(&manager, &sys, &paths, mode)).await
 }
 
-/// Deletes `paths`, records the batch and patches the tree.
+/// Deletes `paths`, records the batch and patches the tree. The two warnings of
+/// [`BatchResult`] come back with the outcome: an `Err` here means the batch did not run.
 ///
 /// Takes paths and a mode, never a finished preview: a preview that came over the wire is a
 /// claim, and the guards run here on this side of it.
@@ -117,16 +118,19 @@ pub async fn action_run(
     manager: State<'_, ScanManager>,
     sys: State<'_, RealSystem>,
     log: State<'_, ActionLog>,
+    batches: State<'_, Arc<BatchLock>>,
     paths: Vec<String>,
     mode: Mode,
-) -> Result<Outcome, String> {
-    let (manager, sys, log) = (
+) -> Result<BatchResult, String> {
+    let (manager, sys, log, batches) = (
         manager.inner().clone(),
         sys.inner().clone(),
         log.inner().clone(),
+        Arc::clone(batches.inner()),
     );
     let paths = to_paths(paths);
-    off_the_event_loop(move || actions::run_batch(&manager, &sys, &log, paths, mode)).await
+    off_the_event_loop(move || actions::run_batch(&manager, &sys, &log, &batches, paths, mode))
+        .await
 }
 
 fn to_paths(paths: Vec<String>) -> Vec<PathBuf> {
@@ -148,6 +152,25 @@ async fn off_the_event_loop<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_that_returns_comes_back_as_its_value() {
+        let value = tauri::async_runtime::block_on(off_the_event_loop(|| 7)).unwrap();
+        assert_eq!(value, 7);
+    }
+
+    /// A panic on the blocking thread reaches the UI as an error, which reads as "the batch
+    /// did not run" — and that is a lie about any panic raised *after* the entries were
+    /// deleted. It is why `run_batch` catches the splice itself: what happens here must stay
+    /// the report of a batch that never got that far.
+    #[test]
+    fn a_panicking_body_comes_back_as_an_error() {
+        let err = tauri::async_runtime::block_on(off_the_event_loop(|| {
+            panic!("the arena rebuild ran past its ceiling")
+        }))
+        .unwrap_err();
+        assert!(err.contains("did not finish"), "{err}");
+    }
 
     #[test]
     fn default_root_is_the_home_folder() {

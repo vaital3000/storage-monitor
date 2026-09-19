@@ -6,6 +6,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use storage_monitor_core::action::Outcome;
 use storage_monitor_core::scan::{NodeId, NodeKind, Tree};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +147,30 @@ impl NodeView {
     }
 }
 
+/// What a deletion batch did, and what the window has to say about it.
+///
+/// [`Outcome`] answers "what happened to each entry", which is [`execute`](storage_monitor_core::action::execute)'s
+/// business and core's type. The other two fields are the window's: they answer "and can
+/// you believe what you are looking at", which nothing in core is in a position to know.
+/// Both are failures the user has to be told about, because both leave something that a
+/// retry cannot repair by itself and stderr does not exist in a bundled `.app`:
+///
+/// - `recorded: false` — the entries are deleted and the action log does not have them.
+///   The log's own contract calls this "not a cosmetic failure": the caller has deleted
+///   something and has no record of it, and must surface that rather than swallow it.
+/// - `tree_stale: true` — the Explorer is showing at least one row for something this batch
+///   deleted, because the patch could not be built or could not be installed. A scan puts it
+///   right; nothing else will.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResult {
+    pub outcome: Outcome,
+    /// Every entry of the batch reached the action log.
+    pub recorded: bool,
+    /// The tree still describes something the batch deleted.
+    pub tree_stale: bool,
+}
+
 /// The root node holds its absolute path; only its last component is shown (the whole
 /// path when there is none, as for `/`).
 fn display_name(tree: &Tree, id: NodeId) -> String {
@@ -162,6 +187,7 @@ fn display_name(tree: &Tree, id: NodeId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage_monitor_core::action::{EntryOutcome, EntryResult, Mode};
     use storage_monitor_core::scan::{Node, Subtree};
 
     fn file(name: &str, size: u64) -> Subtree {
@@ -342,5 +368,34 @@ mod tests {
         assert_eq!(json["children"][0]["hasChildren"], true);
         assert_eq!(json["children"][0]["kind"], "dir");
         assert_eq!(json["children"][0]["fileCount"], 2);
+    }
+
+    #[test]
+    fn a_batch_result_carries_the_outcome_and_the_two_warnings() {
+        let batch = BatchResult {
+            outcome: Outcome {
+                entries: vec![EntryOutcome {
+                    path: "/home/me/cache".into(),
+                    kind: NodeKind::Dir,
+                    result: EntryResult::Removed { bytes: 10 },
+                }],
+                freed_bytes: 10,
+                at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                mode: Mode::Trash,
+            },
+            recorded: false,
+            tree_stale: true,
+        };
+        let json = serde_json::to_value(&batch).unwrap();
+        assert_eq!(json["recorded"], false);
+        assert_eq!(json["treeStale"], true);
+        // The outcome keeps the shape `crates/core/src/action/model.rs` pins; it is nested,
+        // not flattened, so a field added to either side cannot collide with the other.
+        assert_eq!(json["outcome"]["freedBytes"], 10);
+        assert_eq!(json["outcome"]["mode"], "trash");
+        assert_eq!(
+            json["outcome"]["entries"][0]["result"],
+            serde_json::json!({ "result": "removed", "bytes": 10 })
+        );
     }
 }

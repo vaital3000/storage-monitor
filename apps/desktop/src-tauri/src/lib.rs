@@ -5,10 +5,13 @@ mod commands;
 pub mod scan_manager;
 pub mod views;
 
+use std::sync::Arc;
+
 use storage_monitor_core::action::ActionLog;
 use storage_monitor_core::system::RealSystem;
 use storage_monitor_core::{AppInfo, app_info, paths};
 
+use crate::actions::BatchLock;
 use crate::scan_manager::ScanManager;
 
 /// Returns product name and version to the UI.
@@ -21,9 +24,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(ScanManager::default())
-        // The one door to deleting, and the record of everything that went through it.
+        // The one door to deleting, the record of everything that went through it, and the
+        // queue that keeps two batches from racing for the tree.
         .manage(RealSystem)
         .manage(ActionLog::new(paths::actions_log()))
+        .manage(Arc::new(BatchLock::default()))
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             commands::default_root,

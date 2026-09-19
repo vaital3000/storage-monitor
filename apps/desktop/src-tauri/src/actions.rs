@@ -4,7 +4,10 @@
 //! A batch is always re-planned here from the paths alone. Nothing the UI sends is trusted
 //! beyond the paths and the mode — not a preview it was shown, and not the sizes in it.
 
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
 use storage_monitor_core::action::{
@@ -14,7 +17,37 @@ use storage_monitor_core::action::{
 use storage_monitor_core::scan::NodeKind;
 use storage_monitor_core::system::System;
 
-use crate::scan_manager::ScanManager;
+use crate::scan_manager::{ScanManager, TreeState, panic_text};
+use crate::views::BatchResult;
+
+/// The queue of one: batches run one at a time in this process.
+///
+/// Tauri does not serialize invocations, and both action commands hand their body to
+/// `spawn_blocking`, so two batches can be in flight at once. They would each resolve ids
+/// against the same generation, and the second splice would then be dropped for a
+/// generation the first one moved — the deletions land, the tree keeps a row for one of
+/// them, and nothing but a scan repairs it. Queueing them instead costs the second batch
+/// the wait and makes two batches over overlapping paths deterministic.
+///
+/// The dialog's busy state is the other half of this, and the cheaper half to lose: this
+/// one holds wherever the invocation came from.
+#[derive(Debug, Default)]
+pub struct BatchLock(Mutex<()>);
+
+impl BatchLock {
+    /// Waits for the batch in front, if there is one. Poisoning is not a reason to refuse a
+    /// deletion the user asked for: the guard protects an order, not data.
+    fn enter(&self) -> MutexGuard<'_, ()> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether a batch is running right now. Tests assert through it that the queue is held
+    /// for the whole of [`run_batch`], which is the part no observer can see from outside.
+    #[cfg(test)]
+    fn is_held(&self) -> bool {
+        self.0.try_lock().is_err()
+    }
+}
 
 /// What a batch would do, with nothing touched: every path against the guards and the disk.
 ///
@@ -33,13 +66,18 @@ pub fn preview_batch(
     }
 }
 
-/// Deletes what the guards allow, records the whole batch and patches the tree.
+/// Deletes what the guards allow, records the whole batch, patches the tree, and reports
+/// which of those three the window has to tell the user about.
 ///
 /// The order is the order of consequences. The log is written before the tree is patched: it
 /// is the record of something that has already happened, while the splice is a rebuild of
-/// the arena with a live assertion in it. A log that cannot be written is printed to stderr
-/// and nothing more — the files are gone either way, and failing the batch afterwards would
-/// tell the user nothing they can act on.
+/// the arena with a live assertion in it.
+///
+/// Neither of the last two failures fails the batch — the files are gone, and a batch that
+/// came back as an error would say the opposite — but neither is swallowed either.
+/// [`BatchResult::recorded`] and [`BatchResult::tree_stale`] carry them to the dialog,
+/// because a bundled `.app` has no stderr and both leave something only the user can act on:
+/// a deletion with no record of it, and an Explorer showing a row for something that is gone.
 ///
 /// Every entry that was removed **or** failed is rescanned, not just the removed ones:
 /// `remove` is not atomic, so a failure can leave most of a tree deleted, and the rescan is
@@ -48,9 +86,13 @@ pub fn run_batch(
     manager: &ScanManager,
     sys: &dyn System,
     log: &ActionLog,
+    batches: &BatchLock,
     paths: Vec<PathBuf>,
     mode: Mode,
-) -> Outcome {
+) -> BatchResult {
+    // Held for the whole batch, plan included: two batches that resolve ids against one
+    // generation lose a patch whichever of them splices second.
+    let _queued = batches.enter();
     let plan = plan_for(manager, &paths, mode);
     let outcome = match limits_of(manager) {
         Some(limits) => {
@@ -59,11 +101,38 @@ pub fn run_batch(
         }
         None => refused_outcome(&plan, sys.now()),
     };
-    if let Err(err) = log.append(&outcome) {
-        eprintln!("cannot record the batch in {}: {err}", log.path().display());
+    let recorded = match log.append(&outcome) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("cannot record the batch in {}: {err}", log.path().display());
+            false
+        }
+    };
+    let tree_stale = stale_after(panic::catch_unwind(AssertUnwindSafe(|| {
+        manager.patch_paths(&touched(&paths, &outcome))
+    })));
+    BatchResult {
+        outcome,
+        recorded,
+        tree_stale,
     }
-    manager.patch_paths(&touched(&paths, &outcome));
-    outcome
+}
+
+/// What the splice leaves behind, for the window to say.
+///
+/// The `Err` is a panic in the rebuild, whose ceiling is a live `assert!` even in a release
+/// build. It fires after the files are gone and after the record is written, so letting it
+/// out of [`run_batch`] would cost the command its result — and the dialog would say the
+/// batch did not finish about a batch that deleted everything it was asked to. Caught, it
+/// costs the tree its accuracy instead, which is what this reports and what a scan repairs.
+fn stale_after(patched: Result<TreeState, Box<dyn Any + Send>>) -> bool {
+    match patched {
+        Ok(state) => state == TreeState::Stale,
+        Err(payload) => {
+            eprintln!("the tree patch panicked: {}", panic_text(&*payload));
+            true
+        }
+    }
 }
 
 /// The batch as the engine takes it.
@@ -107,6 +176,11 @@ fn plan_for(manager: &ScanManager, paths: &[PathBuf], mode: Mode) -> Plan {
 
 /// The rules for the scan the window holds, or `None` when nothing has been scanned.
 ///
+/// The root, deliberately, and not the tree: a scan that failed or was cancelled leaves a
+/// root and no result, and a batch then is guarded by exactly the rules the user's last
+/// choice of root implies. Sizes go missing in that case, nothing else — [`plan_for`] says
+/// what that costs.
+///
 /// Not limits over an empty root: every path starts with the empty path, so rules 4 and 5
 /// would pass for everything on the machine, and the `debug_assert` that says so is gone in
 /// a release build.
@@ -119,11 +193,21 @@ fn limits_of(manager: &ScanManager) -> Option<Limits> {
 /// explains.
 fn touched(paths: &[PathBuf], outcome: &Outcome) -> Vec<PathBuf> {
     // `preview` and `execute` both keep every entry in its place, which is what lets the
-    // outcome be read next to the paths it came from.
+    // outcome be read next to the paths it came from. Both halves are checked, because the
+    // one that matters is the pairing and `zip` answers a broken one by silently
+    // truncating: in a release build a batch would then patch the wrong paths, or none.
     debug_assert_eq!(
         paths.len(),
         outcome.entries.len(),
-        "every entry of the plan comes back, in its place"
+        "every entry of the plan comes back"
+    );
+    debug_assert!(
+        paths
+            .iter()
+            .zip(&outcome.entries)
+            .all(|(path, entry)| path.file_name() == entry.path.file_name()),
+        "every entry of the plan comes back in its place: the guards normalize a path but \
+         keep the caller's own last component, so the pairs have to agree about it"
     );
     paths
         .iter()
@@ -181,12 +265,15 @@ fn refused_outcome(plan: &Plan, at: DateTime<Utc>) -> Outcome {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, Metadata};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use chrono::DateTime;
+    use storage_monitor_core::system::SystemError;
 
     use storage_monitor_core::action::{
         ActionLog, BlockReason, EntryResult, Limits, LogResult, Mode,
@@ -235,6 +322,18 @@ mod tests {
         ActionLog::new(data.path().join("actions.jsonl"))
     }
 
+    /// A batch with a queue of its own: only the two tests about the queue have a second
+    /// batch for it to order against.
+    fn run_one(
+        manager: &ScanManager,
+        sys: &dyn System,
+        log: &ActionLog,
+        paths: Vec<PathBuf>,
+        mode: Mode,
+    ) -> BatchResult {
+        run_batch(manager, sys, log, &BatchLock::default(), paths, mode)
+    }
+
     /// The root of the tree the manager holds, as the Explorer would ask for it.
     fn root_view(manager: &ScanManager) -> NodeView {
         manager
@@ -247,6 +346,21 @@ mod tests {
 
     fn child_names(view: &NodeView) -> Vec<String> {
         view.children.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// The rows the Explorer would draw for a directory below the root.
+    fn children_of(manager: &ScanManager, path: &Path) -> Vec<String> {
+        let view = manager
+            .with_result(|result, previous| {
+                let id = result
+                    .tree
+                    .find(path)
+                    .unwrap_or_else(|| panic!("{} is not in the tree", path.display()));
+                NodeView::build(&result.tree, id, 500, previous)
+            })
+            .expect("a scan result")
+            .expect("the node");
+        child_names(&view)
     }
 
     fn child_size(view: &NodeView, name: &str) -> u64 {
@@ -273,7 +387,7 @@ mod tests {
         let cache_size = child_size(&before, "cache");
         let generation = manager.generation();
 
-        let outcome = run_batch(
+        let batch = run_one(
             &manager,
             &sys,
             &log_in(&data),
@@ -281,16 +395,18 @@ mod tests {
             Mode::Trash,
         );
 
-        assert_eq!(outcome.entries.len(), 1);
-        assert_eq!(outcome.entries[0].path, root.join("cache"));
-        assert_eq!(outcome.entries[0].kind, NodeKind::Dir);
+        assert_eq!(batch.outcome.entries.len(), 1);
+        assert_eq!(batch.outcome.entries[0].path, root.join("cache"));
+        assert_eq!(batch.outcome.entries[0].kind, NodeKind::Dir);
         assert_eq!(
-            outcome.entries[0].result,
+            batch.outcome.entries[0].result,
             EntryResult::Removed { bytes: cache_size }
         );
-        assert_eq!(outcome.freed_bytes, cache_size);
-        assert_eq!(outcome.mode, Mode::Trash);
-        assert_eq!(outcome.at, sys.now());
+        assert_eq!(batch.outcome.freed_bytes, cache_size);
+        assert_eq!(batch.outcome.mode, Mode::Trash);
+        assert_eq!(batch.outcome.at, sys.now());
+        assert!(batch.recorded, "the record was written");
+        assert!(!batch.tree_stale, "and the Explorer agrees with the disk");
 
         assert!(
             fs::symlink_metadata(root.join("cache")).is_err(),
@@ -330,7 +446,7 @@ mod tests {
         // empties `inner` and then fails to remove `inner` itself. A real partial failure,
         // which is what the rescan after a batch exists for.
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o555)).unwrap();
-        let outcome = run_batch(
+        let batch = run_one(
             &manager,
             &sys,
             &log_in(&data),
@@ -339,14 +455,19 @@ mod tests {
         );
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
 
-        match &outcome.entries[0].result {
+        match &batch.outcome.entries[0].result {
             EntryResult::Failed { message } => assert!(
                 message.contains("cannot delete"),
                 "the port's own message: {message}"
             ),
             other => panic!("expected a failure, got {other:?}"),
         }
-        assert_eq!(outcome.freed_bytes, 0, "a failed entry frees nothing");
+        assert_eq!(batch.outcome.freed_bytes, 0, "a failed entry frees nothing");
+        assert!(batch.recorded);
+        assert!(
+            !batch.tree_stale,
+            "the remainder was spliced in, so the tree is right about it"
+        );
         assert!(
             fs::symlink_metadata(cache.join("inner")).is_ok(),
             "the remainder is still on disk"
@@ -391,7 +512,7 @@ mod tests {
         let before = root_view(&manager);
         let generation = manager.generation();
 
-        let outcome = run_batch(
+        let batch = run_one(
             &manager,
             &sys,
             &log_in(&data),
@@ -400,12 +521,14 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.entries[0].result,
+            batch.outcome.entries[0].result,
             EntryResult::Skipped {
                 reason: BlockReason::OutsideRoots
             }
         );
-        assert_eq!(outcome.freed_bytes, 0);
+        assert_eq!(batch.outcome.freed_bytes, 0);
+        assert!(batch.recorded);
+        assert!(!batch.tree_stale, "nothing was deleted to be stale about");
         assert_eq!(fs::read(&precious).unwrap(), b"keep", "nothing was touched");
         let view = root_view(&manager);
         assert_eq!(child_names(&view), child_names(&before));
@@ -430,7 +553,7 @@ mod tests {
         let cache_size = child_size(&root_view(&manager), "cache");
         let log = log_in(&data);
 
-        let outcome = run_batch(
+        let batch = run_one(
             &manager,
             &sys,
             &log,
@@ -442,12 +565,14 @@ mod tests {
             Mode::Trash,
         );
 
-        assert_eq!(outcome.entries.len(), 3);
+        assert_eq!(batch.outcome.entries.len(), 3);
         let tail = log.tail(10).unwrap();
         assert_eq!(tail.damaged, 0);
         assert_eq!(tail.entries.len(), 3, "one line per entry: {tail:?}");
         assert!(
-            tail.entries.iter().all(|entry| entry.at == outcome.at),
+            tail.entries
+                .iter()
+                .all(|entry| entry.at == batch.outcome.at),
             "one timestamp for the batch: {tail:?}"
         );
         assert!(
@@ -496,7 +621,7 @@ mod tests {
         let generation = manager.generation();
         fs::remove_dir_all(root.join("cache")).unwrap();
 
-        let outcome = run_batch(
+        let batch = run_one(
             &manager,
             &sys,
             &log_in(&data),
@@ -505,7 +630,7 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.entries[0].result,
+            batch.outcome.entries[0].result,
             EntryResult::Skipped {
                 reason: BlockReason::Missing
             }
@@ -537,7 +662,7 @@ mod tests {
         let before = root_view(&manager);
         let (cache_size, logs_size) = (child_size(&before, "cache"), child_size(&before, "logs"));
 
-        let outcome = run_batch(
+        let batch = run_one(
             &manager,
             &sys,
             &log_in(&data),
@@ -545,7 +670,7 @@ mod tests {
             Mode::Trash,
         );
 
-        assert_eq!(outcome.freed_bytes, cache_size + logs_size);
+        assert_eq!(batch.outcome.freed_bytes, cache_size + logs_size);
         let view = root_view(&manager);
         assert_eq!(child_names(&view), vec!["keep.bin"], "both rows are gone");
         assert_eq!(
@@ -567,14 +692,19 @@ mod tests {
         fs::write(&wall, b"x").unwrap();
         let log = ActionLog::new(wall.join("actions.jsonl"));
 
-        let outcome = run_batch(&manager, &sys, &log, vec![root.join("cache")], Mode::Trash);
+        let batch = run_one(&manager, &sys, &log, vec![root.join("cache")], Mode::Trash);
 
         assert!(
             fs::symlink_metadata(log.path()).is_err(),
             "the batch was not recorded"
         );
+        assert!(
+            !batch.recorded,
+            "and the dialog is told: deleted, with no record of it"
+        );
+        assert!(!batch.tree_stale, "the tree was patched all the same");
         assert!(matches!(
-            outcome.entries[0].result,
+            batch.outcome.entries[0].result,
             EntryResult::Removed { .. }
         ));
         assert!(fs::symlink_metadata(root.join("cache")).is_err());
@@ -592,7 +722,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let manager = ScanManager::with_snapshots_dir(data.path().join("snapshots"));
 
-        let outcome = run_batch(
+        let batch = run_one(
             &manager,
             &sys,
             &log_in(&data),
@@ -601,13 +731,14 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.entries[0].result,
+            batch.outcome.entries[0].result,
             EntryResult::Skipped {
                 reason: BlockReason::OutsideRoots
             },
             "with no scan root, nothing is inside it"
         );
-        assert_eq!(outcome.freed_bytes, 0);
+        assert_eq!(batch.outcome.freed_bytes, 0);
+        assert!(batch.recorded && !batch.tree_stale);
         assert!(
             fs::symlink_metadata(root.join("cache/blob.bin")).is_ok(),
             "nothing was deleted"
@@ -627,10 +758,14 @@ mod tests {
         let generation = manager.generation();
         let log = log_in(&data);
 
-        let outcome = run_batch(&manager, &sys, &log, Vec::new(), Mode::Permanent);
+        let batch = run_one(&manager, &sys, &log, Vec::new(), Mode::Permanent);
 
-        assert!(outcome.entries.is_empty());
-        assert_eq!(outcome.freed_bytes, 0);
+        assert!(batch.outcome.entries.is_empty());
+        assert_eq!(batch.outcome.freed_bytes, 0);
+        assert!(
+            batch.recorded && !batch.tree_stale,
+            "nothing happened, so there is nothing to warn about"
+        );
         assert!(
             fs::symlink_metadata(log.path()).is_err(),
             "nothing happened, so nothing is recorded"
@@ -669,6 +804,191 @@ mod tests {
         assert!(fs::symlink_metadata(root.join("cache/blob.bin")).is_ok());
     }
 
+    /// A port that does the real thing and then lets a test change the world, in the one
+    /// window nothing else can reach: between the deletion and the rescan that follows it.
+    /// Both of the batch's own failure reports need that window — a rescan that cannot look,
+    /// and a second batch arriving mid-flight.
+    struct Meddling<'a> {
+        inner: &'a TestSystem,
+        after_removal: Box<dyn Fn() + Send + Sync + 'a>,
+    }
+
+    impl System for Meddling<'_> {
+        fn symlink_metadata(&self, path: &Path) -> Result<Metadata, SystemError> {
+            self.inner.symlink_metadata(path)
+        }
+
+        fn move_to_trash(&self, path: &Path) -> Result<(), SystemError> {
+            let done = self.inner.move_to_trash(path);
+            (self.after_removal)();
+            done
+        }
+
+        fn remove(&self, path: &Path) -> Result<(), SystemError> {
+            let done = self.inner.remove(path);
+            (self.after_removal)();
+            done
+        }
+
+        fn now(&self) -> DateTime<Utc> {
+            self.inner.now()
+        }
+    }
+
+    /// The deletion happened and the rescan cannot look: the row for a directory that is
+    /// gone stays in the tree, and the only honest thing left to do is say so. Without the
+    /// warning this is the one failure the user cannot even see — the batch reports success
+    /// and the Explorer quietly disagrees with the disk until the next scan.
+    ///
+    /// Two paths, and only one of them locked, because one path cannot state the rule: when
+    /// every rescan of a batch fails there is nothing left to splice either, so the patch is
+    /// dropped and the tree would be called stale for the other reason. It takes a batch
+    /// that splices *and* loses a path to tell the two apart.
+    #[test]
+    fn a_batch_whose_rescan_cannot_look_reports_a_stale_tree() {
+        if running_as_root() {
+            return;
+        }
+        let sys = TestSystem::new();
+        let root = sys.root().to_path_buf();
+        let (locked, open) = (root.join("locked"), root.join("open"));
+        write_file(&locked.join("cache/blob.bin"), 8_192);
+        write_file(&open.join("cache/blob.bin"), 4_096);
+        let (manager, data) = scanned(&root);
+        // Locked only once the deletions are done: the guards refuse an entry whose parent
+        // cannot be resolved, so locking it earlier would mean nothing was deleted at all.
+        let meddling = Meddling {
+            inner: &sys,
+            after_removal: Box::new(|| {
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            }),
+        };
+
+        let batch = run_one(
+            &manager,
+            &meddling,
+            &log_in(&data),
+            vec![locked.join("cache"), open.join("cache")],
+            Mode::Trash,
+        );
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            batch
+                .outcome
+                .entries
+                .iter()
+                .all(|entry| matches!(entry.result, EntryResult::Removed { .. })),
+            "both deletions went through: {:?}",
+            batch.outcome.entries
+        );
+        assert!(batch.recorded);
+        assert!(
+            batch.tree_stale,
+            "one rescan could not look, so the tree still names what was deleted"
+        );
+        assert!(
+            fs::symlink_metadata(locked.join("cache")).is_err(),
+            "and that directory really is gone"
+        );
+        assert_eq!(
+            children_of(&manager, &locked),
+            vec!["cache"],
+            "the stale row is exactly what the warning is about"
+        );
+        assert!(
+            children_of(&manager, &open).is_empty(),
+            "while the path that could be rescanned was spliced in the same call"
+        );
+    }
+
+    /// The one branch of a batch no fixture can reach: the rebuild's assertion firing. What
+    /// it must not do is turn a deletion that happened into a command that says it did not.
+    #[test]
+    fn a_splice_that_panicked_leaves_the_tree_stale() {
+        assert!(!stale_after(Ok(TreeState::Current)));
+        assert!(stale_after(Ok(TreeState::Stale)));
+        assert!(
+            stale_after(Err(Box::new("the rebuild ran past its ceiling"))),
+            "a panic costs the tree its accuracy, and the batch keeps its report"
+        );
+    }
+
+    /// The queue is held for the whole batch, not just around the splice. Nothing outside
+    /// the process can observe that, so the observation is made from inside it, at the one
+    /// moment that matters: files are already leaving the disk.
+    #[test]
+    fn a_batch_holds_the_queue_from_the_plan_to_the_patch() {
+        let sys = TestSystem::new();
+        let root = sys.root().to_path_buf();
+        write_file(&root.join("cache/blob.bin"), 8_192);
+        let (manager, data) = scanned(&root);
+        let batches = BatchLock::default();
+        assert!(!batches.is_held(), "and it is free when nothing runs");
+        let held = Mutex::new(Vec::new());
+        let meddling = Meddling {
+            inner: &sys,
+            after_removal: Box::new(|| held.lock().unwrap().push(batches.is_held())),
+        };
+
+        let batch = run_batch(
+            &manager,
+            &meddling,
+            &log_in(&data),
+            &batches,
+            vec![root.join("cache")],
+            Mode::Trash,
+        );
+
+        assert!(batch.recorded && !batch.tree_stale);
+        assert_eq!(
+            *held.lock().unwrap(),
+            vec![true],
+            "a second batch would have had to wait"
+        );
+        assert!(!batches.is_held(), "and the queue is free again afterwards");
+    }
+
+    /// Two batches at once are what the queue is for: without it they resolve ids against
+    /// one generation and whichever splices second is dropped, leaving a row for a
+    /// directory that is gone.
+    #[test]
+    fn two_batches_at_once_both_reach_the_tree() {
+        let sys = TestSystem::new();
+        let root = sys.root().to_path_buf();
+        write_file(&root.join("cache/blob.bin"), 8_192);
+        write_file(&root.join("logs/log.txt"), 12_288);
+        write_file(&root.join("keep.bin"), 4_096);
+        let (manager, data) = scanned(&root);
+        let batches = BatchLock::default();
+        let log = log_in(&data);
+
+        let (manager, sys, log, batches, root) = (&manager, &sys, &log, &batches, &root);
+        thread::scope(|scope| {
+            for name in ["cache", "logs"] {
+                scope.spawn(move || {
+                    let batch = run_batch(
+                        manager,
+                        sys,
+                        log,
+                        batches,
+                        vec![root.join(name)],
+                        Mode::Trash,
+                    );
+                    assert!(batch.recorded, "{name}");
+                    assert!(!batch.tree_stale, "{name}: the patch was not dropped");
+                });
+            }
+        });
+
+        assert_eq!(
+            child_names(&root_view(manager)),
+            vec!["keep.bin"],
+            "both rows left the tree"
+        );
+        assert_eq!(log.tail(10).unwrap().entries.len(), 2);
+    }
+
     /// The tree is addressed by the spelling the scan recorded, never by the normalized
     /// path the guards produce. A scan root reached through a symlink is where the two
     /// differ: the guards resolve it and `Tree::find` answers only to the other one, so a
@@ -697,10 +1017,10 @@ mod tests {
             "only the spelling the scan recorded is a key of the tree"
         );
 
-        let outcome = run_batch(&manager, &sys, &log_in(&data), vec![asked], Mode::Trash);
+        let batch = run_one(&manager, &sys, &log_in(&data), vec![asked], Mode::Trash);
 
         assert!(matches!(
-            outcome.entries[0].result,
+            batch.outcome.entries[0].result,
             EntryResult::Removed { .. }
         ));
         assert!(fs::symlink_metadata(sys.root().join("fixture/cache")).is_err());
