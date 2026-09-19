@@ -2,11 +2,12 @@
 //!
 //! One JSON object per line, because of the two things this file has to survive: a write
 //! that stopped halfway, and a reader that only wants the end. A torn write costs the torn
-//! line and nothing else — [`ActionLog::tail`] drops what it cannot parse instead of
-//! failing the read, and [`ActionLog::append`] starts a fresh line when it finds the file
-//! ending mid-line, so the remainder cannot swallow the batch that follows it. The Activity
-//! screen is the only place a user ever sees what was deleted; neither a damaged line nor a
-//! full volume may be able to close it or to quietly shorten it.
+//! line — [`ActionLog::tail`] drops what it cannot parse instead of failing the read, and
+//! [`ActionLog::append`] starts a fresh line when it finds the file ending mid-line, so the
+//! remainder cannot swallow the batch that follows it. For one writer that is all it costs;
+//! what two of them sharing a volume with no room left can still lose is named on
+//! [`ActionLog`]. The Activity screen is the only place a user ever sees what was deleted;
+//! neither a damaged line nor a full volume may be able to close it or to quietly shorten it.
 //!
 //! An [`Outcome`] is the only input, so every line of a batch carries the same `at` — the
 //! instant the batch began, not the instant of that entry — and the same [`Mode`]. "Newest
@@ -155,6 +156,15 @@ pub struct LogTail {
 /// leave a torn line and an `Err`, and [`ActionLog::append`] repairs the file before it
 /// writes again, so the damage stays the line it happened to.
 ///
+/// That repair has one hole, and reaching it takes both halves of the same bad day: two
+/// instances appending to one log on a volume that is filling up. One reads the end of the
+/// file and finds it clean, the other tears its own batch onto that end, the first then
+/// writes onto the remainder — one glued line, costing the torn batch its last entry and
+/// the arriving one its first. Nothing locks against it: it needs two running copies, a
+/// full volume and a coincidence measured in microseconds, and on a full volume both
+/// writers are failing anyway. One writer cannot reach it, and neither can any number of
+/// them while the volume has room.
+///
 /// Nothing here prunes the file — it is the record, and it grows by one line per entry the
 /// app was asked to delete. [`ActionLog::tail`] reads all of it to return the end.
 #[derive(Debug, Clone)]
@@ -207,7 +217,7 @@ impl ActionLog {
         // of a deletion that has already happened, which is what this module exists for.
         let (mut file, separate) = match open(&self.path, true) {
             Ok(mut file) => {
-                let separate = ends_mid_line(&mut file);
+                let separate = ends_mid_line(last_byte(&mut file));
                 (file, separate)
             }
             Err(_) => (open(&self.path, false)?, true),
@@ -243,7 +253,7 @@ impl ActionLog {
             if tail.entries.len() == limit {
                 break;
             }
-            if line.is_empty() {
+            if line.trim().is_empty() {
                 continue;
             }
             match serde_json::from_str(line) {
@@ -267,17 +277,16 @@ fn open(path: &Path, readable: bool) -> io::Result<File> {
         .open(path)
 }
 
-/// Whether the file ends in the middle of a line, which is what a write cut short leaves
-/// behind. Asked through the handle that is about to append, so it describes the file as it
-/// is now; under `O_APPEND` that answer can only go stale in the harmless direction, since
-/// another writer can only add whole batches and the cost is one blank line.
+/// Whether a batch has to open a line of its own, given the last byte of the file it is
+/// about to be appended to — the middle of a line is what a write cut short leaves behind.
 ///
-/// An error — the length cannot be read, the byte cannot be — answers `true` for the same
-/// reason [`ActionLog::append`] falls back to opening the file append-only: a separator
-/// nobody needed is nothing, and a batch that does not reach the file is a deletion nobody
-/// can see.
-fn ends_mid_line(file: &mut File) -> bool {
-    match last_byte(file) {
+/// Separating where it was not needed costs a blank line, which reads as nothing at all.
+/// Not separating where it was needed costs an entry. So everything unknown separates: a
+/// length that could not be read, a byte that could not be. That is the same rule
+/// [`ActionLog::append`] follows when it cannot open the file for reading in the first
+/// place, and deliberately so — one policy in this file rather than two that can drift.
+fn ends_mid_line(last: io::Result<Option<u8>>) -> bool {
+    match last {
         Ok(Some(byte)) => byte != b'\n',
         // Empty: there is no line to continue.
         Ok(None) => false,
@@ -285,6 +294,11 @@ fn ends_mid_line(file: &mut File) -> bool {
     }
 }
 
+/// The last byte of `file`, or `None` when it is empty. Read through the handle that is
+/// about to append, so it describes the file as it stands at that moment. A writer that
+/// appends whole batches can only make that answer stale in the harmless direction, since
+/// under `O_APPEND` what it adds ends in a newline; a writer whose own batch tears on the
+/// end of the file is the hole [`ActionLog`] names.
 fn last_byte(file: &mut File) -> io::Result<Option<u8>> {
     if file.metadata()?.len() == 0 {
         return Ok(None);
@@ -703,8 +717,10 @@ mod tests {
         append("/h/a");
         append_raw(&path, b"} not json at all\n");
         append("/h/b");
-        // A blank line is a separator someone's editor left behind, not a lost entry.
-        append_raw(&path, b"\n");
+        // Blank lines are what an editor or a separator leaves behind, not lost entries —
+        // and a stray space or tab is still a blank line. Counting one as damage would tell
+        // the user a deletion had gone missing.
+        append_raw(&path, b"\n   \n\t\n");
         append("/h/c");
 
         let read = log.tail(3).unwrap();
@@ -847,6 +863,24 @@ mod tests {
         .unwrap();
         assert!(path.is_file());
         assert_eq!(log.tail(10).unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn anything_unknown_about_the_end_of_the_file_separates() {
+        assert!(
+            !ends_mid_line(Ok(Some(b'\n'))),
+            "a terminated line needs no separator"
+        );
+        assert!(ends_mid_line(Ok(Some(b'}'))), "a line left open needs one");
+        assert!(
+            !ends_mid_line(Ok(None)),
+            "an empty file has no line to continue"
+        );
+        assert!(
+            ends_mid_line(Err(io::Error::other("the end cannot be read"))),
+            "and an end that cannot be read is separated from, not written onto: the rule \
+             `append` follows when it cannot read the file at all"
+        );
     }
 
     #[test]
