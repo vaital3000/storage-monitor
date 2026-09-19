@@ -138,14 +138,13 @@ pub async fn action_run(
 }
 
 /// What the app has deleted, for the Activity screen: the last `limit` entries of the
-/// action log, newest first (default 100), and how many lines could not be read.
+/// action log, last line first, and how many lines could not be read.
 ///
-/// An `Err` means the log could not be read — the same meaning [`action_run`] gives it, one
-/// stage on: the read did not happen. It is not the answer for a log with nothing in it,
-/// which is an empty list and no error, and the screen must not draw the two the same way.
+/// [`actions::activity_tail`] is the contract — what `Err` means here, which answers stay
+/// inside the `Ok`, the default `limit` and what the read costs. This is the door to it.
 #[tauri::command]
 pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Result<LogTail, String> {
-    actions::activity(log.inner(), limit)
+    actions::activity_tail(log.inner(), limit)
 }
 
 fn to_paths(paths: Vec<String>) -> Vec<PathBuf> {
@@ -194,11 +193,15 @@ mod tests {
         assert!(root.starts_with('/'), "{root}");
     }
 
-    /// The command over the [`ActionLog`] the app manages, where the meaning of `Err` is
-    /// fixed for the screen that Task 11 and the Activity page are written against: a log
-    /// nothing has written yet resolves as an empty list, and a log that cannot be read
-    /// rejects. The same file, in both states, so nothing but the read can explain the
-    /// difference.
+    /// The command over the [`ActionLog`] the app manages: a batch is written and read
+    /// back through `State<'_, ActionLog>`, which is what proves the state resolves and
+    /// that `log.inner()` forwards the log the app was given rather than some other one.
+    ///
+    /// The three answers themselves are pinned in `actions.rs`, against
+    /// [`actions::activity_tail`] directly, and the registration of this command is pinned
+    /// in `lib.rs` over real IPC with a sentinel line. What is left here that neither of
+    /// those has is the forwarding — so if this file ever gets crowded, this test is the
+    /// first thing to go, and it is the reason to keep it that should go first with it.
     #[test]
     fn the_activity_command_reads_the_log_the_app_manages() {
         use storage_monitor_core::action::{EntryOutcome, EntryResult, Outcome};

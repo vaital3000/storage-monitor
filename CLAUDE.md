@@ -118,12 +118,20 @@ both use the same store. Cancelled scans are not persisted. Format details:
   other links report 0 bytes.
 - CLI output: write through a locked `stdout` and treat `BrokenPipe` as a
   quiet exit, so `storage-monitor ... --json | head` never panics.
-- The Content Security Policy in `tauri.conf.json` is set. `just dev` does not
-  apply it — Tauri attaches the header only in the `tauri://localhost` handler
-  for the embedded frontend, so a `devUrl` document never passes through it.
-  Verify a change with `pnpm tauri build --debug --no-bundle`, and with a
-  positive control: plant an `eval` and confirm it is blocked, or "no
-  violations" proves nothing.
+- The Content Security Policy in `tauri.conf.json` stays closed: no
+  `'unsafe-eval'` or `'unsafe-inline'` in `script-src`, no remote origin in any
+  directive. `the_content_security_policy_stays_closed` (`src-tauri/src/lib.rs`)
+  holds that and carries the reason for every grant — including why `style-src`
+  keeps `'unsafe-inline'`, which is inline style _attributes_ and not Tailwind.
+  Loosening a directive means changing that test, deliberately.
+- Nothing runs the app under that policy by itself. `just dev` cannot: Tauri
+  attaches the header in the `tauri://localhost` handler for the embedded
+  frontend, and a `devUrl` document is served by Vite and never passes through
+  it — `devCsp` does not help either, it is the same handler. For the dev
+  window, set the header in Vite's `server.headers`. To check a change for
+  real, `pnpm tauri build --debug --no-bundle` and run the binary, always with
+  a positive control: plant an `eval`, confirm it is blocked, and only then
+  believe "no violations".
 - Do not add dependencies for something the standard library or an existing
   dependency already does.
 
