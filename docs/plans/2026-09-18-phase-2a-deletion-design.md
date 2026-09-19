@@ -212,6 +212,17 @@ a deleted path owned the bytes of a hard-linked file, its twins keep reporting
 0 until the next full scan. Re-attribution would mean keeping all `(dev, ino)`
 pairs of the tree — 3.7M entries for a rare case.
 
+Hard-link attribution drifts in **both** directions, and the second is the one
+that shows. A rescan re-attributes inside the rescanned path alone, so a
+surviving link whose twin lives outside it recovers the full size the twin is
+already counting: after the splice the parent counts those bytes twice, and the
+home total *grows* after a deletion — wrong in the app's primary metric.
+Measured on a two-directory fixture sharing one inode: a full scan gives
+`a 8192, b 0`; rescanning `b` gives `b 8192`. The trigger is a rescan after a
+partial failure, and a pnpm store hard-links into every `node_modules`. The next
+full scan corrects it; keeping the tree's whole `(dev, ino)` set to avoid it is
+the trade this design already rejected.
+
 **Second known limitation.** A file whose name is not valid UTF-8 cannot be
 deleted from the app. `Node::name` is a `str` filled through `to_string_lossy`,
 so such a name reaches the tree with U+FFFD in it and the path it yields names
