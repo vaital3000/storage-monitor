@@ -897,6 +897,12 @@ fn a_spliced_deletion_matches_a_full_rescan() {
     // The claim the Explorer relies on: after a deletion, tree plus patch is the tree the
     // walker would build today. Only `docs` and the root are above the deletion, and the
     // patch brings `docs` back fresh, so every node has to match to the byte.
+    //
+    // Both deletions are two levels down on purpose. `assert_same_subtree` compares mtime,
+    // and the splice re-aggregates the three totals and nothing else — so the root keeps
+    // the mtime it was scanned with while a full scan sees the new one. Deleting anything
+    // directly under the root, `big.bin` for instance, makes this fail on a difference that
+    // is the documented behaviour of `replace_subtrees` rather than a bug in it.
     let as_root = unsafe { libc_geteuid() } == 0;
     let dir = splice_fixture(as_root);
     let options = ScanOptions::new(dir.path().to_path_buf());

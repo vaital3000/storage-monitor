@@ -187,6 +187,18 @@ impl Tree {
     /// Names are unique within a directory, so no backtracking is needed. Anything but a
     /// plain name below the root, `..` in particular, matches nothing rather than being
     /// resolved: a patch is spliced onto what the path says, and the path has to say it.
+    ///
+    /// **The path has to be spelled the way the scan spelled it.** Every comparison here is
+    /// byte-exact per component: no symlink is resolved, no case is folded, no Unicode is
+    /// normalized. Three paths that name the right file therefore still answer `None` —
+    /// a canonicalized one (`/private/var/…` against a scan of `/var/…`, or any root
+    /// reached through a symlink), a case-different one on a case-insensitive volume
+    /// (`library` against `Library`), and NFD where the disk gave the walker NFC. Feed it
+    /// what came out of [`Tree::path`], which is where the UI got it.
+    ///
+    /// In particular, do **not** feed it [`Checked::judged`](crate::action::Checked): the
+    /// guards manufacture that value by canonicalizing, which is precisely the spelling
+    /// this rejects. `Checked::path` is the one that still carries the caller's components.
     pub fn find(&self, path: &Path) -> Option<NodeId> {
         let root = self.nodes.first()?;
         let below = path.strip_prefix(Path::new(&*root.name)).ok()?;
@@ -513,7 +525,18 @@ impl<'a> Item<'a> {
 /// The arena is rebuilt rather than edited: a sibling group is a contiguous range of ids,
 /// so there is nowhere to grow one in place. That costs a copy of the tree — a few hundred
 /// milliseconds for a few million nodes — and in exchange every invariant of the arena
-/// holds by construction.
+/// holds by construction. Both arenas are alive at once, so peak memory is about twice the
+/// tree: measured at +284 MiB over a 469 MiB one.
+///
+/// **The cost is per call, not per path**, and the gap is three orders of magnitude: one
+/// call carrying 100 patches takes 120 ms, the same 100 patches one call each take ten
+/// seconds. Collect a whole batch and splice it in one call.
+///
+/// A note for whoever changes this next: `Option<Option<Tree>>` says "drop" and "replace"
+/// in a shape that has to be decoded at both match sites, and an
+/// `enum Patch { Drop, Replace(Tree) }` would say it outright. It was considered and left
+/// alone — it moves a public signature and the tests pinned to it for readability alone.
+/// Worth doing if this file is opened for another reason.
 pub fn replace_subtrees(tree: &Tree, patches: Vec<(NodeId, Option<Tree>)>) -> Tree {
     if tree.is_empty() {
         return tree.clone();
@@ -532,16 +555,31 @@ pub fn replace_subtrees(tree: &Tree, patches: Vec<(NodeId, Option<Tree>)>) -> Tr
     rebuild.place(root, NO_PARENT);
     while let Some((parent, item)) = rebuild.pending.pop_front() {
         let mut children = children_of(&item, &replacements, &totals);
-        // Only a group holding a node whose size changed can be out of order, and those
-        // are the groups whose parent is an ancestor of a patch. Every other group keeps
-        // the order the walker gave it.
+        // Only a group holding a node whose size changed can be out of order, and those are
+        // the groups whose parent is an ancestor of a patch. Every other group keeps the
+        // order the walker gave it.
+        //
+        // This is the third and weakest use of `patchable`, and the only one that is an
+        // optimisation rather than a rule: sorting every group instead is *correct*, and
+        // measured, barely slower — 96–105 ms either way over 3.7 M nodes, because the sort
+        // finds the existing run in one pass and the rebuild is dominated by name
+        // allocations. Keep it, but do not read it as a correctness argument and do not let
+        // it vouch for the other two. The lookups in `children_of` are the lethal ones:
+        // there `patchable` is what keeps an id from being read in the wrong arena.
         if item.patchable && totals.contains_key(&item.id) {
             children.sort_by(|a, b| {
                 order_key(a.totals.size, a.name).cmp(&order_key(b.totals.size, b.name))
             });
         }
-        rebuild.nodes[parent as usize].first_child = rebuild.nodes.len() as NodeId;
-        rebuild.nodes[parent as usize].child_count = children.len() as u32;
+        // A node reaches this queue because it had children before the patch, so a group
+        // that comes back empty is one the patch emptied. `first_child` stays 0 for it, the
+        // value `flatten` leaves on a leaf: `children` reads the same `0..0` either way, but
+        // two nodes that agree about having no children should not differ in the field, or
+        // the first comparison of a patched `Node` against a walked one goes wrong.
+        if !children.is_empty() {
+            rebuild.nodes[parent as usize].first_child = rebuild.nodes.len() as NodeId;
+            rebuild.nodes[parent as usize].child_count = children.len() as u32;
+        }
         for child in children {
             rebuild.place(child, parent);
         }
@@ -867,6 +905,16 @@ mod tests {
         for id in 0..tree.len() as NodeId {
             let node = &tree.nodes[id as usize];
             if node.child_count == 0 {
+                // A group the patch emptied has to come out looking like a leaf the walker
+                // built, down to the unused field: `children` reads `0..0` either way, so
+                // nothing here notices — until two `Node`s are compared across a splice, or
+                // a test asserts `children(x) == 0..0` on a patched tree the way
+                // `flatten_assigns_parents_and_children` does on a flattened one.
+                assert_eq!(
+                    node.first_child, 0,
+                    "{id} has no children but still points at {}",
+                    node.first_child
+                );
                 continue;
             }
             assert_eq!(
@@ -1450,6 +1498,95 @@ mod tests {
         assert!(!patched.has_children(spliced));
         assert_eq!(totals_of(&patched, "/root/a"), (77, 12, 1));
         assert_eq!(totals_of(&patched, "/root"), (177, 92, 2));
+    }
+
+    #[test]
+    fn a_spliced_node_breaks_a_size_tie_on_the_name_it_kept() {
+        // The name half of the sort key, which nothing else in this file measures: every
+        // other fixture separates its siblings by size, so the comparator could read any
+        // name at all — or none — and still pass.
+        //
+        // `zz` is patched down from 90 to 40, which ties it with `m.bin`, so the group is
+        // decided on names alone. The two candidates fall on opposite sides: the kept name
+        // `zz` sorts after `m.bin`, while the patch root's absolute path `/root/zz` sorts
+        // before it, because `/` is below every letter. So reading the patch's name — or
+        // dropping the name term and leaving the tie in arrival order — puts the spliced
+        // node first, which is the user watching a directory they just shrank jump to the
+        // top of the list.
+        let (tree, _) = aggregated(
+            "/root",
+            0,
+            vec![
+                leaf("m.bin", 40),
+                aggregated("zz", 0, vec![leaf("inner.bin", 90)]),
+            ],
+        )
+        .flatten();
+        assert_eq!(names(&tree, tree.children(Tree::ROOT)), vec!["zz", "m.bin"]);
+
+        let (replacement, _) = aggregated("/root/zz", 0, vec![leaf("left.bin", 40)]).flatten();
+        let patched = replace_subtrees(&tree, vec![(find(&tree, "/root/zz"), Some(replacement))]);
+
+        assert_invariants(&patched);
+        let spliced = find(&patched, "/root/zz");
+        assert_eq!(patched.get(spliced).unwrap().name.as_ref(), "zz");
+        assert_eq!(
+            totals_of(&patched, "/root/zz").0,
+            totals_of(&patched, "/root/m.bin").0,
+            "the fixture only proves anything while the two tie",
+        );
+        assert_eq!(
+            names(&patched, patched.children(Tree::ROOT)),
+            vec!["m.bin", "zz"],
+            "a tie is broken on the name the node kept, not on the patch's path",
+        );
+    }
+
+    #[test]
+    fn an_error_on_a_replacements_own_root_is_kept() {
+        // `rescan_path` puts an error on the root of the tree it returns in two shapes that
+        // both ship: the one-node answer for a mount point it refused to enter, and a
+        // directory that has become partly unreadable since the scan. Both land here as a
+        // replacement whose root — not whose children — carries the message, and the
+        // splice has to carry it across.
+        let mut refused = Subtree::new(node("/root/mnt", NodeKind::Dir, 8));
+        refused.error = Some("skipped: different volume".into());
+        let mut partial = aggregated("/root/docs", 4, vec![leaf("kept.bin", 10)]);
+        partial.error = Some("1 entry could not be read".into());
+
+        let mut root = aggregated(
+            "/root",
+            0,
+            vec![
+                aggregated("docs", 1, vec![leaf("old.bin", 70)]),
+                aggregated("mnt", 1, vec![leaf("stale.bin", 60)]),
+            ],
+        );
+        root.children[0].error = Some("the old message".into());
+        let (tree, _) = root.flatten();
+        assert_eq!(tree.errors().len(), 1);
+
+        let patched = replace_subtrees(
+            &tree,
+            vec![
+                (find(&tree, "/root/docs"), Some(partial.flatten().0)),
+                (find(&tree, "/root/mnt"), Some(refused.flatten().0)),
+            ],
+        );
+
+        assert_invariants(&patched);
+        assert_eq!(
+            errors_by_path(&patched),
+            vec![
+                ("/root/docs".to_owned(), "1 entry could not be read"),
+                ("/root/mnt".to_owned(), "skipped: different volume"),
+            ],
+            "each replacement's own root keeps its message and the old one is gone",
+        );
+        // The refused mount point is the single-node shape: its error is on a leaf.
+        assert!(!patched.has_children(find(&patched, "/root/mnt")));
+        assert_eq!(totals_of(&patched, "/root/mnt"), (8, 8, 0));
+        assert_eq!(totals_of(&patched, "/root/docs"), (14, 10, 1));
     }
 
     #[test]
