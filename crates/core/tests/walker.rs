@@ -683,15 +683,22 @@ fn siblings_at_the_root_of_the_volume(keep: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The only test that holds the same-volume rule of a patch, because a mount point cannot
+/// be built into a fixture: it uses the one this machine already has. Do not delete it as
+/// environment-dependent — without it, a rescan walks whole foreign volumes into a total
+/// that describes one.
 #[test]
 fn rescan_of_another_volume_is_skipped_exactly_as_the_walker_skips_it() {
     // `/dev` is devfs on macOS and a container mount on Linux; `/` is the boot volume.
+    // Asserted, not skipped around: a guard that returns early would leave the rule
+    // untested on a machine where it silently stopped holding.
     let root = PathBuf::from("/");
     let other = PathBuf::from("/dev");
-    if fs::metadata(&root).unwrap().dev() == fs::metadata(&other).unwrap().dev() {
-        eprintln!("skipped: /dev is on the same volume as /");
-        return;
-    }
+    assert_ne!(
+        fs::metadata(&root).unwrap().dev(),
+        fs::metadata(&other).unwrap().dev(),
+        "no second volume to compare against"
+    );
     let mut options = ScanOptions::new(root.clone());
     assert!(options.same_device, "the rule under test");
     let tree = rescan_path(&other, &options).unwrap().unwrap();
@@ -718,6 +725,16 @@ fn rescan_of_another_volume_is_skipped_exactly_as_the_walker_skips_it() {
     let walked = rescan_path(&other, &options).unwrap().unwrap();
     assert!(walked.len() > 1, "only {} nodes", walked.len());
     assert_eq!(walked.error(Tree::ROOT), None);
+
+    // The rule is the walker's: it stops a *descent*, so it never touches an entry that is
+    // not a directory, however foreign the volume that entry sits on.
+    let options = ScanOptions::new(root);
+    let null = rescan_path(Path::new("/dev/null"), &options)
+        .unwrap()
+        .unwrap();
+    assert_eq!(null.len(), 1);
+    assert_eq!(null.root().kind, NodeKind::Other);
+    assert_eq!(null.error(Tree::ROOT), None, "a leaf is not skipped");
 }
 
 fn subtree_size(tree: &Tree, id: u32) -> usize {

@@ -182,6 +182,12 @@ pub fn scan(options: &ScanOptions, progress: &ScanProgress) -> Result<ScanResult
 /// [`ScanError::Root`], as is an `options.root` the volume rule cannot be resolved against.
 /// [`ScanError::NotADirectory`] and [`ScanError::Workers`] escape from the walk as well.
 ///
+/// One error does not name `path`: when `options.root` itself cannot be read, the
+/// [`ScanError::Root`] carries the scan root, because that is the path that failed. A
+/// caller mapping errors back to the entries of a batch should expect it — and expect the
+/// batch to be inconsistent about it, since a file never reaches the volume rule and comes
+/// back fine under the very options that fail for a directory next to it.
+///
 /// Hard links are re-attributed inside `path` alone. A link there whose bytes the last full
 /// scan gave to a twin outside takes them back, so splicing the patch can make the totals
 /// above it *grow* although nothing was added; the next full scan puts it right. Holding
@@ -384,6 +390,9 @@ mod tests {
 
     /// The directory can be deleted between the stat in [`rescan_path`] and the one inside
     /// [`scan`]; a scan of a root that is not there reaches the same arm without the race.
+    /// The only test that holds that arm — the race itself cannot be a fixture — so do not
+    /// delete it for reaching a private helper; through `rescan_path` the outer stat
+    /// answers first and the arm is never entered.
     #[test]
     fn a_directory_that_is_gone_by_the_time_the_walk_starts_is_not_an_error() {
         let options = ScanOptions::new(PathBuf::from("/home/me"));
@@ -438,10 +447,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let here = fs::metadata(dir.path()).unwrap().dev();
         let there = fs::metadata("/dev").unwrap().dev();
-        if here == there {
-            eprintln!("skipped: /dev is on the volume of the temp dir");
-            return;
-        }
+        assert_ne!(here, there, "no second volume to compare against");
         let link = dir.path().join("root");
         std::os::unix::fs::symlink("/dev", &link).unwrap();
         let options = ScanOptions::new(link);
