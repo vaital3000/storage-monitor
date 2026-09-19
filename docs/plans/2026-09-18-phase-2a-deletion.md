@@ -1230,6 +1230,8 @@ pub async fn action_run(manager: State<'_, ScanManager>, paths: Vec<String>, mod
 
 Both clone what they need and run the body inside `tauri::async_runtime::spawn_blocking`, so the window keeps painting. `action_run` re-plans from the paths and never trusts a preview from the UI. Register both in `lib.rs` next to the scan commands, and add the `RealSystem` and the `ActionLog` to the managed state.
 
+**A rejected `actionRun` and a warning inside a resolved one mean opposite things, and the UI must not render them the same way.** `Err` means the batch **did not run** — the body panicked before doing the work, and the message reads "the batch did not finish". A batch that did run always resolves, and reports afterwards through `recorded: false` (deleted, no record) or `treeStale: true` (deleted, the view is behind). Showing an error for that second pair would tell the user nothing happened at the moment 40 GB went.
+
 **Step 4: Run the tests**
 
 Run: `cargo test -p storage-monitor-desktop`
