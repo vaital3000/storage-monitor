@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  actionPreview,
+  actionRun,
+  activityLog,
   defaultRoot,
   diskUsage,
   getAppInfo,
@@ -13,7 +16,14 @@ import {
   treeNode,
   type ScanStatus,
 } from '../lib/ipc';
-import { FIXTURE_ROOT, fixtureDisk, fixtureGrowers, fixtureNodes } from './fixtures';
+import {
+  FIXTURE_ROOT,
+  fixtureDisk,
+  fixtureGrowers,
+  fixtureNode,
+  fixtureNodes,
+  fixtureStatusDone,
+} from './fixtures';
 import { installIpcMock, mockScanDelayMs, resetIpcMock, revealed, setMockScanDelay } from './ipc';
 
 /** Subscribes to both scan events; `done` resolves with the payload of `scan:done`. */
@@ -30,14 +40,14 @@ async function subscribe() {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 
-/** The mocked `invoke`, for commands the typed layer does not expose. */
-function rawInvoke(cmd: string): Promise<unknown> {
+/** The mocked `invoke`, for commands and arguments the typed layer does not expose. */
+function rawInvoke(cmd: string, args: unknown = {}): Promise<unknown> {
   const internals = (
     window as unknown as {
       __TAURI_INTERNALS__: { invoke(cmd: string, args?: unknown): Promise<unknown> };
     }
   ).__TAURI_INTERNALS__;
-  return internals.invoke(cmd, {});
+  return internals.invoke(cmd, args);
 }
 
 beforeEach(() => {
@@ -226,5 +236,160 @@ describe('resetIpcMock', () => {
     await revealInFinder('/x');
     installIpcMock();
     expect(revealed).toEqual([]);
+  });
+
+  it('puts the fixture back, so an install hands out a tree nothing has deleted from', async () => {
+    const { done } = await subscribe();
+    await scanStart();
+    await done;
+    const movies = fixtureNode('Movies');
+    await actionRun([movies.path], 'trash');
+    expect((await activityLog()).entries).toHaveLength(1);
+
+    resetIpcMock();
+
+    expect(fixtureNode('Movies')).toBe(movies);
+    expect(await activityLog()).toEqual({ entries: [], damaged: 0 });
+    expect(fixtureNodes[0].size).toBe(fixtureStatusDone().bytes);
+  });
+});
+
+describe('the deletion commands', () => {
+  it('block every path before a scan instead of failing, unlike tree_node', async () => {
+    await expect(treeNode()).rejects.toBe('no scan result');
+    const movies = fixtureNode('Movies');
+    const preview = await actionPreview([movies.path], 'trash');
+    expect(preview.entries).toEqual([
+      {
+        path: movies.path,
+        kind: 'dir',
+        size: movies.size,
+        status: { state: 'blocked', reason: 'outsideRoots' },
+      },
+    ]);
+    expect(preview.totalBytes).toBe(0);
+    const idle = await scanStatus();
+    const batch = await actionRun([movies.path], 'trash');
+    expect(batch.outcome.entries[0].result).toEqual({
+      result: 'skipped',
+      reason: 'outsideRoots',
+    });
+    expect(batch.outcome.freedBytes).toBe(0);
+    // A batch that deleted nothing has no totals to bring up to date, and an idle window
+    // has none to show: the counters of a scan that never ran stay at zero.
+    expect(await scanStatus()).toEqual(idle);
+    expect(idle.bytes).toBe(0);
+    expect(await activityLog()).toEqual({
+      entries: [expect.objectContaining({ result: 'skipped', detail: 'outsideRoots' })],
+      damaged: 0,
+    });
+  });
+
+  it('reject arguments that are not a list of paths and a mode', async () => {
+    await expect(rawInvoke('action_preview', { paths: '/Users/demo/Movies' })).rejects.toMatch(
+      /paths/,
+    );
+    await expect(rawInvoke('action_run', { paths: [1, 2], mode: 'trash' })).rejects.toMatch(
+      /paths/,
+    );
+    await expect(rawInvoke('action_run', { paths: [], mode: 'bin' })).rejects.toMatch(/mode/);
+    await expect(rawInvoke('action_preview', { paths: [] })).rejects.toMatch(/mode/);
+  });
+
+  describe('after a scan', () => {
+    beforeEach(async () => {
+      const { done } = await subscribe();
+      await scanStart();
+      await done;
+    });
+
+    it('preview a selection against the scan root', async () => {
+      const film = fixtureNode('Movies/family-2025.mov');
+      const preview = await actionPreview([film.path, fixtureNode('Library').path], 'permanent');
+      expect(preview.mode).toBe('permanent');
+      expect(preview.entries.map((entry) => entry.status)).toEqual([
+        { state: 'ready' },
+        { state: 'blocked', reason: 'denylisted' },
+      ]);
+      expect(preview.totalBytes).toBe(film.size);
+    });
+
+    it('run a batch: the rows leave the tree and the scanned totals shrink', async () => {
+      const before = await scanStatus();
+      const movies = fixtureNode('Movies');
+      const [size, files] = [movies.size, movies.fileCount];
+      const batch = await actionRun([movies.path], 'trash');
+      expect(batch).toEqual({
+        outcome: {
+          entries: [{ path: movies.path, kind: 'dir', result: { result: 'removed', bytes: size } }],
+          freedBytes: size,
+          at: expect.any(String),
+          mode: 'trash',
+        },
+        recorded: true,
+        treeStale: false,
+      });
+      const root = await treeNode();
+      expect(root.children.map((child) => child.name)).not.toContain('Movies');
+      expect(root.size).toBe(before.bytes - size);
+      const after = await scanStatus();
+      expect(after.bytes).toBe(before.bytes - size);
+      expect(after.files).toBe(before.files - files);
+      expect(after.dirs).toBe(before.dirs - 1);
+      // Like `patched_stats`, a patch leaves the read errors of the scan alone.
+      expect(after.errors).toBe(before.errors);
+      expect(after.state).toBe('done');
+      expect(after.durationMs).toBe(before.durationMs);
+    });
+
+    it('leave the scanned totals alone when a batch deletes nothing', async () => {
+      const before = await scanStatus();
+      await actionRun([fixtureNode('Library').path], 'trash');
+      expect(await scanStatus()).toEqual(before);
+    });
+
+    it('keep the read errors of a deleted unreadable directory', async () => {
+      const before = await scanStatus();
+      await actionRun([fixtureNode('.Trash').path], 'trash');
+      const after = await scanStatus();
+      expect(after.errors).toBe(before.errors);
+      expect(after.dirs).toBe(before.dirs - 1);
+      expect(after.bytes).toBe(before.bytes);
+    });
+
+    it('read the batch back through activity_log, newest first', async () => {
+      const report = fixtureNode('Downloads/q3-report.pdf');
+      const size = report.size;
+      await actionRun([report.path, `${FIXTURE_ROOT}/nope`], 'permanent');
+      const log = await activityLog();
+      expect(log.damaged).toBe(0);
+      expect(log.entries).toEqual([
+        expect.objectContaining({ path: `${FIXTURE_ROOT}/nope`, result: 'skipped' }),
+        expect.objectContaining({
+          path: report.path,
+          kind: 'file',
+          mode: 'permanent',
+          result: 'removed',
+          detail: null,
+          bytes: size,
+        }),
+      ]);
+    });
+
+    it('return the last hundred entries to a caller that asks for no limit', async () => {
+      const paths = Array.from({ length: 101 }, (_, i) => `${FIXTURE_ROOT}/nope-${i}`);
+      await actionRun(paths, 'trash');
+      expect((await activityLog()).entries).toHaveLength(100);
+      expect((await activityLog(101)).entries).toHaveLength(101);
+      expect((await activityLog(2)).entries.map((entry) => entry.path)).toEqual([
+        `${FIXTURE_ROOT}/nope-100`,
+        `${FIXTURE_ROOT}/nope-99`,
+      ]);
+    });
+
+    it('start every test with the fixture whole again', async () => {
+      expect((await treeNode()).children.map((child) => child.name)).toContain('Movies');
+      expect(await activityLog()).toEqual({ entries: [], damaged: 0 });
+    });
   });
 });

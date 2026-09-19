@@ -2,8 +2,29 @@
 // 180 GB, with the artifacts the cleanup modules will target, two folders the scanner
 // cannot read, one it could read only in part, one mount point it skips, and a previous
 // snapshot for deltas.
+//
+// The tree is mutable from `mockActionRun` down: a batch takes rows out of it exactly as a
+// deletion followed by `ScanManager::patch_paths` does in the app. `resetMockActions` puts
+// every node back, and the test setup calls it between tests.
 
-import type { Crumb, Delta, DiskUsage, NodeId, NodeKind, NodeView, ScanStatus } from '../lib/ipc';
+import type {
+  ActivityEntry,
+  BatchResult,
+  BlockReason,
+  Crumb,
+  Delta,
+  DiskUsage,
+  EntryOutcome,
+  LogTail,
+  Mode,
+  NodeId,
+  NodeKind,
+  NodeView,
+  Outcome,
+  Preview,
+  PreviewEntry,
+  ScanStatus,
+} from '../lib/ipc';
 
 /** Root of the fixture tree; `default_root` returns it in mock mode. */
 export const FIXTURE_ROOT = '/Users/demo';
@@ -256,6 +277,21 @@ export const fixtureNodes: readonly FixtureNode[] = flatten(build(HOME));
 
 const byPath = new Map(fixtureNodes.map((node) => [node.path, node]));
 
+/**
+ * Ids of the nodes a batch deleted. Nothing is spliced out of `fixtureNodes`, which is
+ * indexed by id: a deleted node keeps its slot and leaves `byPath`, its parent's children
+ * and every count instead.
+ */
+const removed = new Set<NodeId>();
+
+/** Every node as the fixture was built, so that `resetMockActions` can put it back. */
+const pristine = fixtureNodes.map((node) => ({
+  size: node.size,
+  logicalSize: node.logicalSize,
+  fileCount: node.fileCount,
+  children: [...node.children],
+}));
+
 /** The node at an absolute or root-relative path; throws for a path outside the fixture. */
 export function fixtureNode(path: string): FixtureNode {
   const absolute =
@@ -283,7 +319,9 @@ function deltaOf(node: FixtureNode): number | null {
 /** One page of the tree, built like `NodeView::build`; throws for an unknown id. */
 export function fixtureNodeView(id: NodeId = 0, limit = 500): NodeView {
   const node = fixtureNodes[id];
-  if (node === undefined) {
+  // A deleted node is as unknown as one that never existed: after the real splice the whole
+  // arena is rebuilt and none of its ids mean what they did.
+  if (node === undefined || removed.has(id)) {
     throw new Error(`unknown node ${id}`);
   }
   const breadcrumbs: Crumb[] = [];
@@ -324,11 +362,7 @@ export function fixtureNodeView(id: NodeId = 0, limit = 500): NodeView {
   };
 }
 
-/**
- * Growing directories, largest first, like `snapshot::top_growers`: a directory is left
- * out when one child explains at least 80% of its growth (the child is listed instead).
- */
-export function fixtureGrowers(): Delta[] {
+function computeGrowers(): Delta[] {
   const growing: Delta[] = [];
   for (const [path, before] of previousSizes) {
     const node = fixtureNode(path);
@@ -346,6 +380,21 @@ export function fixtureGrowers(): Delta[] {
     .sort((a, b) => b.delta - a.delta || (a.path < b.path ? -1 : 1));
 }
 
+/** The growers as the finished scan left them; `fixtureGrowers` hands out copies. */
+const GROWERS: readonly Delta[] = computeGrowers();
+
+/**
+ * Growing directories, largest first, like `snapshot::top_growers`: a directory is left
+ * out when one child explains at least 80% of its growth (the child is listed instead).
+ *
+ * Read once, when the fixture is built, because that is when `ScanManager` computes the
+ * list it hands to `top_growers` — a splice does not touch it. So a batch cannot change
+ * these numbers, and a path a batch deleted still reports the size the scan recorded.
+ */
+export function fixtureGrowers(): Delta[] {
+  return GROWERS.map((grower) => ({ ...grower }));
+}
+
 /** A 1 TB volume with the fixture's home folder on it. */
 export function fixtureDisk(): DiskUsage {
   const total = 994_662_584_320;
@@ -355,7 +404,8 @@ export function fixtureDisk(): DiskUsage {
 
 /** The status of the finished fixture scan, with a previous snapshot to compare against. */
 export function fixtureStatusDone(): ScanStatus {
-  const count = (test: (node: FixtureNode) => boolean) => fixtureNodes.filter(test).length;
+  const count = (test: (node: FixtureNode) => boolean) =>
+    fixtureNodes.filter((node) => !removed.has(node.id) && test(node)).length;
   return {
     state: 'done',
     root: FIXTURE_ROOT,
@@ -369,4 +419,308 @@ export function fixtureStatusDone(): ScanStatus {
     hasPrevious: true,
     previousTakenAt: PREVIOUS_TAKEN_AT,
   };
+}
+
+// The mock's half of `crates/core/src/action`: the guards, the deletion and the record of
+// it, over the fixture tree instead of a disk. Every rule below mirrors one the backend
+// enforces, because this is the only oracle the UI tests have — a mock that says yes to
+// everything makes them prove nothing.
+
+/**
+ * Where deletion is never allowed: the standard denylist of `Limits::with_home`, with the
+ * fixture root as the home folder — which is what it is, since `default_root` returns it
+ * exactly as the app returns `$HOME`. So the fixture's whole `Library` subtree is
+ * undeletable here, as `~/Library` is in the app until a module declares a path inside it.
+ */
+const DENIED: readonly string[] = [
+  '/',
+  '/System',
+  '/usr',
+  '/bin',
+  '/sbin',
+  '/Library',
+  '/Applications',
+  '/opt',
+  '/cores',
+  '/Users',
+  '/Volumes',
+  '/etc',
+  '/var',
+  '/tmp',
+  '/private',
+  `${FIXTURE_ROOT}/Library`,
+  FIXTURE_ROOT,
+];
+
+/** The action log, oldest line first: the JSONL file the backend appends to, as an array. */
+export const mockActionLog: string[] = [];
+
+/** `a.starts_with(b)` for paths: component by component, so `/h/ab` is not inside `/h/a`. */
+function isAtOrUnder(path: string, prefix: string): boolean {
+  return prefix === '/' ? path.startsWith('/') : path === prefix || path.startsWith(`${prefix}/`);
+}
+
+/** The components of a path, the way `Path::components` reads them: `.` and `//` are noise. */
+function componentsOf(path: string): string[] {
+  return path.split('/').filter((part) => part !== '' && part !== '.');
+}
+
+/** `Limits::check`: the normalized path to delete, or the reason the rules refuse it. */
+function checkPath(path: string, root: string): { judged: string } | { reason: BlockReason } {
+  // 1. No last component to speak of: `/`, or a path ending in `..`, both of which name
+  //    something other than they appear to. Judged as written, before anything is resolved.
+  const written = componentsOf(path);
+  if (written.length === 0 || written[written.length - 1] === '..') {
+    return { reason: 'malformed' };
+  }
+  // 2. Only the parent is resolved, and the mock's filesystem has no working directory, so
+  //    the parent of a relative path is exactly the one that cannot be resolved.
+  if (!path.startsWith('/')) {
+    return { reason: 'missing' };
+  }
+  // 3. Lexical where the backend calls `canonicalize`: no directory of the fixture is a
+  //    symlink, so resolving `..` is the whole of the difference.
+  const resolved: string[] = [];
+  for (const part of written) {
+    if (part === '..') resolved.pop();
+    else resolved.push(part);
+  }
+  const judged = `/${resolved.join('/')}`;
+  // 4. The root itself and every ancestor of it.
+  if (isAtOrUnder(root, judged)) {
+    return { reason: 'isRoot' };
+  }
+  // 5. Component-wise, so `/h/ab` is not inside `/h/a`.
+  if (!isAtOrUnder(judged, root)) {
+    return { reason: 'outsideRoots' };
+  }
+  // 6. The denied entry itself and everything below it — except an entry that contains the
+  //    root, which `Limits::new` drops so that scanning a denied folder unlocks it.
+  if (DENIED.some((denied) => !isAtOrUnder(root, denied) && isAtOrUnder(judged, denied))) {
+    return { reason: 'denylisted' };
+  }
+  return { judged };
+}
+
+/**
+ * `preview_batch`: every path against the guards and the fixture, with nothing touched.
+ *
+ * `root` is the scan root the window holds; `null` is the state where nothing has been
+ * scanned, which `refused_preview` answers by blocking every entry as `outsideRoots` —
+ * nothing is inside a root that does not exist.
+ */
+export function mockActionPreview(
+  paths: readonly string[],
+  mode: Mode,
+  root: string | null,
+): Preview {
+  const entries: PreviewEntry[] = [];
+  /** Where each still-ready entry sits, and the form the batch comparison needs. */
+  const ready: Array<{ index: number; judged: string }> = [];
+  for (const path of paths) {
+    // `plan_for`: the kind and the size come from the tree, under the spelling the caller
+    // sent, which is the spelling the scan recorded. A path it does not know carries neither.
+    const planned = byPath.get(path);
+    const kind = planned?.kind ?? 'other';
+    const size = planned?.size ?? 0;
+    const checked = root === null ? { reason: 'outsideRoots' as const } : checkPath(path, root);
+    if ('reason' in checked) {
+      // Without a normalized path, the only honest thing to show is what was asked for.
+      entries.push({ path, kind, size, status: { state: 'blocked', reason: checked.reason } });
+      continue;
+    }
+    const onDisk = byPath.get(checked.judged);
+    if (onDisk === undefined) {
+      const status = { state: 'blocked', reason: 'missing' } as const;
+      entries.push({ path: checked.judged, kind, size, status });
+      continue;
+    }
+    ready.push({ index: entries.length, judged: checked.judged });
+    // Only the kind is re-read, as `check_entry` does: a stale size costs nothing, and a
+    // stale kind deletes the wrong thing.
+    entries.push({ path: checked.judged, kind: onDisk.kind, size, status: { state: 'ready' } });
+  }
+  // `drop_nested`, over the still-ready entries only: one that will not be deleted cannot
+  // swallow the one below it. A strict ancestor always wins; between two spellings of one
+  // entry, the earlier one does.
+  for (const [i, entry] of ready.entries()) {
+    const swallowed = ready.some(
+      ({ judged }, j) =>
+        i !== j && isAtOrUnder(entry.judged, judged) && (judged !== entry.judged || j < i),
+    );
+    if (swallowed) {
+      entries[entry.index].status = { state: 'blocked', reason: 'nested' };
+    }
+  }
+  const totalBytes = entries
+    .filter((entry) => entry.status.state === 'ready')
+    .reduce((sum, entry) => sum + entry.size, 0);
+  return { entries, totalBytes, mode };
+}
+
+/**
+ * `run_batch`: deletes what the guards allow, records the batch and patches the tree.
+ *
+ * The two warnings always come back clear. The mock has no port that can refuse a deletion,
+ * no log that can fail to be written and no patch that can be dropped, so a batch that got
+ * this far did all three.
+ */
+export function mockActionRun(
+  paths: readonly string[],
+  mode: Mode,
+  root: string | null,
+): BatchResult {
+  const preview = mockActionPreview(paths, mode, root);
+  // One instant for the whole batch, read before the first deletion.
+  const at = new Date().toISOString();
+  const entries: EntryOutcome[] = [];
+  let freedBytes = 0;
+  for (const entry of preview.entries) {
+    if (entry.status.state === 'blocked') {
+      // Reported where the user left it, with the reason they were shown.
+      const result = { result: 'skipped', reason: entry.status.reason } as const;
+      entries.push({ path: entry.path, kind: entry.kind, result });
+      continue;
+    }
+    const node = byPath.get(entry.path);
+    if (node === undefined) {
+      const result = { result: 'skipped', reason: 'missing' } as const;
+      entries.push({ path: entry.path, kind: entry.kind, result });
+      continue;
+    }
+    removeSubtree(node);
+    freedBytes += entry.size;
+    // The size the plan carried and the dialog promised, never a re-read of a subtree that
+    // is no longer there.
+    const result = { result: 'removed', bytes: entry.size } as const;
+    entries.push({ path: entry.path, kind: entry.kind, result });
+  }
+  const outcome: Outcome = { entries, freedBytes, at, mode };
+  appendToLog(outcome);
+  return { outcome, recorded: true, treeStale: false };
+}
+
+/** The parent of a node, or `undefined` for the root. */
+function parentOf(node: FixtureNode): FixtureNode | undefined {
+  return node.parent === null ? undefined : fixtureNodes[node.parent];
+}
+
+/**
+ * Takes a node and everything under it out of the tree, and shrinks every ancestor by what
+ * it held — which is what a deletion followed by `patch_paths` leaves behind.
+ */
+function removeSubtree(node: FixtureNode): void {
+  const parent = parentOf(node);
+  if (parent !== undefined) {
+    parent.children.splice(parent.children.indexOf(node.id), 1);
+  }
+  for (let ancestor = parent; ancestor !== undefined; ancestor = parentOf(ancestor)) {
+    ancestor.size -= node.size;
+    ancestor.logicalSize -= node.logicalSize;
+    ancestor.fileCount -= node.fileCount;
+  }
+  const gone: FixtureNode[] = [node];
+  for (let next = 0; next < gone.length; next += 1) {
+    removed.add(gone[next].id);
+    byPath.delete(gone[next].path);
+    for (const child of gone[next].children) {
+      gone.push(fixtureNodes[child]);
+    }
+  }
+}
+
+/** `ActionLog::append`: one line per entry, in the order of the batch. */
+function appendToLog(outcome: Outcome): void {
+  for (const entry of outcome.entries) {
+    mockActionLog.push(JSON.stringify(logEntry(entry, outcome)));
+  }
+}
+
+/** `LogEntry::of`: the verdict alone, with what it carried split into `detail` and `bytes`. */
+function logEntry(entry: EntryOutcome, outcome: Outcome): ActivityEntry {
+  const line = { at: outcome.at, path: entry.path, kind: entry.kind, mode: outcome.mode };
+  switch (entry.result.result) {
+    case 'removed':
+      return { ...line, result: 'removed', detail: null, bytes: entry.result.bytes };
+    case 'failed':
+      return { ...line, result: 'failed', detail: entry.result.message, bytes: 0 };
+    case 'skipped':
+      return { ...line, result: 'skipped', detail: entry.result.reason, bytes: 0 };
+  }
+}
+
+const KINDS: readonly string[] = ['dir', 'file', 'symlink', 'other'];
+const MODES: readonly string[] = ['trash', 'permanent'];
+const RESULTS: readonly string[] = ['removed', 'failed', 'skipped'];
+
+const oneOf = (field: unknown, names: readonly string[]) =>
+  typeof field === 'string' && names.includes(field);
+
+/** One line of the log, or `null` when it is not an entry — which is what serde answers. */
+function parseLogLine(line: string): ActivityEntry | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+  const entry = value as Record<string, unknown>;
+  const complete =
+    typeof entry.at === 'string' &&
+    typeof entry.path === 'string' &&
+    oneOf(entry.kind, KINDS) &&
+    oneOf(entry.mode, MODES) &&
+    oneOf(entry.result, RESULTS) &&
+    (entry.detail === null || typeof entry.detail === 'string') &&
+    typeof entry.bytes === 'number';
+  return complete ? (value as ActivityEntry) : null;
+}
+
+/**
+ * `ActionLog::tail`: the last `limit` entries, newest first, and how many lines of the
+ * stretch that was read could not be parsed.
+ *
+ * A damaged line costs one `damaged` and nothing else: it does not use up a slot of `limit`,
+ * and it does not stop the read. A blank line is a separator, not damage. `damaged` counts
+ * only as far back as the read went, which is as far as `limit` entries reach.
+ */
+export function mockActivityTail(limit: number): LogTail {
+  const entries: ActivityEntry[] = [];
+  let damaged = 0;
+  for (let line = mockActionLog.length - 1; line >= 0; line -= 1) {
+    if (entries.length === limit) {
+      break;
+    }
+    const text = mockActionLog[line];
+    if (text.trim() === '') {
+      continue;
+    }
+    const entry = parseLogLine(text);
+    if (entry === null) {
+      damaged += 1;
+    } else {
+      entries.push(entry);
+    }
+  }
+  return { entries, damaged };
+}
+
+/**
+ * Puts every node of the tree back as it was built and forgets the log. `resetIpcMock` calls
+ * it, and so does the test setup, so a batch in one test is never visible in the next.
+ */
+export function resetMockActions(): void {
+  mockActionLog.length = 0;
+  removed.clear();
+  for (const node of fixtureNodes) {
+    const was = pristine[node.id];
+    node.size = was.size;
+    node.logicalSize = was.logicalSize;
+    node.fileCount = was.fileCount;
+    node.children.splice(0, node.children.length, ...was.children);
+    byPath.set(node.path, node);
+  }
 }

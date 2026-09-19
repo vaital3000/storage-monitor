@@ -4,7 +4,13 @@
 
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC } from '@tauri-apps/api/mocks';
-import { SCAN_DONE_EVENT, SCAN_PROGRESS_EVENT, type AppInfo, type ScanStatus } from '../lib/ipc';
+import {
+  SCAN_DONE_EVENT,
+  SCAN_PROGRESS_EVENT,
+  type AppInfo,
+  type Mode,
+  type ScanStatus,
+} from '../lib/ipc';
 import {
   FIXTURE_ROOT,
   fixtureDisk,
@@ -12,6 +18,10 @@ import {
   fixtureNodeView,
   fixtureNodes,
   fixtureStatusDone,
+  mockActionPreview,
+  mockActionRun,
+  mockActivityTail,
+  resetMockActions,
 } from './fixtures';
 
 export const MOCK_APP_INFO: AppInfo = { name: 'Storage Monitor', version: '0.0.0-mock' };
@@ -29,6 +39,7 @@ export function setMockScanDelay(ms: number): void {
 const PROGRESS_TICKS = 6;
 const DEFAULT_CHILDREN_LIMIT = 500;
 const DEFAULT_GROWERS_LIMIT = 10;
+const DEFAULT_ACTIVITY_LIMIT = 100;
 
 /** Directories the simulated scan claims to be reading, one per tick, shallow to deep. */
 const PROGRESS_PATHS: readonly string[] = (() => {
@@ -81,6 +92,22 @@ function stringArgument(args: IpcArgs, name: string): string | undefined {
 function numberArgument(args: IpcArgs, name: string): number | undefined {
   const value = argument(args, name);
   return typeof value === 'number' ? value : undefined;
+}
+
+/**
+ * The two arguments of both action commands, refused the way Tauri refuses a body it cannot
+ * deserialize into `Vec<String>` and `Mode`: with an error, never with a guess.
+ */
+function batchArguments(args: IpcArgs, cmd: string): { paths: string[]; mode: Mode } {
+  const paths = argument(args, 'paths');
+  if (!Array.isArray(paths) || paths.some((path) => typeof path !== 'string')) {
+    commandError(`invalid args \`paths\` for command \`${cmd}\`: expected a list of paths`);
+  }
+  const mode = argument(args, 'mode');
+  if (mode !== 'trash' && mode !== 'permanent') {
+    commandError(`invalid args \`mode\` for command \`${cmd}\`: expected trash or permanent`);
+  }
+  return { paths: paths as string[], mode };
 }
 
 /** A command's `Err(String)`: Tauri rejects with the string itself, not with an `Error`. */
@@ -178,6 +205,22 @@ function scanCancel(): ScanStatus {
   return { ...status };
 }
 
+/**
+ * A batch, with the totals of the scan brought up to date afterwards.
+ *
+ * `patched_stats` does the same in the app: the files, the folders and the bytes come from
+ * the tree the splice installed, while the read errors stay the ones the scan met. Without
+ * it the header would go on claiming the bytes of rows that are gone.
+ */
+function runBatch(paths: string[], mode: Mode) {
+  const batch = mockActionRun(paths, mode, status.root);
+  if (hasResult) {
+    const patched = fixtureStatusDone();
+    status = { ...status, files: patched.files, dirs: patched.dirs, bytes: patched.bytes };
+  }
+  return batch;
+}
+
 const handle: IpcHandler = (cmd, args) => {
   switch (cmd) {
     case 'get_app_info':
@@ -211,6 +254,16 @@ const handle: IpcHandler = (cmd, args) => {
       return status.hasPrevious
         ? fixtureGrowers().slice(0, numberArgument(args, 'limit') ?? DEFAULT_GROWERS_LIMIT)
         : [];
+    case 'action_preview': {
+      const { paths, mode } = batchArguments(args, cmd);
+      return mockActionPreview(paths, mode, status.root);
+    }
+    case 'action_run': {
+      const { paths, mode } = batchArguments(args, cmd);
+      return runBatch(paths, mode);
+    }
+    case 'activity_log':
+      return mockActivityTail(numberArgument(args, 'limit') ?? DEFAULT_ACTIVITY_LIMIT);
     case 'plugin:opener|reveal_item_in_dir': {
       // `revealItemInDir(path)` sends `{ paths: [path] }`.
       const paths = argument(args, 'paths');
@@ -224,12 +277,16 @@ const handle: IpcHandler = (cmd, args) => {
   }
 };
 
-/** Back to idle: no scan, no tree, no revealed paths, no pending ticks. Keeps the delay. */
+/**
+ * Back to idle: no scan, no tree, no revealed paths, no pending ticks, and the fixture whole
+ * again with an empty action log. Keeps the delay.
+ */
 export function resetIpcMock(): void {
   clearTimer();
   status = IDLE;
   hasResult = false;
   revealed.length = 0;
+  resetMockActions();
 }
 
 declare global {

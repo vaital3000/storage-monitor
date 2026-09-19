@@ -1,14 +1,21 @@
 import { describe, expect, it } from 'vitest';
+import type { BlockReason, Mode, PreviewEntry } from '../lib/ipc';
 import {
   FIXTURE_ROOT,
   PARTIAL_READ,
+  PERMISSION_DENIED,
   fixtureDisk,
   fixtureGrowers,
   fixtureNode,
   fixtureNodeView,
   fixtureNodes,
   fixtureStatusDone,
+  mockActionLog,
+  mockActionPreview,
+  mockActionRun,
+  mockActivityTail,
   previousSizes,
+  resetMockActions,
 } from './fixtures';
 
 const GB = 1e9;
@@ -249,5 +256,473 @@ describe('fixtureDisk and fixtureStatusDone', () => {
     expect(status.durationMs).toBeGreaterThan(0);
     expect(status.hasPrevious).toBe(true);
     expect(status.previousTakenAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  });
+});
+
+/** An absolute path under the fixture root, for entries the fixture does not have. */
+const at = (relative: string) => `${FIXTURE_ROOT}/${relative}`;
+
+const preview = (paths: string[], root: string | null = FIXTURE_ROOT) =>
+  mockActionPreview(paths, 'trash', root);
+
+const run = (paths: string[], mode: Mode = 'trash', root: string | null = FIXTURE_ROOT) =>
+  mockActionRun(paths, mode, root);
+
+const blocked = (reason: BlockReason) => ({ state: 'blocked', reason });
+
+const statuses = (entries: PreviewEntry[]) => entries.map((entry) => entry.status);
+
+describe('mockActionPreview', () => {
+  it('reports a path of the tree as ready, with the kind and size the tree has', () => {
+    const xcode = fixtureNode('Downloads/Xcode_16.4.xip');
+    const result = preview([xcode.path]);
+    expect(result).toEqual({
+      entries: [{ path: xcode.path, kind: 'file', size: xcode.size, status: { state: 'ready' } }],
+      totalBytes: xcode.size,
+      mode: 'trash',
+    });
+    expect(result.totalBytes).toBe(14_810_000_000);
+  });
+
+  it('carries the mode it was asked about', () => {
+    expect(mockActionPreview([], 'permanent', FIXTURE_ROOT).mode).toBe('permanent');
+    expect(mockActionPreview([], 'trash', FIXTURE_ROOT)).toEqual({
+      entries: [],
+      totalBytes: 0,
+      mode: 'trash',
+    });
+  });
+
+  it('keeps a directory the scan could not read deletable', () => {
+    const trash = fixtureNode('.Trash');
+    expect(trash.error).toBe(PERMISSION_DENIED);
+    expect(preview([trash.path]).entries).toEqual([
+      { path: trash.path, kind: 'dir', size: 0, status: { state: 'ready' } },
+    ]);
+  });
+
+  it('blocks a path outside the scan root as outsideRoots', () => {
+    const result = preview(['/etc/hosts', '/Users/other/notes.txt', '/Volumes/Backup']);
+    expect(statuses(result.entries)).toEqual([
+      blocked('outsideRoots'),
+      blocked('outsideRoots'),
+      blocked('outsideRoots'),
+    ]);
+    expect(result.entries[0]).toEqual({
+      path: '/etc/hosts',
+      kind: 'other',
+      size: 0,
+      status: blocked('outsideRoots'),
+    });
+    expect(result.totalBytes).toBe(0);
+  });
+
+  it('blocks the scan root and every ancestor of it as isRoot', () => {
+    const root = fixtureNodes[0];
+    const result = preview([FIXTURE_ROOT, '/Users']);
+    expect(statuses(result.entries)).toEqual([blocked('isRoot'), blocked('isRoot')]);
+    // A blocked entry keeps the plan's claim about kind and size: nothing was re-read.
+    expect(result.entries[0]).toEqual({
+      path: FIXTURE_ROOT,
+      kind: 'dir',
+      size: root.size,
+      status: blocked('isRoot'),
+    });
+  });
+
+  it('blocks a path with no last component as malformed', () => {
+    const result = preview(['/', '', at('Movies/..'), at('..')]);
+    expect(statuses(result.entries)).toEqual([
+      blocked('malformed'),
+      blocked('malformed'),
+      blocked('malformed'),
+      blocked('malformed'),
+    ]);
+  });
+
+  it('blocks the Library folder of the scanned home, and everything under it', () => {
+    const library = fixtureNode('Library');
+    const derived = fixtureNode('Library/Developer/Xcode/DerivedData');
+    const result = preview([library.path, derived.path]);
+    expect(statuses(result.entries)).toEqual([blocked('denylisted'), blocked('denylisted')]);
+    expect(result.totalBytes).toBe(0);
+  });
+
+  it('blocks a path the tree does not have as missing, with the plan empty', () => {
+    const result = preview([at('nope'), 'Movies']);
+    expect(result.entries).toEqual([
+      { path: at('nope'), kind: 'other', size: 0, status: blocked('missing') },
+      // No working directory in the mock, so the parent of a relative path never resolves.
+      { path: 'Movies', kind: 'other', size: 0, status: blocked('missing') },
+    ]);
+  });
+
+  it('normalizes the path of an entry the guards let through, and only that one', () => {
+    const result = preview([at('Downloads/../nope'), at('Library/../Library')]);
+    expect(result.entries[0]).toEqual({
+      path: at('nope'),
+      kind: 'other',
+      size: 0,
+      status: blocked('missing'),
+    });
+    // Refused by the guards, so there is no normalized form to show: the path as asked for.
+    expect(result.entries[1]).toEqual({
+      path: at('Library/../Library'),
+      kind: 'other',
+      size: 0,
+      status: blocked('denylisted'),
+    });
+  });
+
+  it('resolves a spelling the tree does not know, keeping the size the plan could not find', () => {
+    const movies = fixtureNode('Movies');
+    expect(preview([at('Downloads/../Movies')]).entries).toEqual([
+      { path: movies.path, kind: 'dir', size: 0, status: { state: 'ready' } },
+    ]);
+  });
+
+  it('blocks an entry another one of the batch contains, whichever order they arrive in', () => {
+    const movies = fixtureNode('Movies');
+    const film = fixtureNode('Movies/family-2025.mov');
+    expect(statuses(preview([movies.path, film.path]).entries)).toEqual([
+      { state: 'ready' },
+      blocked('nested'),
+    ]);
+    expect(statuses(preview([film.path, movies.path]).entries)).toEqual([
+      blocked('nested'),
+      { state: 'ready' },
+    ]);
+    // Between two spellings of one entry the first survives.
+    expect(statuses(preview([movies.path, at('Documents/../Movies')]).entries)).toEqual([
+      { state: 'ready' },
+      blocked('nested'),
+    ]);
+  });
+
+  it('compares paths component by component, not as strings', () => {
+    // `/Users/demo2` is not inside `/Users/demo`, and `/Users/dem` is not an ancestor of it;
+    // both are string prefixes, and the same comparison decides the nesting pass.
+    expect(statuses(preview(['/Users/demo2/Movies', '/Users/dem']).entries)).toEqual([
+      blocked('outsideRoots'),
+      blocked('outsideRoots'),
+    ]);
+  });
+
+  it('keeps the denylist under a scan root of the whole volume', () => {
+    // `/` is dropped from the denylist as the ancestor of everything — without that every
+    // entry of every batch would be refused — and `/Users` then protects the fixture.
+    expect(statuses(preview([fixtureNode('Movies').path, '/System/Library'], '/').entries)).toEqual(
+      [blocked('denylisted'), blocked('denylisted')],
+    );
+  });
+
+  it('totals the ready entries only', () => {
+    const movies = fixtureNode('Movies');
+    const film = fixtureNode('Movies/family-2025.mov');
+    const library = fixtureNode('Library');
+    const thesis = fixtureNode('Documents/thesis.docx');
+    const result = preview([movies.path, film.path, library.path, thesis.path]);
+    expect(result.totalBytes).toBe(movies.size + thesis.size);
+    expect(result.entries).toHaveLength(4);
+  });
+
+  it('refuses every entry as outsideRoots when nothing has been scanned', () => {
+    const movies = fixtureNode('Movies');
+    const result = preview([movies.path, at('nope')], null);
+    expect(result).toEqual({
+      entries: [
+        { path: movies.path, kind: 'dir', size: movies.size, status: blocked('outsideRoots') },
+        { path: at('nope'), kind: 'other', size: 0, status: blocked('outsideRoots') },
+      ],
+      totalBytes: 0,
+      mode: 'trash',
+    });
+  });
+
+  it('blocks the fixture against a scan root of its own elsewhere', () => {
+    expect(statuses(preview([fixtureNode('Movies').path], '/Volumes/Backup').entries)).toEqual([
+      blocked('outsideRoots'),
+    ]);
+  });
+
+  it('touches nothing: two previews of one path agree', () => {
+    const film = fixtureNode('Movies/family-2025.mov');
+    expect(preview([film.path])).toEqual(preview([film.path]));
+    expect(mockActionLog).toEqual([]);
+  });
+});
+
+describe('mockActionRun', () => {
+  it('removes a file, shrinks every ancestor and leaves the siblings alone', () => {
+    const root = fixtureNodes[0];
+    const movies = fixtureNode('Movies');
+    const film = fixtureNode('Movies/family-2025.mov');
+    const [rootSize, rootFiles, moviesSize, moviesFiles] = [
+      root.size,
+      root.fileCount,
+      movies.size,
+      movies.fileCount,
+    ];
+    const result = run([film.path]);
+    expect(result).toEqual({
+      outcome: {
+        entries: [
+          { path: film.path, kind: 'file', result: { result: 'removed', bytes: film.size } },
+        ],
+        freedBytes: film.size,
+        at: expect.any(String),
+        mode: 'trash',
+      },
+      recorded: true,
+      treeStale: false,
+    });
+    expect(movies.size).toBe(moviesSize - film.size);
+    expect(movies.fileCount).toBe(moviesFiles - 1);
+    expect(root.size).toBe(rootSize - film.size);
+    expect(root.fileCount).toBe(rootFiles - 1);
+    expect(() => fixtureNode('Movies/family-2025.mov')).toThrow(
+      'unknown fixture path /Users/demo/Movies/family-2025.mov',
+    );
+    expect(fixtureNodeView(movies.id).children.map((child) => child.name)).toEqual([
+      'screen-recording.mp4',
+    ]);
+    expect(fixtureNodeView(movies.id).childrenTotal).toBe(1);
+    expect(() => fixtureNodeView(film.id)).toThrow(`unknown node ${film.id}`);
+  });
+
+  it('takes the whole subtree with a directory', () => {
+    const documents = fixtureNode('Documents');
+    const design = fixtureNode('Documents/Design');
+    const psd = fixtureNode('Documents/Design/hero-assets.psd');
+    const thesis = fixtureNode('Documents/thesis.docx');
+    expect(run([design.path]).outcome.freedBytes).toBe(design.size);
+    expect(() => fixtureNode('Documents/Design/hero-assets.psd')).toThrow('unknown fixture path');
+    expect(() => fixtureNodeView(psd.id)).toThrow(`unknown node ${psd.id}`);
+    expect(documents.children).toEqual([thesis.id]);
+    expect(documents.size).toBe(thesis.size);
+    expect(documents.logicalSize).toBe(thesis.logicalSize);
+    expect(documents.fileCount).toBe(1);
+  });
+
+  it('skips every blocked entry with the reason the preview gave, and keeps it in place', () => {
+    const library = fixtureNode('Library');
+    const librarySize = library.size;
+    const report = fixtureNode('Downloads/q3-report.pdf');
+    const result = run([library.path, at('nope'), report.path, FIXTURE_ROOT]);
+    expect(result.outcome.entries).toEqual([
+      { path: library.path, kind: 'dir', result: { result: 'skipped', reason: 'denylisted' } },
+      { path: at('nope'), kind: 'other', result: { result: 'skipped', reason: 'missing' } },
+      { path: report.path, kind: 'file', result: { result: 'removed', bytes: report.size } },
+      { path: FIXTURE_ROOT, kind: 'dir', result: { result: 'skipped', reason: 'isRoot' } },
+    ]);
+    expect(result.outcome.freedBytes).toBe(report.size);
+    expect(library.size).toBe(librarySize);
+    expect(fixtureNode('Library').children.length).toBeGreaterThan(0);
+  });
+
+  it('deletes what is ready in a batch that also nests', () => {
+    const movies = fixtureNode('Movies');
+    const film = fixtureNode('Movies/family-2025.mov');
+    const result = run([movies.path, film.path]);
+    expect(result.outcome.entries.map((entry) => entry.result)).toEqual([
+      { result: 'removed', bytes: movies.size },
+      { result: 'skipped', reason: 'nested' },
+    ]);
+    expect(result.outcome.freedBytes).toBe(movies.size);
+    expect(() => fixtureNode('Movies')).toThrow('unknown fixture path');
+    expect(fixtureNodes[0].children).not.toContain(movies.id);
+  });
+
+  it('runs a permanent batch the same way, and says so', () => {
+    const zshrc = fixtureNode('.zshrc');
+    const result = run([zshrc.path], 'permanent');
+    expect(result.outcome.mode).toBe('permanent');
+    expect(mockActivityTail(10).entries[0].mode).toBe('permanent');
+  });
+
+  it('leaves the growers of the finished scan where they are', () => {
+    const target = fixtureNode('src/storage-monitor/target');
+    const before = fixtureGrowers();
+    expect(before.map((grower) => grower.path)).toContain(target.path);
+    run([target.path]);
+    // A splice does not recompute them, and a deleted path must not throw on the way out.
+    expect(fixtureGrowers()).toEqual(before);
+  });
+
+  it('does nothing at all for an empty batch', () => {
+    const before = fixtureNodes[0].size;
+    expect(run([])).toEqual({
+      outcome: { entries: [], freedBytes: 0, at: expect.any(String), mode: 'trash' },
+      recorded: true,
+      treeStale: false,
+    });
+    expect(mockActionLog).toEqual([]);
+    expect(fixtureNodes[0].size).toBe(before);
+  });
+
+  it('refuses everything and deletes nothing when nothing has been scanned', () => {
+    const movies = fixtureNode('Movies');
+    const before = fixtureNodes[0].size;
+    const result = run([movies.path], 'trash', null);
+    expect(result.outcome.entries).toEqual([
+      { path: movies.path, kind: 'dir', result: { result: 'skipped', reason: 'outsideRoots' } },
+    ]);
+    expect(result.outcome.freedBytes).toBe(0);
+    expect(fixtureNodes[0].size).toBe(before);
+    expect(fixtureNode('Movies')).toBe(movies);
+  });
+});
+
+describe('mockActivityTail', () => {
+  it('is empty before anything is deleted', () => {
+    expect(mockActivityTail(10)).toEqual({ entries: [], damaged: 0 });
+  });
+
+  it('records one line per entry of the batch, the last of them first', () => {
+    const report = fixtureNode('Downloads/q3-report.pdf');
+    const thesis = fixtureNode('Documents/thesis.docx');
+    const [reportSize, thesisSize] = [report.size, thesis.size];
+    const { outcome } = run([report.path, thesis.path, at('nope')]);
+    const tail = mockActivityTail(10);
+    expect(tail.damaged).toBe(0);
+    expect(mockActionLog).toHaveLength(3);
+    expect(tail.entries).toEqual([
+      {
+        at: expect.any(String),
+        path: at('nope'),
+        kind: 'other',
+        mode: 'trash',
+        result: 'skipped',
+        detail: 'missing',
+        bytes: 0,
+      },
+      {
+        at: expect.any(String),
+        path: thesis.path,
+        kind: 'file',
+        mode: 'trash',
+        result: 'removed',
+        detail: null,
+        bytes: thesisSize,
+      },
+      {
+        at: expect.any(String),
+        path: report.path,
+        kind: 'file',
+        mode: 'trash',
+        result: 'removed',
+        detail: null,
+        bytes: reportSize,
+      },
+    ]);
+    // One instant for the whole batch — the outcome's own — in the form the backend writes.
+    expect(tail.entries.map((entry) => entry.at)).toEqual([outcome.at, outcome.at, outcome.at]);
+    expect(outcome.at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
+    expect(Number.isNaN(Date.parse(outcome.at))).toBe(false);
+  });
+
+  it('grows by one entry per entry of every batch, newest batch first', () => {
+    run([fixtureNode('Downloads/q3-report.pdf').path]);
+    run([fixtureNode('Documents/thesis.docx').path, at('nope')]);
+    expect(mockActionLog).toHaveLength(3);
+    expect(mockActivityTail(10).entries.map((entry) => entry.path)).toEqual([
+      at('nope'),
+      `${FIXTURE_ROOT}/Documents/thesis.docx`,
+      `${FIXTURE_ROOT}/Downloads/q3-report.pdf`,
+    ]);
+  });
+
+  it('honours the limit from the end of the log', () => {
+    run([at('a'), at('b'), at('c')]);
+    expect(mockActivityTail(2).entries.map((entry) => entry.path)).toEqual([at('c'), at('b')]);
+    expect(mockActivityTail(0)).toEqual({ entries: [], damaged: 0 });
+    expect(mockActivityTail(99).entries).toHaveLength(3);
+  });
+
+  it('counts a damaged line as far back as the read goes, without giving it a slot', () => {
+    run([at('a'), at('b'), at('c')]);
+    mockActionLog.splice(1, 0, '{ truncated');
+    expect(mockActivityTail(10)).toEqual({
+      entries: expect.arrayContaining([expect.objectContaining({ path: at('a') })]),
+      damaged: 1,
+    });
+    expect(mockActivityTail(10).entries).toHaveLength(3);
+    // The read stopped at the third entry, before it ever reached the torn line.
+    expect(mockActivityTail(2)).toEqual({
+      entries: [
+        expect.objectContaining({ path: at('c') }),
+        expect.objectContaining({ path: at('b') }),
+      ],
+      damaged: 0,
+    });
+  });
+
+  it('counts a line that is JSON but not an entry, and skips a blank one', () => {
+    const entry = {
+      at: '2026-09-18T09:30:00Z',
+      path: at('a'),
+      kind: 'file',
+      mode: 'trash',
+      result: 'removed',
+      detail: null,
+      bytes: 12,
+    };
+    const withoutPath: Record<string, unknown> = { ...entry };
+    delete withoutPath.path;
+    // Every line below is that entry with a single field spoiled: a reader that stopped
+    // checking any one of them would take that line for an entry of the user's history.
+    const spoiled = [
+      { ...entry, at: 12 },
+      withoutPath,
+      { ...entry, kind: 'folder' },
+      { ...entry, mode: 'bin' },
+      { ...entry, result: 'deleted' },
+      { ...entry, detail: 7 },
+      { ...entry, bytes: '12' },
+    ];
+    mockActionLog.push(
+      JSON.stringify(entry),
+      '',
+      '   ',
+      '[]',
+      '7',
+      // Valid JSON with no fields to read at all: a reader that goes looking for them
+      // without checking throws instead of counting the line.
+      'null',
+      '{ truncated',
+      ...spoiled.map((line) => JSON.stringify(line)),
+    );
+    const tail = mockActivityTail(20);
+    expect(tail.entries).toEqual([entry]);
+    expect(tail.damaged).toBe(4 + spoiled.length);
+  });
+});
+
+describe('resetMockActions', () => {
+  const snapshot = () => fixtureNodes.map((node) => ({ ...node, children: [...node.children] }));
+
+  it('restores every node of the tree and clears the log', () => {
+    const before = snapshot();
+    const status = fixtureStatusDone();
+    run([fixtureNode('Movies').path, fixtureNode('Downloads').path, at('nope')]);
+    expect(snapshot()).not.toEqual(before);
+    expect(mockActionLog.length).toBeGreaterThan(0);
+
+    resetMockActions();
+
+    expect(snapshot()).toEqual(before);
+    expect(mockActionLog).toEqual([]);
+    expect(mockActivityTail(10)).toEqual({ entries: [], damaged: 0 });
+    expect(fixtureStatusDone()).toEqual(status);
+    expect(fixtureNodeView(fixtureNode('Movies').id).children).toHaveLength(2);
+    expect(fixtureNode('Movies/family-2025.mov').path).toBe(
+      `${FIXTURE_ROOT}/Movies/family-2025.mov`,
+    );
+  });
+
+  it('is what the previous test left behind: the tree is whole again', () => {
+    expect(fixtureNode('Movies').children).toHaveLength(2);
+    expect(fixtureNodes[0].size).toBeGreaterThan(170 * GB);
+    expect(mockActivityTail(10).entries).toEqual([]);
   });
 });
