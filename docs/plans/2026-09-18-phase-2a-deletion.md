@@ -1083,6 +1083,13 @@ pub fn replace_subtrees(tree: &Tree, patches: Vec<(NodeId, Option<Tree>)>) -> Tr
 
 Note for the implementer: a node's `size` is the subtree total, and the walker adds the directory's own allocated blocks to it. When recomputing an ancestor, start from `own_size = old_size - sum(old children sizes)` so the directory's own blocks survive the patch. Compute `own_size` from the *old* tree before rebuilding.
 
+Four things Task 6 established about the input, all pinned by its tests:
+
+- **The names differ on purpose.** A patch root carries the absolute path; the node it replaces carries the file name. Step 2's "keep the old node's name" depends on exactly that, and `crates/core/tests/walker.rs` asserts both sides.
+- **Sibling order already matches a scan's**, so a group that did not change needs no re-sorting.
+- **Verify a splice at least as strictly as Task 6 verified its input.** `assert_same_subtree` and `subtree_size` in `crates/core/tests/walker.rs` compare kind, sizes, `file_count`, mtime, child names, child counts and the error side table, recursively. Promote them or copy them — do not check a splice with weaker assertions than the thing being spliced.
+- **The hard-link limitation test is a tripwire, not a bug report.** If `replace_subtrees` ever re-aggregates hard links, `rescan_re_attributes_hard_links_inside_the_branch` fails. That failure means a design decision is being re-opened, not that the test needs updating.
+
 **Step 4: Run the tests**
 
 Run: `cargo test -p storage-monitor-core scan::tree`
