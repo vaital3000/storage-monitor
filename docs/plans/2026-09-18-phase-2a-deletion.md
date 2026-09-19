@@ -1430,9 +1430,9 @@ git commit -m "feat(desktop): select rows in the node table"
 
 **Step 1: Write the failing tests**
 
-The dialog lists every preview entry with its formatted size; blocked entries are shown with their reason and are visually muted; the total counts only the ready entries; the Trash option explains that space is freed when the Trash is emptied; choosing Permanent disables the confirm button until the "I understand" checkbox is ticked, and switching back to Trash re-enables it and clears the checkbox; Escape calls `onCancel`; focus lands on Cancel when the dialog opens; the confirm button reports the mode it was confirmed with; while the batch runs the buttons are disabled and a busy label is shown; when an outcome arrives the dialog switches to the result view, listing failures with their messages, and — because a batch can succeed at deleting and still fail to tell anyone — saying so when `recorded` is false ("deleted, but not recorded") and when `treeStale` is true ("the Explorer may be stale until the next scan"). Neither is an error in the deletion; both are the app admitting the record or the view no longer matches the disk.
+The dialog lists every preview entry with its formatted size; blocked entries are shown with their reason and are visually muted; the total counts only the ready entries; the Trash option explains that space is freed when the Trash is emptied; choosing Permanent disables the confirm button until the "I understand" checkbox is ticked, and switching back to Trash re-enables it and clears the checkbox; Escape calls `onClose` except while the batch runs, when it does nothing; focus lands on Cancel when the dialog opens; the confirm button reports the mode it was confirmed with; the dialog opens in `initialMode` (Trash by default) and never in the mode the preview was computed with; while the batch runs the buttons are disabled and a busy label is shown; when an outcome arrives the dialog switches to the result view, listing failures with their messages **and skipped entries with their reasons** — the run-time skipped set is not the preview's blocked set, because `missing` and `kindChanged` are decided while the batch runs, so a view that lists only failures says "Moved 2 items" while a third is still on disk — and — because a batch can succeed at deleting and still fail to tell anyone — saying so when `recorded` is false ("deleted, but not recorded") and when `treeStale` is true ("the Explorer may be stale until the next scan"). Neither is an error in the deletion; both are the app admitting the record or the view no longer matches the disk.
 
-Use `@testing-library/user-event` for the keyboard assertions — it is already a dependency through `@testing-library/dom`. If it is not, add `@testing-library/user-event` to `devDependencies`.
+Use `fireEvent` for the keyboard assertions, as `NodeTable.test.tsx` does. (An earlier draft said `@testing-library/user-event` ships with `@testing-library/dom`; the dependency runs the other way and the package is in neither `package.json` nor `pnpm-lock.yaml`. The only keyboard behaviour that belongs to this component is the trap's boundary handler — `preventDefault` plus an explicit `focus()` — and `fireEvent` drives that exactly. Know the cost: `fireEvent` moves no focus, so a test can pin the boundary but not that Tab walks the tab order, and a radio group's single tab stop is invisible to the suite.)
 
 **Step 2: Run to verify failure**
 
@@ -1440,13 +1440,25 @@ Run: `pnpm --filter @storage-monitor/desktop test src/components/ConfirmDeleteDi
 
 **Step 3: Implement**
 
-A controlled component: `{ preview, outcome, busy, onConfirm(mode), onCancel }`. Markup: a fixed overlay, a panel with `role="dialog"`, `aria-modal="true"` and `aria-labelledby`. Trap focus by cycling Tab between the first and last focusable element; return focus to the trigger on close (the caller passes nothing — use `document.activeElement` captured on mount).
+A controlled component: `{ preview: Omit<Preview, 'mode'>, status, initialMode?, onConfirm(mode), onClose }`, where
+
+```ts
+type BatchStatus =
+  | { phase: 'asking' }
+  | { phase: 'running' }
+  | { phase: 'done'; result: BatchResult }
+  | { phase: 'failed'; message: string };
+```
+
+An earlier draft said `{ preview, outcome, busy, onConfirm, onCancel }`. That shape cannot work: `recorded` and `treeStale` live on `BatchResult`, outside `Outcome`, so the result view could not reach the two things it exists to admit; a rejected `action_run` had no arm at all; and flat props admit `busy && outcome`. The union makes those unrepresentable. `Omit<Preview, 'mode'>` is deliberate too — it turns reading `preview.mode` into a compile error, so the dialog cannot render "Items move to the Trash" over a button armed to delete permanently, which is the worst failure this component has. `onClose` is one callback in all phases and says nothing about whether a batch ran; the caller knows that from its own state.
+
+Markup: a fixed overlay, a panel with `role="dialog"`, `aria-modal="true"` and `aria-labelledby`. Trap focus by cycling Tab between the first and last focusable element; return focus to the trigger on close (the caller passes nothing — use `document.activeElement` captured on mount). Three things the trap gets wrong if written the obvious way: the focusable list must be read per key press, not once at mount, because the acknowledgement checkbox appears and disappears and buttons become disabled; a disabled element is not focusable and must not be a boundary; and a radio group has exactly one tab stop, the checked radio, so an unchecked one must not be `focusable[0]`. Put the key listener on the document rather than the panel — a click on the overlay blurs to `<body>`, and a panel listener then stops hearing Escape at all.
 
 Wording, in English as everywhere in the UI:
 
 - Trash: "Items move to the Trash. Space is freed when you empty it."
 - Permanent: "Items are deleted immediately. This cannot be undone."
-- Result view: "Moved 12 items to the Trash · 4.3 GB" or "Deleted 12 items · 4.3 GB", plus "Show in Trash" for the Trash mode — never "Put Back", which macOS may not offer (design section 11). That button opens the Trash folder, not a single entry: `move_to_trash` returns nothing and the crate behind it gives no post-move URL on macOS, so an `Outcome` has nowhere to carry one. Do not wire up a per-item reveal.
+- Result view: "Moved 12 items to the Trash · 4.3 GB" or "Deleted 12 items · 4.3 GB" — counting the `removed` entries only, never `entries.length`, which overstates what left the disk in the same sentence that reports bytes. Never "Put Back", which macOS may not offer, and **no "Show in Trash" button**: an earlier draft promised one, and design section 11 now records why phase 2a ships without it. `move_to_trash` returns no post-move URL, so there is no path to reveal; opening the Trash folder needs `opener:allow-open-path`, a real privilege grant. Do not wire up a per-item reveal either.
 
 **Step 4: Run the tests and commit**
 
@@ -1466,7 +1478,7 @@ git commit -m "feat(desktop): add the deletion confirmation dialog"
 
 **Step 1: Write the failing tests**
 
-Selecting two rows shows the action bar with the count and the summed size; "Move to Trash" opens the dialog with a preview of exactly those paths; confirming removes the rows from the table and clears the selection; the ancestors' sizes in the breadcrumbs shrink; cancelling leaves everything alone; a batch where one entry is blocked still deletes the other and the result view names the blocked one; switching directories clears the selection; a rescan (new generation) clears the selection.
+Selecting two rows shows the action bar with the count and the summed size; "Move to Trash" opens the dialog with a preview of exactly those paths; "Delete permanently" opens the same dialog already in Permanent mode, with its confirm button still disabled until the acknowledgement; confirming removes the rows from the table and clears the selection; the ancestors' sizes in the breadcrumbs shrink; cancelling leaves everything alone; a batch where one entry is blocked still deletes the other and the result view names the blocked one; switching directories clears the selection; a rescan (new generation) clears the selection.
 
 **Step 2: Run to verify failure**
 
@@ -1486,7 +1498,11 @@ After a successful run, invalidate the tree queries of the current generation an
 
 **That invalidation is not optional, and nothing upstream does it for you.** The generation the backend bumps after a splice is `Inner.generation`, which never crosses the wire — `ScanStatus` has no field for it, and `useScan().generation` is a front-end counter bumped by `scan:done`. Its only job is to stop one patch being spliced onto an arena another patch already replaced. So when `actionRun` resolves, every `['treeNode', generation, id]` entry in the cache still holds `NodeId`s from the arena the splice threw away: the Explorer goes on rendering a tree that no longer exists, which is the symptom this whole phase is built to avoid, arriving through the cache instead of through the splice.
 
-**Do not let a second batch start while one is running.** Two overlapping `action_run` calls end with the second patch dropped by the generation check, so that batch's rows stay in the tree until the next scan. Nothing is lost or mis-spliced — it is the documented behaviour of `patch_paths` step 3 — but the dialog can rule it out entirely by staying busy until its outcome arrives.
+**Do not let a second batch start while one is running.** Two overlapping `action_run` calls end with the second patch dropped by the generation check, so that batch's rows stay in the tree until the next scan. Nothing is lost or mis-spliced — it is the documented behaviour of `patch_paths` step 3 — but it is avoidable, and **this page is what avoids it**. An earlier draft said the dialog rules it out "by staying busy until its outcome arrives"; it cannot. The dialog is controlled: it renders whatever `status` it is handed, so the guard is the page's mutation state, not the component's.
+
+**The preview is this page's to wait for and to fail.** `ConfirmDeleteDialog` takes a resolved `preview` as a required prop and renders no pending state, so the click on "Move to Trash" and the dialog appearing are separated by a round trip the user gets no feedback about. `action_preview` returns a `Result`, so it can reject, and that rejection has no home in `BatchStatus` — `failed` there means the batch failed, which is a different and much more alarming sentence. Surface both here: something between the click and the dialog, and an error path for a preview that never arrives.
+
+**The action bar has two entry points, and both must land honestly.** "Move to Trash" and "Delete permanently" (danger style) open the same dialog with `initialMode` set accordingly. The safety gate does not move: Permanent still needs the "I understand" tick before its confirm button enables, so the danger button opens a dialog that is armed for nothing yet. Passing no `initialMode` gives Trash, which is the default the rest of the app assumes.
 
 **Step 4: Run the tests and commit**
 

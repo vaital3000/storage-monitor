@@ -273,7 +273,13 @@ A non-empty selection reveals an action bar above the table: "12 selected ·
 
 The confirmation dialog is our own component (Radix is not a dependency):
 `role="dialog"`, `aria-modal`, a focus trap, Escape closes, and the initial
-focus is on Cancel rather than on the confirming button. It lists the entries
+focus is on Cancel rather than on the confirming button. Escape has one
+exception: while the batch is running it does nothing, because it carries the
+same intent as Cancel — which is disabled then — and because closing mid-flight
+would throw away the only report of `recorded: false` or `treeStale: true`,
+which nothing else will tell the user. The dialog opens in the mode its entry
+point asks for, Trash by default, so the action bar's two buttons both land
+somewhere honest. It lists the entries
 with their sizes, greys out blocked ones with the reason, totals the bytes, and
 carries the mode switch. Trash mode says space is freed only when the Trash is
 emptied; Permanent mode says the deletion cannot be undone and keeps its button
@@ -333,8 +339,21 @@ failing. It also plays the Finder sound and is slow for a batch.
 `NsFileManager` needs no extra permission, is fast and silent, and survives
 rebuilds. Its documented cost is that "Put Back" may be missing on some
 systems — a macOS bug the crate links to. Files still land in the Trash and can
-be restored by dragging them out, so the UI offers "Show in Trash" and never
-promises "Put Back".
+be restored by dragging them out, so the UI never promises "Put Back".
+
+**Phase 2a ships no "Show in Trash" button, deliberately.** An earlier draft of
+this section promised one; Task 13 found there is nothing to build it from.
+`move_to_trash` returns no post-move URL, so an `Outcome` cannot carry where an
+entry landed, and guessing `~/.Trash/<basename>` is wrong the moment macOS
+deduplicates a name — a wrong path in the one dialog whose job is to say
+exactly what left the disk. Revealing the folder itself does not substitute:
+`~/.Trash` is hidden, and `revealItemInDir` would select it inside the home
+window rather than open it. Opening it needs `opener:allow-open-path`, which is
+a real privilege grant — on macOS `open_path` reaches `open`, which launches
+applications — and that is not something to add in passing for one convenience
+button on a branch that just closed the Content Security Policy. The Trash is a
+click away in Finder. Revisit it with an ADR if a reason appears; do not wire it
+up because the permission looked like the missing piece.
 
 The crate is preferred over calling objc2 directly because it already handles
 non-UTF-8 paths (percent-encoding), maps the Cocoa error, and — unlike a
