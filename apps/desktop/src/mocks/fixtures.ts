@@ -521,12 +521,16 @@ export type HeldScan =
 /**
  * `Tree::find`: the node the scan recorded, under the spelling the caller sent.
  *
- * Two rules of it are visible from here. The tree describes its own root, so a path outside
- * that root is not in it whatever else exists — `find` strips the root's path first. And
- * `Path::components` treats `.` and `//` as noise while a `..` is a component of its own
- * that matches no child, so `a/b/.` names the same node as `a/b` and `a/x/../b` names none.
+ * Four of its rules are visible from here. It strips the root's own path first, and strips
+ * it from an **absolute** base — so a relative path finds nothing at all, and a path outside
+ * the root finds nothing whatever else exists. Then `Path::components` treats `.` and `//`
+ * as noise, while a `..` is a component of its own that matches no child: `a/b/.` names the
+ * same node as `a/b`, and `a/x/../b` names none.
  */
 function treeFind(path: string, root: string): FixtureNode | undefined {
+  if (!path.startsWith('/')) {
+    return undefined;
+  }
   const spelled = `/${componentsOf(path).join('/')}`;
   return isAtOrUnder(spelled, root) ? byPath.get(spelled) : undefined;
 }
@@ -682,6 +686,47 @@ const oneOf = (field: unknown, names: readonly string[]) =>
   typeof field === 'string' && names.includes(field);
 
 /**
+ * `chrono`'s grammar for a `DateTime<Utc>`, which is not the platform's.
+ *
+ * It takes `T`, `t` or a space between the date and the time, needs `Z`, `z` or an offset —
+ * never nothing — and allows any number of fractional digits, a leap second and surrounding
+ * space. It refuses a bare date, a time without seconds, and a day the month does not have.
+ *
+ * `Date.parse` is no substitute, in **both** directions: it reads `2026-09-18` and a stamp
+ * with no offset at all, and refuses the leap second and the trailing space that `chrono`
+ * reads. Both grammars were measured against the real `LogEntry`, and this one agrees with
+ * it on every string that was tried.
+ *
+ * It matters because the plan sends the next task to hand-write log lines. A line whose `Z`
+ * was forgotten has to be damaged here too — otherwise it renders in the mock and vanishes
+ * in the app, which is the worst possible way to find out about the difference.
+ */
+const TIMESTAMP =
+  /^\s*(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|[+-](\d{2}):?(\d{2}))\s*$/;
+
+function isTimestamp(value: string): boolean {
+  const parts = TIMESTAMP.exec(value);
+  if (parts === null) {
+    return false;
+  }
+  const [year, month, day, hour, minute, second, offsetHour, offsetMinute] = parts
+    .slice(1)
+    .map((part) => (part === undefined ? 0 : Number(part)));
+  // A leap second is a second; a day the month does not have is not a day, and rolling it
+  // through `Date.UTC` is what says so — arithmetic, not another parser's grammar.
+  const rolled = new Date(Date.UTC(year, month - 1, day));
+  return (
+    rolled.getUTCMonth() === month - 1 &&
+    rolled.getUTCDate() === day &&
+    hour < 24 &&
+    minute < 60 &&
+    second < 61 &&
+    offsetHour < 24 &&
+    offsetMinute < 60
+  );
+}
+
+/**
  * One line of the log, or `null` when it is not an entry — as far as possible the line serde
  * refuses, measured against the real `LogEntry` rather than guessed:
  *
@@ -689,8 +734,9 @@ const oneOf = (field: unknown, names: readonly string[]) =>
  *   but `Option<String>` is one serde fills in, and a line written by hand for a test — the
  *   natural way to get a `failed` row on screen — does not have to carry it;
  * - an unknown field is ignored, so a line from a later version still reads;
- * - `at` has to be a timestamp, not any string; `bytes` a whole number that is not negative,
- *   because the field is a `u64` and serde takes neither `-1` nor `1.5`.
+ * - `at` has to be a timestamp in `chrono`'s grammar (see [`isTimestamp`], which is where
+ *   that grammar is written down); `bytes` a whole number that is not negative, because the
+ *   field is a `u64` and serde takes neither `-1` nor `1.5`.
  */
 function parseLogLine(line: string): ActivityEntry | null {
   let value: unknown;
@@ -706,7 +752,7 @@ function parseLogLine(line: string): ActivityEntry | null {
   const detail = entry.detail ?? null;
   const complete =
     typeof entry.at === 'string' &&
-    !Number.isNaN(Date.parse(entry.at)) &&
+    isTimestamp(entry.at) &&
     typeof entry.path === 'string' &&
     oneOf(entry.kind, KINDS) &&
     oneOf(entry.mode, MODES) &&

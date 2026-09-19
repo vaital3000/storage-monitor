@@ -356,11 +356,15 @@ describe('mockActionPreview', () => {
   });
 
   it('blocks a path the tree does not have as missing, with the plan empty', () => {
-    const result = preview([at('nope'), 'Movies']);
+    const result = preview([at('nope'), 'Movies', 'Users/demo/Movies']);
     expect(result.entries).toEqual([
       { path: at('nope'), kind: 'other', size: 0, status: blocked('missing') },
       // No working directory in the mock, so the parent of a relative path never resolves.
       { path: 'Movies', kind: 'other', size: 0, status: blocked('missing') },
+      // And the tree behind the plan cannot be asked about it either: `Tree::find` strips
+      // the root from an absolute base, so a relative path never gets as far as a lookup —
+      // however much this one looks like a row of the fixture with the slash taken off.
+      { path: 'Users/demo/Movies', kind: 'other', size: 0, status: blocked('missing') },
     ]);
   });
 
@@ -732,6 +736,13 @@ describe('mockActivityTail', () => {
       { ...entry, detail: 7 },
       { ...entry, bytes: '12' },
       { ...entry, at: 'not a date' },
+      // `chrono` needs an offset, and a time with its seconds; `Date.parse` takes all three.
+      { ...entry, at: '2026-09-18T09:30:00' },
+      { ...entry, at: '2026-09-18 09:30:00' },
+      { ...entry, at: '2026-09-18' },
+      { ...entry, at: '2026-09-18T09:30Z' },
+      { ...entry, at: '2026-09-31T09:30:00Z' },
+      { ...entry, at: '2026-13-18T09:30:00Z' },
       { ...entry, bytes: -1 },
       { ...entry, bytes: 1.5 },
     ];
@@ -750,6 +761,41 @@ describe('mockActivityTail', () => {
     const tail = mockActivityTail(20);
     expect(tail.entries).toEqual([entry]);
     expect(tail.damaged).toBe(4 + spoiled.length);
+  });
+
+  it('reads every timestamp chrono reads, and only those', () => {
+    // Measured against the real `LogEntry`: a space for the `T`, a lower-case `z`, an offset
+    // with or without its colon, any number of fractional digits, a leap second and a
+    // trailing space are all lines the app reads — two of which `Date.parse` refuses.
+    const stamps = [
+      '2026-09-18T09:30:00Z',
+      '2026-09-18 09:30:00Z',
+      '2026-09-18t09:30:00z',
+      '2026-09-18T09:30:00+02:00',
+      '2026-09-18T09:30:00-07:00',
+      '2026-09-18T09:30:00+0200',
+      '2026-09-18T09:30:00.123Z',
+      '2026-09-18T09:30:00.123456789Z',
+      '2026-09-18T09:30:00Z ',
+      '2026-09-18T09:30:60Z',
+      '2028-02-29T00:00:00Z',
+    ];
+    for (const stamp of stamps) {
+      mockActionLog.push(
+        JSON.stringify({
+          at: stamp,
+          path: at('a'),
+          kind: 'file',
+          mode: 'trash',
+          result: 'removed',
+          detail: null,
+          bytes: 1,
+        }),
+      );
+    }
+    const tail = mockActivityTail(stamps.length);
+    expect(tail.damaged).toBe(0);
+    expect(tail.entries.map((line) => line.at)).toEqual([...stamps].reverse());
   });
 
   it('reads the lines serde reads: no detail is null, and an unknown field is ignored', () => {
