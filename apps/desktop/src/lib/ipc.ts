@@ -16,7 +16,14 @@ export interface AppInfo {
 
 export type NodeId = number;
 
-export type NodeKind = 'dir' | 'file' | 'symlink' | 'other';
+/**
+ * Every kind the walker classifies, as the values first and the type from them: a variant
+ * added to `NodeKind` in Rust and mirrored here then reaches the code that has to enumerate
+ * them — the mock's log reader, an icon map — instead of leaving it silently behind.
+ */
+export const NODE_KINDS = ['dir', 'file', 'symlink', 'other'] as const;
+
+export type NodeKind = (typeof NODE_KINDS)[number];
 
 export type ScanState = 'idle' | 'running' | 'done' | 'cancelled' | 'failed';
 
@@ -97,23 +104,28 @@ export interface Delta {
   delta: number;
 }
 
-/** How an entry leaves the disk. */
-export type Mode = 'trash' | 'permanent';
+/** How an entry leaves the disk. `Mode` in Rust, where it lives under `action::`. */
+export const DELETION_MODES = ['trash', 'permanent'] as const;
+
+export type DeletionMode = (typeof DELETION_MODES)[number];
 
 /**
  * Why an entry will not be deleted, mirroring `BlockReason`. All eight of them: the guards
  * tell `missing` from `unreadable` (grant Full Disk Access, do not go hunting for a ghost)
  * and `malformed` from both, so a screen that folds them together says the wrong thing.
  */
-export type BlockReason =
-  | 'outsideRoots'
-  | 'denylisted'
-  | 'malformed'
-  | 'isRoot'
-  | 'nested'
-  | 'missing'
-  | 'unreadable'
-  | 'kindChanged';
+export const BLOCK_REASONS = [
+  'outsideRoots',
+  'denylisted',
+  'malformed',
+  'isRoot',
+  'nested',
+  'missing',
+  'unreadable',
+  'kindChanged',
+] as const;
+
+export type BlockReason = (typeof BLOCK_REASONS)[number];
 
 /** The verdict of the guards on one entry. */
 export type EntryStatus = { state: 'ready' } | { state: 'blocked'; reason: BlockReason };
@@ -137,7 +149,7 @@ export interface Preview {
   entries: PreviewEntry[];
   /** Sum of `size` over the ready entries only. */
   totalBytes: number;
-  mode: Mode;
+  mode: DeletionMode;
 }
 
 /** What became of one entry. */
@@ -160,7 +172,7 @@ export interface Outcome {
   freedBytes: number;
   /** RFC 3339 timestamp of the batch, shared by every entry of it. */
   at: string;
-  mode: Mode;
+  mode: DeletionMode;
 }
 
 /**
@@ -178,7 +190,9 @@ export interface BatchResult {
 }
 
 /** What became of one entry, as the action log says it: the verdict alone. */
-export type LogResult = 'removed' | 'failed' | 'skipped';
+export const LOG_RESULTS = ['removed', 'failed', 'skipped'] as const;
+
+export type LogResult = (typeof LOG_RESULTS)[number];
 
 /** One line of the action log, readable on its own long after the dialog that wrote it. */
 export interface ActivityEntry {
@@ -190,7 +204,7 @@ export interface ActivityEntry {
    */
   path: string;
   kind: NodeKind;
-  mode: Mode;
+  mode: DeletionMode;
   result: LogResult;
   /**
    * Meaningless without `result`: the failure message under `failed`, the wire name of a
@@ -201,6 +215,35 @@ export interface ActivityEntry {
   detail: string | null;
   /** Bytes this entry freed; 0 for anything that was not removed. */
   bytes: number;
+}
+
+/**
+ * What an entry's `detail` says, read the only way it may be read: with `result` first.
+ *
+ * The rule lives here, once and executably, rather than in every screen that draws a row —
+ * `detail` holds two different things and one absence, and the strings cannot be told apart
+ * by looking at them. A failure whose message happens to read `denylisted` is a failure.
+ */
+export function logDetail(
+  entry: ActivityEntry,
+): { kind: 'message'; message: string } | { kind: 'reason'; reason: BlockReason } | null {
+  if (entry.detail === null) {
+    return null;
+  }
+  if (entry.result === 'failed') {
+    return { kind: 'message', message: entry.detail };
+  }
+  if (entry.result === 'skipped' && isBlockReason(entry.detail)) {
+    return { kind: 'reason', reason: entry.detail };
+  }
+  // A `removed` line carries no detail, and a `skipped` one carries a reason this version
+  // does not know — a variant added to `BlockReason` after this build. Neither is a string
+  // to put on screen as if it explained something.
+  return null;
+}
+
+function isBlockReason(value: string): value is BlockReason {
+  return (BLOCK_REASONS as readonly string[]).includes(value);
 }
 
 /** The end of the action log. */
@@ -256,7 +299,7 @@ export function topGrowers(limit?: number): Promise<Delta[]> {
 }
 
 /** What deleting `paths` would do, with nothing touched: one row per path, with its verdict. */
-export function actionPreview(paths: string[], mode: Mode): Promise<Preview> {
+export function actionPreview(paths: string[], mode: DeletionMode): Promise<Preview> {
   return invoke<Preview>('action_preview', { paths, mode });
 }
 
@@ -266,7 +309,7 @@ export function actionPreview(paths: string[], mode: Mode): Promise<Preview> {
  * A rejection means the batch did **not** run. A batch that ran always resolves, and says
  * through `recorded` and `treeStale` what it could not finish afterwards.
  */
-export function actionRun(paths: string[], mode: Mode): Promise<BatchResult> {
+export function actionRun(paths: string[], mode: DeletionMode): Promise<BatchResult> {
   return invoke<BatchResult>('action_run', { paths, mode });
 }
 

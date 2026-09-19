@@ -2,7 +2,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach } from 'vitest';
 import { cleanup } from '@testing-library/react';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { resetMockActions } from '../mocks/fixtures';
+import { resetMockActions } from '../mocks/actions';
 import { resetIpcMock, setMockScanDelay } from '../mocks/ipc';
 
 beforeEach(() => {

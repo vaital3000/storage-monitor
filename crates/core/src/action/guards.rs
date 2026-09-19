@@ -280,6 +280,106 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
+    use serde::Deserialize;
+
+    /// The scenarios of `tests/fixtures/guard-cases.json`, which the mock of the desktop app
+    /// answers as well. The file itself says what it is for and what `ready` means there.
+    #[derive(Deserialize)]
+    struct GuardCases {
+        scenarios: Vec<GuardScenario>,
+    }
+
+    #[derive(Deserialize)]
+    struct GuardScenario {
+        name: String,
+        /// Relative to the base of the scenario; empty is the base itself.
+        root: String,
+        home: String,
+        tree: GuardTree,
+        cases: Vec<GuardCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct GuardTree {
+        dirs: Vec<String>,
+        files: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct GuardCase {
+        base: String,
+        path: String,
+        expect: String,
+        why: String,
+    }
+
+    fn under(base: &Path, relative: &str) -> PathBuf {
+        if relative.is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(relative)
+        }
+    }
+
+    /// The verdict as the shared cases name it: the wire name of the reason, or `ready`.
+    fn verdict(checked: &Result<Checked, BlockReason>) -> String {
+        match checked {
+            Ok(_) => "ready".to_owned(),
+            Err(reason) => match serde_json::to_value(reason) {
+                Ok(serde_json::Value::String(name)) => name,
+                other => panic!("a block reason is a string on the wire, got {other:?}"),
+            },
+        }
+    }
+
+    /// The cases the desktop mock answers too, so that a rule cannot change on one side
+    /// alone. The mock is the oracle every UI test of the deletion is written against, and
+    /// nothing else compares the two.
+    #[test]
+    fn the_shared_guard_cases_hold() {
+        let text = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/guard-cases.json"
+        ))
+        .expect("the shared guard cases are next to this crate");
+        let file: GuardCases = serde_json::from_str(&text).expect("the shared cases parse");
+        assert!(!file.scenarios.is_empty(), "there are cases to run");
+        for scenario in &file.scenarios {
+            let base = tempfile::tempdir().unwrap();
+            for dir in &scenario.tree.dirs {
+                fs::create_dir_all(base.path().join(dir)).unwrap();
+            }
+            for path in &scenario.tree.files {
+                fs::write(base.path().join(path), b"x").unwrap();
+            }
+            let root = under(base.path(), &scenario.root);
+            let home = under(base.path(), &scenario.home);
+            let limits = Limits::with_home(root.clone(), Some(home.clone()));
+            let parent = root
+                .parent()
+                .expect("a scan root has a parent")
+                .to_path_buf();
+            for case in &scenario.cases {
+                let path = match case.base.as_str() {
+                    "root" => under(&root, &case.path),
+                    "home" => under(&home, &case.path),
+                    "parent" => under(&parent, &case.path),
+                    "absolute" => PathBuf::from(&case.path),
+                    other => panic!("unknown base {other} in the shared cases"),
+                };
+                assert_eq!(
+                    verdict(&limits.check(&path)),
+                    case.expect,
+                    "{}: {} {} — {}",
+                    scenario.name,
+                    case.base,
+                    case.path,
+                    case.why
+                );
+            }
+        }
+    }
+
     fn limits(root: &Path) -> Limits {
         Limits::new(root.to_path_buf(), vec![root.join("Library")])
     }

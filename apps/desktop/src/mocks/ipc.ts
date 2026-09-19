@@ -8,7 +8,8 @@ import {
   SCAN_DONE_EVENT,
   SCAN_PROGRESS_EVENT,
   type AppInfo,
-  type Mode,
+  type BatchResult,
+  type DeletionMode,
   type ScanStatus,
 } from '../lib/ipc';
 import {
@@ -18,12 +19,9 @@ import {
   fixtureNodeView,
   fixtureNodes,
   fixtureStatusDone,
-  type HeldScan,
-  mockActionPreview,
-  mockActionRun,
-  mockActivityTail,
-  resetMockActions,
 } from './fixtures';
+import { type HeldScan, mockActionPreview, mockActionRun, resetMockActions } from './actions';
+import { mockActivityTail } from './actionLog';
 
 export const MOCK_APP_INFO: AppInfo = { name: 'Storage Monitor', version: '0.0.0-mock' };
 
@@ -35,6 +33,16 @@ export let mockScanDelayMs = 150;
 
 export function setMockScanDelay(ms: number): void {
   mockScanDelayMs = ms;
+}
+
+/**
+ * Makes every simulated scan from now on end in `failed` with this message, until it is set
+ * back to null. `Inner::fail` leaves a root and no result behind, which is the one state a
+ * window can be in where the guards run and the plan has no sizes to carry — so this is how
+ * a screen stages "a batch after a scan that did not finish".
+ */
+export function setMockScanFailure(message: string | null): void {
+  scanFailure = message;
 }
 
 const PROGRESS_TICKS = 6;
@@ -68,6 +76,8 @@ const IDLE: ScanStatus = {
 let status: ScanStatus = IDLE;
 /** A tree is available: the last scan finished or was cancelled. */
 let hasResult = false;
+/** What the next scan fails with, or null while the machine is behaving. */
+let scanFailure: string | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 
 type IpcHandler = Parameters<typeof mockIPC>[0];
@@ -99,7 +109,7 @@ function numberArgument(args: IpcArgs, name: string): number | undefined {
  * The two arguments of both action commands, refused the way Tauri refuses a body it cannot
  * deserialize into `Vec<String>` and `Mode`: with an error, never with a guess.
  */
-function batchArguments(args: IpcArgs, cmd: string): { paths: string[]; mode: Mode } {
+function batchArguments(args: IpcArgs, cmd: string): { paths: string[]; mode: DeletionMode } {
   const paths = argument(args, 'paths');
   if (!Array.isArray(paths) || paths.some((path) => typeof path !== 'string')) {
     commandError(`invalid args \`paths\` for command \`${cmd}\`: expected a list of paths`);
@@ -149,9 +159,13 @@ function publish(event: string): void {
   void emit(event, { ...status });
 }
 
-function finish(final: ScanStatus): void {
+/**
+ * The end of a scan. `holdsTree` is what `Inner::complete` does and `Inner::fail` does not:
+ * a failed scan keeps its root and leaves no tree at all.
+ */
+function finish(final: ScanStatus, holdsTree = true): void {
   status = final;
-  hasResult = true;
+  hasResult = holdsTree;
   publish(SCAN_DONE_EVENT);
 }
 
@@ -161,6 +175,22 @@ function advance(tick: number): void {
   }
   const done = fixtureStatusDone();
   if (tick > PROGRESS_TICKS) {
+    if (scanFailure !== null) {
+      // The counters stay the walker's own, as they do in the app: with no result to read,
+      // `ScanManager::status` answers from the live progress of the walk that stopped.
+      finish(
+        {
+          ...status,
+          state: 'failed',
+          currentPath: '',
+          error: scanFailure,
+          hasPrevious: false,
+          previousTakenAt: null,
+        },
+        false,
+      );
+      return;
+    }
     finish({ ...done, root: status.root });
     return;
   }
@@ -224,7 +254,7 @@ function heldScan(): HeldScan {
  * the tree the splice installed, while the read errors stay the ones the scan met. Without
  * it the header would go on claiming the bytes of rows that are gone.
  */
-function runBatch(paths: string[], mode: Mode) {
+function runBatch(paths: string[], mode: DeletionMode): BatchResult {
   const batch = mockActionRun(paths, mode, heldScan());
   if (hasResult) {
     const patched = fixtureStatusDone();
@@ -297,6 +327,7 @@ export function resetIpcMock(): void {
   clearTimer();
   status = IDLE;
   hasResult = false;
+  scanFailure = null;
   revealed.length = 0;
   resetMockActions();
 }
@@ -307,6 +338,7 @@ declare global {
     __STORAGE_MONITOR_MOCK__?: {
       revealed: string[];
       setMockScanDelay: (ms: number) => void;
+      setMockScanFailure: (message: string | null) => void;
     };
   }
 }
@@ -341,5 +373,5 @@ export function installIpcMock(): void {
   resetIpcMock();
   mockIPC(handle, { shouldMockEvents: true });
   fixUnlisten();
-  window.__STORAGE_MONITOR_MOCK__ = { revealed, setMockScanDelay };
+  window.__STORAGE_MONITOR_MOCK__ = { revealed, setMockScanDelay, setMockScanFailure };
 }

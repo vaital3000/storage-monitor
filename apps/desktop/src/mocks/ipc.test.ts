@@ -24,7 +24,14 @@ import {
   fixtureNodes,
   fixtureStatusDone,
 } from './fixtures';
-import { installIpcMock, mockScanDelayMs, resetIpcMock, revealed, setMockScanDelay } from './ipc';
+import {
+  installIpcMock,
+  mockScanDelayMs,
+  resetIpcMock,
+  revealed,
+  setMockScanDelay,
+  setMockScanFailure,
+} from './ipc';
 
 /** Subscribes to both scan events; `done` resolves with the payload of `scan:done`. */
 async function subscribe() {
@@ -165,6 +172,7 @@ describe('a simulated scan', () => {
     expect(window.__STORAGE_MONITOR_MOCK__?.revealed).toBe(revealed);
     window.__STORAGE_MONITOR_MOCK__?.setMockScanDelay(0);
     expect(mockScanDelayMs).toBe(0);
+    expect(window.__STORAGE_MONITOR_MOCK__?.setMockScanFailure).toBe(setMockScanFailure);
     await revealInFinder('/x');
     expect(window.__STORAGE_MONITOR_MOCK__?.revealed).toEqual(['/x']);
   });
@@ -313,6 +321,36 @@ describe('the deletion commands', () => {
     expect(batch.outcome.freedBytes).toBe(0);
     // Nothing to bring up to date either: the totals of a running scan are the walker's.
     expect((await scanStatus()).state).toBe('running');
+  });
+
+  it('guard a batch after a scan that failed, which leaves a root and no tree', async () => {
+    setMockScanFailure('the scan panicked: the volume went away');
+    const { done } = await subscribe();
+    await scanStart();
+    const final = await done;
+    expect(final.state).toBe('failed');
+    expect(final.error).toBe('the scan panicked: the volume went away');
+    await expect(treeNode()).rejects.toBe('no scan result');
+
+    const movies = fixtureNode('Movies');
+    const preview = await actionPreview([movies.path], 'trash');
+    // The root the user chose still decides what may be deleted; the tree that would have
+    // carried the sizes is the thing that did not arrive.
+    expect(preview.entries).toEqual([
+      { path: movies.path, kind: 'dir', size: 0, status: { state: 'ready' } },
+    ]);
+    expect(preview.totalBytes).toBe(0);
+  });
+
+  it('carry the tree of a cancelled scan, which keeps its partial walk', async () => {
+    const { done } = await subscribe();
+    await scanStart();
+    await scanCancel();
+    expect((await done).state).toBe('cancelled');
+    const movies = fixtureNode('Movies');
+    // `Inner::complete` installs a cancelled scan's tree like any other, so the plan behind
+    // a batch has its sizes — the one classification of the three that is not obvious.
+    expect((await actionPreview([movies.path], 'trash')).totalBytes).toBe(movies.size);
   });
 
   it('reject arguments that are not a list of paths and a mode', async () => {

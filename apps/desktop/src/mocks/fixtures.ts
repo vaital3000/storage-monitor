@@ -1,31 +1,16 @@
-// A deterministic home folder for mock mode, unit tests and e2e: about 60 nodes and
-// 180 GB, with the artifacts the cleanup modules will target, two folders the scanner
-// cannot read, one it could read only in part, one mount point it skips, and a previous
-// snapshot for deltas.
+// The scanned tree the mock answers from: a deterministic home folder for mock mode, unit
+// tests and e2e — about 60 nodes and 180 GB, with the artifacts the cleanup modules will
+// target, two folders the scanner cannot read, one it could read only in part, one mount
+// point it skips, and a previous snapshot for deltas.
 //
-// The tree is mutable from `mockActionRun` down: a batch takes rows out of it exactly as a
-// deletion followed by `ScanManager::patch_paths` does in the app. `resetMockActions` puts
-// every node back, and the test setup calls it between tests.
+// This file is the tree and nothing else. `actions.ts` mirrors the guards and the engine
+// over it, and `actionLog.ts` mirrors the record of what they did.
+//
+// The tree is mutable from `removeSubtree` down: a batch takes rows out of it exactly as a
+// deletion followed by `ScanManager::patch_paths` does in the app. `resetFixtureTree` puts
+// every node back, and `resetMockActions` calls it between tests.
 
-import type {
-  ActivityEntry,
-  BatchResult,
-  BlockReason,
-  Crumb,
-  Delta,
-  DiskUsage,
-  EntryOutcome,
-  LogResult,
-  LogTail,
-  Mode,
-  NodeId,
-  NodeKind,
-  NodeView,
-  Outcome,
-  Preview,
-  PreviewEntry,
-  ScanStatus,
-} from '../lib/ipc';
+import type { Crumb, Delta, DiskUsage, NodeId, NodeKind, NodeView, ScanStatus } from '../lib/ipc';
 
 /** Root of the fixture tree; `default_root` returns it in mock mode. */
 export const FIXTURE_ROOT = '/Users/demo';
@@ -405,15 +390,19 @@ export function fixtureDisk(): DiskUsage {
 
 /** The status of the finished fixture scan, with a previous snapshot to compare against. */
 export function fixtureStatusDone(): ScanStatus {
-  const count = (test: (node: FixtureNode) => boolean) =>
-    fixtureNodes.filter((node) => !removed.has(node.id) && test(node)).length;
   return {
     state: 'done',
     root: FIXTURE_ROOT,
-    files: count((n) => n.kind !== 'dir'),
-    dirs: count((n) => n.kind === 'dir'),
+    // The three `patched_stats` reads from the tree, from where it reads them: the root's
+    // own file count, the directories still in the arena, and the root's size.
+    files: fixtureNodes[0].fileCount,
+    dirs: fixtureNodes.filter((node) => !removed.has(node.id) && node.kind === 'dir').length,
     bytes: fixtureNodes[0].size,
-    errors: count((n) => n.error === PERMISSION_DENIED) + PARTIAL_READ_ERRORS,
+    // The errors are the scan's, and a patch does not touch them — `patched_stats` carries
+    // `stats.errors` through untouched. Deleting a folder the walker could not read does not
+    // unmake the moment it could not read it, so this counts over the tree as it was walked.
+    errors:
+      fixtureNodes.filter((node) => node.error === PERMISSION_DENIED).length + PARTIAL_READ_ERRORS,
     currentPath: '',
     durationMs: SCAN_DURATION_MS,
     error: null,
@@ -422,223 +411,24 @@ export function fixtureStatusDone(): ScanStatus {
   };
 }
 
-// The mock's half of `crates/core/src/action`: the guards, the deletion and the record of
-// it, over the fixture tree instead of a disk. Every rule below mirrors one the backend
-// enforces, because this is the only oracle the UI tests have — a mock that says yes to
-// everything makes them prove nothing.
-
-/**
- * Where deletion is never allowed: the standard denylist of `Limits::with_home`, with the
- * fixture root as the home folder — which is what it is, since `default_root` returns it
- * exactly as the app returns `$HOME`. So the fixture's whole `Library` subtree is
- * undeletable here, as `~/Library` is in the app until a module declares a path inside it.
- */
-const DENIED: readonly string[] = [
-  '/',
-  '/System',
-  '/usr',
-  '/bin',
-  '/sbin',
-  '/Library',
-  '/Applications',
-  '/opt',
-  '/cores',
-  '/Users',
-  '/Volumes',
-  '/etc',
-  '/var',
-  '/tmp',
-  '/private',
-  `${FIXTURE_ROOT}/Library`,
-  FIXTURE_ROOT,
-];
-
-/** The action log, oldest line first: the JSONL file the backend appends to, as an array. */
-export const mockActionLog: string[] = [];
-
-/** `a.starts_with(b)` for paths: component by component, so `/h/ab` is not inside `/h/a`. */
-function isAtOrUnder(path: string, prefix: string): boolean {
-  return prefix === '/' ? path.startsWith('/') : path === prefix || path.startsWith(`${prefix}/`);
-}
-
-/** The components of a path, the way `Path::components` reads them: `.` and `//` are noise. */
-function componentsOf(path: string): string[] {
-  return path.split('/').filter((part) => part !== '' && part !== '.');
-}
-
-/** `Limits::check`: the normalized path to delete, or the reason the rules refuse it. */
-function checkPath(path: string, root: string): { judged: string } | { reason: BlockReason } {
-  // 1. No last component to speak of: `/`, or a path ending in `..`, both of which name
-  //    something other than they appear to. Judged as written, before anything is resolved.
-  const written = componentsOf(path);
-  if (written.length === 0 || written[written.length - 1] === '..') {
-    return { reason: 'malformed' };
-  }
-  // 2. Only the parent is resolved, and the mock's filesystem has no working directory, so
-  //    the parent of a relative path is exactly the one that cannot be resolved.
-  if (!path.startsWith('/')) {
-    return { reason: 'missing' };
-  }
-  // 3. Lexical where the backend calls `canonicalize`: no directory of the fixture is a
-  //    symlink, so resolving `..` is the whole of the difference.
-  const resolved: string[] = [];
-  for (const part of written) {
-    if (part === '..') resolved.pop();
-    else resolved.push(part);
-  }
-  const judged = `/${resolved.join('/')}`;
-  // 4. The root itself and every ancestor of it.
-  if (isAtOrUnder(root, judged)) {
-    return { reason: 'isRoot' };
-  }
-  // 5. Component-wise, so `/h/ab` is not inside `/h/a`.
-  if (!isAtOrUnder(judged, root)) {
-    return { reason: 'outsideRoots' };
-  }
-  // 6. The denied entry itself and everything below it — except an entry that contains the
-  //    root, which `Limits::new` drops so that scanning a denied folder unlocks it.
-  if (DENIED.some((denied) => !isAtOrUnder(root, denied) && isAtOrUnder(judged, denied))) {
-    return { reason: 'denylisted' };
-  }
-  return { judged };
-}
-
-/**
- * What the window holds when a batch arrives — which is two questions, not one, because the
- * backend asks two different seams: `ScanManager::root` decides the guards, and
- * `with_result` decides whether the plan can carry a kind and a size at all.
- *
- * The states are the ones `limits_of` documents. A scan that is **running**, and one that
- * **failed**, hold a root and no tree: `start` clears the result and keeps the root. The
- * guards are then exactly the rules the user's choice of root implies, while every entry of
- * the plan is `(other, 0)` — `with_result` answers `None` and `plan_for` has nothing to read.
- * A **cancelled** scan installs its partial tree like a finished one and is `tree`. A tree
- * without a root is not representable here, because the manager cannot be in that state.
- */
-export type HeldScan =
-  { held: 'nothing' } | { held: 'root'; root: string } | { held: 'tree'; root: string };
-
-/**
- * `Tree::find`: the node the scan recorded, under the spelling the caller sent.
- *
- * Four of its rules are visible from here. It strips the root's own path first, and strips
- * it from an **absolute** base — so a relative path finds nothing at all, and a path outside
- * the root finds nothing whatever else exists. Then `Path::components` treats `.` and `//`
- * as noise, while a `..` is a component of its own that matches no child: `a/b/.` names the
- * same node as `a/b`, and `a/x/../b` names none.
- */
-function treeFind(path: string, root: string): FixtureNode | undefined {
-  if (!path.startsWith('/')) {
-    return undefined;
-  }
-  const spelled = `/${componentsOf(path).join('/')}`;
-  return isAtOrUnder(spelled, root) ? byPath.get(spelled) : undefined;
-}
-
-/**
- * `preview_batch`: every path against the guards and the fixture, with nothing touched.
- *
- * With no scan root — nothing scanned at all — `refused_preview` blocks every entry as
- * `outsideRoots`, because nothing is inside a root that does not exist. It copies the kind
- * and the size from the plan, which in that state has neither.
- */
-export function mockActionPreview(paths: readonly string[], mode: Mode, scan: HeldScan): Preview {
-  const entries: PreviewEntry[] = [];
-  /** Where each still-ready entry sits, and the form the batch comparison needs. */
-  const ready: Array<{ index: number; judged: string }> = [];
-  for (const path of paths) {
-    // `plan_for`: the kind and the size come from the tree the window holds. Without one —
-    // while a scan runs, or after a failed one — every entry of the plan is `(other, 0)`,
-    // and the dialog promises no bytes it cannot name.
-    const planned = scan.held === 'tree' ? treeFind(path, scan.root) : undefined;
-    const kind = planned?.kind ?? 'other';
-    const size = planned?.size ?? 0;
-    const checked =
-      scan.held === 'nothing' ? { reason: 'outsideRoots' as const } : checkPath(path, scan.root);
-    if ('reason' in checked) {
-      // Without a normalized path, the only honest thing to show is what was asked for.
-      entries.push({ path, kind, size, status: { state: 'blocked', reason: checked.reason } });
-      continue;
-    }
-    // The disk, not the tree: `check_entry` stats the entry whatever the window holds. The
-    // fixture is both here, so an entry the scan could not list does not exist here either.
-    const onDisk = byPath.get(checked.judged);
-    if (onDisk === undefined) {
-      const status = { state: 'blocked', reason: 'missing' } as const;
-      entries.push({ path: checked.judged, kind, size, status });
-      continue;
-    }
-    ready.push({ index: entries.length, judged: checked.judged });
-    // Only the kind is re-read, as `check_entry` does: a stale size costs nothing, and a
-    // stale kind deletes the wrong thing.
-    entries.push({ path: checked.judged, kind: onDisk.kind, size, status: { state: 'ready' } });
-  }
-  // `drop_nested`, over the still-ready entries only: one that will not be deleted cannot
-  // swallow the one below it. A strict ancestor always wins; between two spellings of one
-  // entry, the earlier one does.
-  for (const [i, entry] of ready.entries()) {
-    const swallowed = ready.some(
-      ({ judged }, j) =>
-        i !== j && isAtOrUnder(entry.judged, judged) && (judged !== entry.judged || j < i),
-    );
-    if (swallowed) {
-      entries[entry.index].status = { state: 'blocked', reason: 'nested' };
-    }
-  }
-  const totalBytes = entries
-    .filter((entry) => entry.status.state === 'ready')
-    .reduce((sum, entry) => sum + entry.size, 0);
-  return { entries, totalBytes, mode };
-}
-
-/**
- * `run_batch`: deletes what the guards allow, records the batch and patches the tree.
- *
- * The two warnings always come back clear. The mock has no port that can refuse a deletion,
- * no log that can fail to be written and no patch that can be dropped, so a batch that got
- * this far did all three.
- */
-export function mockActionRun(paths: readonly string[], mode: Mode, scan: HeldScan): BatchResult {
-  const preview = mockActionPreview(paths, mode, scan);
-  // One instant for the whole batch, read before the first deletion.
-  const at = new Date().toISOString();
-  const entries: EntryOutcome[] = [];
-  let freedBytes = 0;
-  for (const entry of preview.entries) {
-    if (entry.status.state === 'blocked') {
-      // Reported where the user left it, with the reason they were shown.
-      const result = { result: 'skipped', reason: entry.status.reason } as const;
-      entries.push({ path: entry.path, kind: entry.kind, result });
-      continue;
-    }
-    const node = byPath.get(entry.path);
-    if (node === undefined) {
-      const result = { result: 'skipped', reason: 'missing' } as const;
-      entries.push({ path: entry.path, kind: entry.kind, result });
-      continue;
-    }
-    removeSubtree(node);
-    freedBytes += entry.size;
-    // The size the plan carried and the dialog promised, never a re-read of a subtree that
-    // is no longer there.
-    const result = { result: 'removed', bytes: entry.size } as const;
-    entries.push({ path: entry.path, kind: entry.kind, result });
-  }
-  const outcome: Outcome = { entries, freedBytes, at, mode };
-  appendToLog(outcome);
-  return { outcome, recorded: true, treeStale: false };
+/** The entry at an absolute path, or `undefined` when nothing is there: the mock's `stat`. */
+export function fixtureEntry(path: string): FixtureNode | undefined {
+  return byPath.get(path);
 }
 
 /** The parent of a node, or `undefined` for the root. */
-function parentOf(node: FixtureNode): FixtureNode | undefined {
+export function parentOf(node: FixtureNode): FixtureNode | undefined {
   return node.parent === null ? undefined : fixtureNodes[node.parent];
 }
 
 /**
  * Takes a node and everything under it out of the tree, and shrinks every ancestor by what
  * it held — which is what a deletion followed by `patch_paths` leaves behind.
+ *
+ * The arithmetic stands in for the rescan the manager really does. In the fixture the two
+ * agree, because nothing else can have changed on a disk that is this array.
  */
-function removeSubtree(node: FixtureNode): void {
+export function removeSubtree(node: FixtureNode): void {
   const parent = parentOf(node);
   if (parent !== undefined) {
     parent.children.splice(parent.children.indexOf(node.id), 1);
@@ -658,159 +448,8 @@ function removeSubtree(node: FixtureNode): void {
   }
 }
 
-/** `ActionLog::append`: one line per entry, in the order of the batch. */
-function appendToLog(outcome: Outcome): void {
-  for (const entry of outcome.entries) {
-    mockActionLog.push(JSON.stringify(logEntry(entry, outcome)));
-  }
-}
-
-/** `LogEntry::of`: the verdict alone, with what it carried split into `detail` and `bytes`. */
-function logEntry(entry: EntryOutcome, outcome: Outcome): ActivityEntry {
-  const line = { at: outcome.at, path: entry.path, kind: entry.kind, mode: outcome.mode };
-  switch (entry.result.result) {
-    case 'removed':
-      return { ...line, result: 'removed', detail: null, bytes: entry.result.bytes };
-    case 'failed':
-      return { ...line, result: 'failed', detail: entry.result.message, bytes: 0 };
-    case 'skipped':
-      return { ...line, result: 'skipped', detail: entry.result.reason, bytes: 0 };
-  }
-}
-
-const KINDS: readonly string[] = ['dir', 'file', 'symlink', 'other'];
-const MODES: readonly string[] = ['trash', 'permanent'];
-const RESULTS: readonly string[] = ['removed', 'failed', 'skipped'];
-
-const oneOf = (field: unknown, names: readonly string[]) =>
-  typeof field === 'string' && names.includes(field);
-
-/**
- * `chrono`'s grammar for a `DateTime<Utc>`, which is not the platform's.
- *
- * It takes `T`, `t` or a space between the date and the time, needs `Z`, `z` or an offset —
- * never nothing — and allows any number of fractional digits, a leap second and surrounding
- * space. It refuses a bare date, a time without seconds, and a day the month does not have.
- *
- * `Date.parse` is no substitute, in **both** directions: it reads `2026-09-18` and a stamp
- * with no offset at all, and refuses the leap second and the trailing space that `chrono`
- * reads. Both grammars were measured against the real `LogEntry`, and this one agrees with
- * it on every string that was tried.
- *
- * It matters because the plan sends the next task to hand-write log lines. A line whose `Z`
- * was forgotten has to be damaged here too — otherwise it renders in the mock and vanishes
- * in the app, which is the worst possible way to find out about the difference.
- */
-const TIMESTAMP =
-  /^\s*(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|[+-](\d{2}):?(\d{2}))\s*$/;
-
-function isTimestamp(value: string): boolean {
-  const parts = TIMESTAMP.exec(value);
-  if (parts === null) {
-    return false;
-  }
-  const [year, month, day, hour, minute, second, offsetHour, offsetMinute] = parts
-    .slice(1)
-    .map((part) => (part === undefined ? 0 : Number(part)));
-  // A leap second is a second; a day the month does not have is not a day, and rolling it
-  // through `Date.UTC` is what says so — arithmetic, not another parser's grammar.
-  const rolled = new Date(Date.UTC(year, month - 1, day));
-  return (
-    rolled.getUTCMonth() === month - 1 &&
-    rolled.getUTCDate() === day &&
-    hour < 24 &&
-    minute < 60 &&
-    second < 61 &&
-    offsetHour < 24 &&
-    offsetMinute < 60
-  );
-}
-
-/**
- * One line of the log, or `null` when it is not an entry — as far as possible the line serde
- * refuses, measured against the real `LogEntry` rather than guessed:
- *
- * - a **missing `detail`** is an entry with `detail: null`. Every other field is required,
- *   but `Option<String>` is one serde fills in, and a line written by hand for a test — the
- *   natural way to get a `failed` row on screen — does not have to carry it;
- * - an unknown field is ignored, so a line from a later version still reads;
- * - `at` has to be a timestamp in `chrono`'s grammar (see [`isTimestamp`], which is where
- *   that grammar is written down); `bytes` a whole number that is not negative, because the
- *   field is a `u64` and serde takes neither `-1` nor `1.5`.
- */
-function parseLogLine(line: string): ActivityEntry | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  if (typeof value !== 'object' || value === null) {
-    return null;
-  }
-  const entry = value as Record<string, unknown>;
-  const detail = entry.detail ?? null;
-  const complete =
-    typeof entry.at === 'string' &&
-    isTimestamp(entry.at) &&
-    typeof entry.path === 'string' &&
-    oneOf(entry.kind, KINDS) &&
-    oneOf(entry.mode, MODES) &&
-    oneOf(entry.result, RESULTS) &&
-    (detail === null || typeof detail === 'string') &&
-    typeof entry.bytes === 'number' &&
-    Number.isInteger(entry.bytes) &&
-    entry.bytes >= 0;
-  if (!complete) {
-    return null;
-  }
-  // Field by field, so that an unknown one is dropped the way serde drops it.
-  return {
-    at: entry.at as string,
-    path: entry.path as string,
-    kind: entry.kind as NodeKind,
-    mode: entry.mode as Mode,
-    result: entry.result as LogResult,
-    detail: detail as string | null,
-    bytes: entry.bytes as number,
-  };
-}
-
-/**
- * `ActionLog::tail`: the last `limit` entries, newest first, and how many lines of the
- * stretch that was read could not be parsed.
- *
- * A damaged line costs one `damaged` and nothing else: it does not use up a slot of `limit`,
- * and it does not stop the read. A blank line is a separator, not damage. `damaged` counts
- * only as far back as the read went, which is as far as `limit` entries reach.
- */
-export function mockActivityTail(limit: number): LogTail {
-  const entries: ActivityEntry[] = [];
-  let damaged = 0;
-  for (let line = mockActionLog.length - 1; line >= 0; line -= 1) {
-    if (entries.length === limit) {
-      break;
-    }
-    const text = mockActionLog[line];
-    if (text.trim() === '') {
-      continue;
-    }
-    const entry = parseLogLine(text);
-    if (entry === null) {
-      damaged += 1;
-    } else {
-      entries.push(entry);
-    }
-  }
-  return { entries, damaged };
-}
-
-/**
- * Puts every node of the tree back as it was built and forgets the log. `resetIpcMock` calls
- * it, and so does the test setup, so a batch in one test is never visible in the next.
- */
-export function resetMockActions(): void {
-  mockActionLog.length = 0;
+/** Every node back as the fixture was built. Half of `resetMockActions`. */
+export function resetFixtureTree(): void {
   removed.clear();
   for (const node of fixtureNodes) {
     const was = pristine[node.id];

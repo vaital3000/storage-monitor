@@ -29,6 +29,8 @@ apps/desktop/src/         React UI. Backend calls only through src/lib/ipc.ts
   pages/                  ExplorerPage and the placeholder of the sections of later phases
   components/             app shell, NodeTable, Treemap (ECharts), Breadcrumbs, ScanProgress
   mocks/                  IPC mock and the /Users/demo fixture (unit tests, e2e, `just dev-web`)
+    ipc.ts                the commands; fixtures.ts the scanned tree
+    actions.ts            mirrors core's action/{guards,engine}.rs; actionLog.ts its log.rs
   test/                   Vitest setup, render helper with a QueryClient, ECharts stand-in
 apps/desktop/e2e/         Playwright tests against the mocked UI
 docs/adr/                 Architecture decision records
@@ -154,6 +156,13 @@ both use the same store. Cancelled scans are not persisted. Format details:
 - Playwright serves the mock on port 1430 and writes `explorer.png`,
   `explorer-dark.png` and `home.png` under `apps/desktop/test-results/`, which
   it wipes on every run.
+- The deletion guards are pinned by cases both implementations answer:
+  `crates/core/tests/fixtures/guard-cases.json`, run by
+  `the_shared_guard_cases_hold` in `crates/core/src/action/guards.rs` over a temp
+  tree and by `apps/desktop/src/mocks/actions.test.ts` over the fixture. Changing
+  a placement rule means changing both sides, which is the point: the mock is the
+  oracle every UI test of the deletion is written against. The file covers the six
+  numbered rules of `Limits::check` and stops there.
 - Rust walker tests (`crates/core/tests/walker.rs`) build temp trees: hard
   links, sparse files, permission-denied and partially readable directories,
   symlinks, deep nesting.
