@@ -84,15 +84,30 @@ applied, the scan ran.
 
 **What the guard test does and does not prove.** It proves the line is still
 there and still closed. It cannot prove the app runs under it, because nothing
-automated launches the app. Task 16 adds the nearest available substitute —
-the Playwright mock server serving this same policy, so a browser enforces
-something close — but that substitute is weaker than it looks: the origin
-differs, so `'self'` does not mean there what it means in the packaged app.
-What
-transfers is the class that actually breaks — `'unsafe-eval'`, a `blob:`
-worker, a `data:` font — and that is worth having, because `echarts` is a caret
-range: a `pnpm update` pulling a chart build that reaches for a blob worker
-would ship an app whose treemap silently fails to render, with every other gate
-green.
+automated launches the app. The Playwright suite is the nearest available
+substitute: its mock server reads this same policy out of `tauri.conf.json` and
+serves it on port 1430, so the served header cannot drift from the shipped one,
+and every spec runs under it. That substitute is weaker than it looks — the
+origin differs, so `'self'` does not mean there what it means in the packaged
+app, and the module graph is Vite's rather than the bundle's. What transfers is
+the class that actually breaks: `'unsafe-eval'`, a `blob:` worker, a `data:`
+font. That is worth having, because `echarts` is a caret range — a `pnpm update`
+pulling a chart build that reaches for a blob worker would ship an app whose
+treemap silently fails to render, with every other gate green.
+
+Its own positive control plants all four classes and asserts they did not merely
+raise an event but failed to run. Two traps are recorded there, both measured.
+A control written as `page.evaluate(() => eval(…))` proves nothing: the eval
+runs, raises no violation, and reports success, because `page.evaluate` executes
+through the debugger, which the page's policy does not cover — `setTimeout('…',
+0)` scheduled from inside it does raise `script-src <- eval`, because the page's
+own task does the compiling. And an alarm nobody trips is indistinguishable from
+one that cannot fire, so a `test.fail()` spec plants a violation without
+declaring it, and passes only by failing.
+
+Serving the policy also costs the dev server its fast refresh: the React
+plugin's preamble is an inline `<script>`, which `script-src 'self'` blocks, and
+the app then never mounts. That is why the e2e server turns fast refresh off and
+why `just dev` cannot be made to apply the policy by setting a header.
 
 Loosening the policy means editing that test, deliberately, which is the point.
