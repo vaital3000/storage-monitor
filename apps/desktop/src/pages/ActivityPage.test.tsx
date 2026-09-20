@@ -61,9 +61,11 @@ function rowFor(path: string): HTMLElement {
 }
 
 function paths(): string[] {
-  // The path line only. The detail of a failed or skipped entry sits under it in the same
-  // cell, so the cell's own text is the two of them run together.
-  return rows().map((row) => cells(row)[1].firstElementChild?.textContent ?? '');
+  // The path line, found by the `title` only it carries rather than by its place in the
+  // cell: the detail of a failed or skipped entry sits under it, so the cell's own text is
+  // the two run together and its last child is the wrong one. Every test that compares
+  // paths stages a row with a detail, so a helper that went back to either would fail.
+  return rows().map((row) => within(row).getByTitle(/^\//).textContent ?? '');
 }
 
 /** Waits for the record to arrive: every test here starts with the query in flight. */
@@ -78,6 +80,9 @@ describe('ActivityPage', () => {
     expect(await screen.findByTestId('activity-empty')).toHaveTextContent('No actions yet');
     expect(screen.queryByTestId('activity-rows')).not.toBeInTheDocument();
     expect(screen.queryByTestId('activity-damaged')).not.toBeInTheDocument();
+    // Nor "0 entries" over it: the summary counts what is on screen, and there is no
+    // screen to count.
+    expect(screen.queryByTestId('activity-summary')).not.toBeInTheDocument();
   });
 
   it('heads the screen and its columns, which is what says which column is which', async () => {
@@ -117,8 +122,18 @@ describe('ActivityPage', () => {
     // that woke up. `ActionLog` is explicit that "newest first" is the order of the lines
     // in the file and never the `at` they carry, and a screen that sorted by the stamp
     // would put the older batch on top and claim it was the last thing the user deleted.
+    //
+    // The second line carries a detail as well, which is what keeps `paths()` honest: a
+    // row with two lines in its path cell is the case a helper reading the cell's text,
+    // or its last child, gets wrong.
     record({ path: under('first'), at: new Date(2026, 8, 18, 9, 0, 0).toISOString() });
-    record({ path: under('second'), at: new Date(2026, 8, 18, 8, 0, 0).toISOString() });
+    record({
+      path: under('second'),
+      at: new Date(2026, 8, 18, 8, 0, 0).toISOString(),
+      result: 'skipped',
+      detail: 'denylisted',
+      bytes: 0,
+    });
     show();
     await shown();
     expect(paths()).toEqual([under('second'), under('first')]);
@@ -155,8 +170,12 @@ describe('ActivityPage', () => {
     const failure = within(rowFor(under('locked'))).getByTestId('activity-detail');
     const reason = within(rowFor(under('Library'))).getByTestId('activity-detail');
     expect(failure).toHaveAttribute('data-detail', 'failure');
-    expect(failure).toHaveClass('text-red-700');
+    // Both themes. Half the app's users read it in the other one, and a failure line that
+    // keeps `text-red-700` alone falls to about 3.4:1 on the dark panel — under the 4.5:1
+    // floor — while the attribute above goes on saying "failure".
+    expect(failure).toHaveClass('text-red-700', 'dark:text-red-400');
     expect(reason).toHaveAttribute('data-detail', 'reason');
+    // `text-muted` is the app's own utility and carries its dark shade inside it.
     expect(reason).toHaveClass('text-muted');
   });
 
@@ -186,16 +205,27 @@ describe('ActivityPage', () => {
     // A ninth `BlockReason`, added in Rust after this build was made: `logDetail` refuses
     // to call it a reason, and the row must still not be left bare.
     record({ path: under('sealed'), result: 'skipped', detail: 'quarantined', bytes: 0 });
+    // The other way `logDetail` answers null over a blocked row: a line with no `detail`
+    // at all, which `parseLogLine` accepts on purpose — `Option<String>` is a field serde
+    // fills in, so a line written by hand does not have to carry it. Both are "this build
+    // does not know why", and both get the sentence rather than an empty cell.
+    record({ path: under('bare'), result: 'skipped', detail: null, bytes: 0 });
     show();
     await shown();
     const row = rowFor(under('sealed'));
     expect(row).toHaveTextContent('Blocked for a reason this version does not know');
     expect(row).not.toHaveTextContent('quarantined');
+    expect(rowFor(under('bare'))).toHaveTextContent(
+      'Blocked for a reason this version does not know',
+    );
   });
 
   it('shows a size wherever there is one, and nothing where nothing was freed', async () => {
     record({ path: under('gone'), result: 'removed', bytes: 512 });
     record({ path: under('kept'), result: 'skipped', detail: 'isRoot', bytes: 0 });
+    // The case the rule is *for*: a deletion that ran and did not happen. "0 B" here
+    // reads as a file that was deleted and happened to be empty.
+    record({ path: under('locked'), result: 'failed', detail: 'denied', bytes: 0 });
     // A line that failed and freed bytes is not one the backend writes; the rule is about
     // the number and not about the verdict, so it cannot hide one that is there.
     record({ path: under('half'), result: 'failed', detail: 'half a tree', bytes: 4_096 });
@@ -206,8 +236,27 @@ describe('ActivityPage', () => {
     await shown();
     expect(cells(rowFor(under('gone')))[4]).toHaveTextContent('512 B');
     expect(cells(rowFor(under('kept')))[4]).toHaveTextContent('—');
+    expect(cells(rowFor(under('locked')))[4]).toHaveTextContent('—');
     expect(cells(rowFor(under('half')))[4]).toHaveTextContent('4.1 KB');
     expect(cells(rowFor(under('empty')))[4]).toHaveTextContent('0 B');
+  });
+
+  it('leaves the mode blank on a row nothing was done to', async () => {
+    // A skipped entry was refused before anything was touched, so "Trash" beside it would
+    // say the file is in the Trash. A failed one did go that way and failed going, so it
+    // keeps its mode — and a removed one is where the word is load-bearing: it is what
+    // makes "Removed" mean *moved, recoverable* rather than *gone*.
+    record({ path: under('Library'), result: 'skipped', detail: 'denylisted', bytes: 0 });
+    record({ path: under('locked'), result: 'failed', detail: 'denied', bytes: 0 });
+    record({ path: under('gone'), result: 'removed', mode: 'trash', bytes: 512 });
+    show();
+    await shown();
+    const skipped = rowFor(under('Library'));
+    expect(cells(skipped)[2]).toHaveTextContent('—');
+    expect(cells(skipped)[2]).not.toHaveTextContent('Trash');
+    expect(skipped).toHaveAttribute('data-result', 'skipped');
+    expect(cells(rowFor(under('locked')))[2]).toHaveTextContent('Trash');
+    expect(cells(rowFor(under('gone')))[2]).toHaveTextContent('Trash');
   });
 
   it('shows a stamp it cannot read as the record wrote it', async () => {
@@ -219,23 +268,28 @@ describe('ActivityPage', () => {
     expect(cells((await shown())[0])[0]).toHaveTextContent(leap);
   });
 
-  it('counts the lines it could not read instead of dropping them', async () => {
+  it('counts the one line it could not read instead of dropping it', async () => {
     record({ path: under('gone') });
     mockActionLog.push('{ torn');
-    mockActionLog.push('not json at all');
     show();
     await shown();
-    expect(screen.getByTestId('activity-damaged')).toHaveTextContent('2 damaged entries');
+    // By role as well as by test id, because the role is the whole difference between a
+    // note about the record and a sentence that happens to be near it.
+    expect(screen.getByRole('note')).toBe(screen.getByTestId('activity-damaged'));
+    expect(screen.getByRole('note')).toHaveTextContent('1 damaged entry hidden');
     expect(rows()).toHaveLength(1);
   });
 
   it('does not call a record of nothing but damage empty', async () => {
     // Every line unreadable: entries are empty, and "No actions yet" over a log full of
-    // the user's deletions is the silent loss `damaged` exists to prevent.
+    // the user's deletions is the silent loss `damaged` exists to prevent. Two of them,
+    // so that the rule being held is "none at all" and not "exactly one".
     mockActionLog.push('{ torn');
+    mockActionLog.push('not json at all');
     show();
-    expect(await screen.findByTestId('activity-damaged')).toHaveTextContent('1 damaged entry');
+    expect(await screen.findByRole('note')).toHaveTextContent('2 damaged entries hidden');
     expect(screen.queryByTestId('activity-empty')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('activity-rows')).not.toBeInTheDocument();
   });
 
   it('says the record could not be read rather than showing an empty one', async () => {

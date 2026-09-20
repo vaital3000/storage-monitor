@@ -81,11 +81,28 @@ function describeBytes(entry: ActivityEntry): string | null {
   return entry.result === 'removed' || entry.bytes > 0 ? formatBytes(entry.bytes) : null;
 }
 
+/**
+ * How the entry left — for the rows where something left at all.
+ *
+ * A `skipped` entry was refused before anything was touched, so "Trash" beside it would
+ * read as a file that is now in the Trash. It is the same trade `describeBytes` makes one
+ * function up, and the dialog makes it too: its Skipped list carries no mode either. A
+ * `failed` row keeps its mode, because that batch did try, and *how* it tried is half of
+ * what its message means.
+ */
+function describeMode(entry: ActivityEntry): string | null {
+  return entry.result === 'skipped' ? null : MODE_LABELS[entry.mode];
+}
+
 const CELL = 'px-2 py-1.5 align-top';
+
+/** What a cell shows when the record has nothing to put there — never a zero or a guess. */
+const EMPTY_CELL = '—';
 
 function Row({ entry }: { entry: ActivityEntry }) {
   const detail = describeDetail(entry);
   const bytes = describeBytes(entry);
+  const mode = describeMode(entry);
   return (
     <tr data-result={entry.result} className="border-t border-neutral-100 dark:border-neutral-800">
       <td className={`${CELL} whitespace-nowrap text-muted tabular-nums`}>
@@ -120,9 +137,9 @@ function Row({ entry }: { entry: ActivityEntry }) {
           </span>
         )}
       </td>
-      <td className={CELL}>{MODE_LABELS[entry.mode]}</td>
+      <td className={CELL}>{mode ?? EMPTY_CELL}</td>
       <td className={CELL}>{RESULT_LABELS[entry.result]}</td>
-      <td className={`${CELL} text-right tabular-nums`}>{bytes ?? '—'}</td>
+      <td className={`${CELL} text-right tabular-nums`}>{bytes ?? EMPTY_CELL}</td>
     </tr>
   );
 }
@@ -204,10 +221,7 @@ export default function ActivityPage() {
           <h3 className="font-semibold text-red-800 dark:text-red-300">
             The record could not be read
           </h3>
-          <p
-            data-testid="activity-error"
-            className="mt-2 font-mono text-sm break-words text-red-700 dark:text-red-300"
-          >
+          <p className="mt-2 font-mono text-sm break-words text-red-700 dark:text-red-300">
             {String(log.error)}
           </p>
           <Button className="mt-3" onClick={() => void log.refetch()}>
@@ -257,9 +271,11 @@ export default function ActivityPage() {
         damaged === 0 && (
           <div data-testid="activity-empty" className="flex flex-col gap-1">
             <p className="text-sm font-medium">No actions yet</p>
+            {/* "its size", not "what it freed": under the Trash nothing is freed until the
+                Trash is emptied, which the dialog says in words and which the neutral
+                "Size" header of the table this replaces gets right. */}
             <p className="text-sm text-muted">
-              Deleting from the Explorer records a line here, with the path, the mode and what it
-              freed.
+              Deleting from the Explorer records a line here, with the path, the mode and its size.
             </p>
           </div>
         )
