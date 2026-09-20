@@ -34,6 +34,7 @@ apps/desktop/src/         React UI. Backend calls only through src/lib/ipc.ts
     actions.ts            mirrors core's action/{guards,engine}.rs; actionLog.ts its log.rs
   test/                   Vitest setup, render helper with a QueryClient, ECharts stand-in
 apps/desktop/e2e/         Playwright tests against the mocked UI
+  fixtures.ts             the `test` every spec imports: it fails on a CSP violation
 docs/adr/                 Architecture decision records
 docs/plans/               Designs and implementation plans
 docs/images/              Screenshots embedded in README.md
@@ -142,11 +143,12 @@ both use the same store. Cancelled scans are not persisted. Format details:
 - Nothing runs the app under that policy by itself. `just dev` cannot: Tauri
   attaches the header in the `tauri://localhost` handler for the embedded
   frontend, and a `devUrl` document is served by Vite and never passes through
-  it — `devCsp` does not help either, it is the same handler. For the dev
-  window, set the header in Vite's `server.headers`. To check a change for
-  real, `pnpm tauri build --debug --no-bundle` and run the binary, always with
-  a positive control: plant an `eval`, confirm it is blocked, and only then
-  believe "no violations".
+  it — `devCsp` does not help either, it is the same handler. The nearest
+  substitute is `just e2e`, which serves the same header from the mock server
+  (see Testing). To check a change for real, run the binary that
+  `pnpm tauri build --debug --no-bundle` leaves behind, always with a positive
+  control: plant an `eval`, confirm it is blocked, and only then believe "no
+  violations".
 - Do not add dependencies for something the standard library or an existing
   dependency already does.
 
@@ -165,8 +167,26 @@ both use the same store. Cancelled scans are not persisted. Format details:
   function — so the tests that exist for that mix-up cannot see it there.
   `the_suite_runs_outside_utc` in `src/lib/format.test.ts` fails if the pin goes.
 - Playwright serves the mock on port 1430 and writes `explorer.png`,
-  `explorer-dark.png` and `home.png` under `apps/desktop/test-results/`, which
-  it wipes on every run.
+  `explorer-dark.png`, `explorer-selection.png`, `activity.png` and `home.png`
+  under `apps/desktop/test-results/`, which it wipes on every run.
+- That server is the mock one, sealed (`STORAGE_MONITOR_E2E=1`, set by
+  `playwright.config.ts`): it serves the window's Content Security Policy read
+  from `tauri.conf.json` itself, and every spec runs under it through the `test`
+  of `e2e/fixtures.ts`, which fails on any `securitypolicyviolation`. Fast
+  refresh is off there because its preamble is an inline script the policy
+  blocks — the page then renders nothing, which is also what `just dev` would do
+  if the header were set on the ordinary dev server. `e2e/csp.spec.ts` is the
+  positive control: it checks the header arrived and plants three violations
+  through the DOM. Not through `eval` — `page.evaluate` runs its argument
+  through the debugger, which the policy does not cover, so an eval planted
+  there runs and proves nothing.
+- The fixture's ids move when a batch does: `renumberTree` in
+  `src/mocks/fixtures.ts` re-numbers the surviving tree breadth first, siblings
+  largest first, once per batch that removed anything — `install_patches`
+  rebuilding the arena. So `fixtureNodes` is a live binding, a node read before a
+  batch is a snapshot of the old arena, and `fixtureNodeView(id)` answers for
+  whichever node holds that slot now rather than throwing. That is what lets a UI
+  test see the hazard the re-anchor exists for.
 - The deletion guards are pinned by cases both implementations answer:
   `crates/core/tests/fixtures/guard-cases.json`, run by
   `the_shared_guard_cases_hold` in `crates/core/src/action/guards.rs` over a temp
