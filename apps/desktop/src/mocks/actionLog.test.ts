@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { DeletionMode } from '../lib/ipc';
 import { FIXTURE_ROOT, fixtureNode } from './fixtures';
 import { type HeldScan, mockActionRun } from './actions';
-import { mockActionLog, mockActivityTail } from './actionLog';
+import { appendToLog, mockActionLog, mockActivityTail } from './actionLog';
 
 /** An absolute path under the fixture root, for entries the fixture does not have. */
 const under = (relative: string) => `${FIXTURE_ROOT}/${relative}`;
@@ -58,6 +58,40 @@ describe('mockActivityTail', () => {
     expect(tail.entries.map((entry) => entry.at)).toEqual([outcome.at, outcome.at, outcome.at]);
     expect(outcome.at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
     expect(Number.isNaN(Date.parse(outcome.at))).toBe(false);
+  });
+
+  it('splits a failure into its message and no bytes, which no batch of this mock can', () => {
+    // `mockActionRun` cannot produce `failed` — the fixture has no disk to refuse — so
+    // this arm of `logEntry` is reached by nothing else in the suite, and the Activity
+    // screen's failure rows are all hand-written lines. The mapping is still the mock's
+    // half of `LogEntry::of`: the message goes to `detail`, and `bytes` is 0 because
+    // nothing was freed.
+    appendToLog({
+      entries: [
+        {
+          path: under('locked'),
+          kind: 'dir',
+          result: { result: 'failed', message: 'cannot delete /Users/demo/locked: denied' },
+        },
+      ],
+      freedBytes: 0,
+      at: '2026-09-18T09:15:00Z',
+      mode: 'permanent',
+    });
+    expect(mockActivityTail(10)).toEqual({
+      entries: [
+        {
+          at: '2026-09-18T09:15:00Z',
+          path: under('locked'),
+          kind: 'dir',
+          mode: 'permanent',
+          result: 'failed',
+          detail: 'cannot delete /Users/demo/locked: denied',
+          bytes: 0,
+        },
+      ],
+      damaged: 0,
+    });
   });
 
   it('grows by one entry per entry of every batch, newest batch first', () => {
