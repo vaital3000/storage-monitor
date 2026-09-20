@@ -579,6 +579,11 @@ describe('ExplorerPage deleting the selection', () => {
     expect(within(dialog).getByRole('radio', { name: 'Permanent' })).toBeChecked();
     expect(within(dialog).getByTestId('mode-explanation')).toHaveTextContent('cannot be undone');
     expect(confirmButton(dialog)).toBeDisabled();
+    // The two red buttons this screen now shows at once do not read alike. Asserted here
+    // because this is the only place both exist: the bar keeps "Delete permanently", which
+    // is the vocabulary of the mode, and the dialog's confirm says what it does.
+    expect(confirmButton(dialog)).toHaveTextContent('Delete for good');
+    expect(within(bar()).getByRole('button', { name: 'Delete permanently' })).toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole('checkbox', { name: /I understand/ }));
     expect(confirmButton(dialog)).toBeEnabled();
@@ -1126,10 +1131,11 @@ describe('ExplorerPage deleting the selection', () => {
     // does, and what no test could see while the fixture kept its ids for ever.
     const stranger = fixtureNodeView(movies.id);
     expect(stranger.path).not.toBe(movies.path);
-    // The rows on screen are the root's, and not that stranger's. Both halves matter: the
-    // first alone passes for a page that never navigated anywhere.
+    // A directory with rows of its own, so showing the root's is a choice this page made
+    // and not the only thing it could have drawn: keeping the old id would have put these
+    // on screen, under breadcrumbs naming a folder nobody opened.
+    expect(stranger.children.length).toBeGreaterThan(0);
     expect(names()).toEqual(fixtureNodeView(0).children.map((child) => child.name));
-    expect(names()).not.toEqual(stranger.children.map((child) => child.name));
   });
 
   it('stays where it is when the batch removed nothing', async () => {

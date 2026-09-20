@@ -248,13 +248,18 @@ test('deletes what it can when the batch holds a folder this app never deletes f
   await bar(page).getByRole('button', { name: 'Move to Trash' }).click();
 
   const dialog = page.getByRole('dialog');
-  await expect(dialog.getByTestId('delete-total')).toHaveText(/· 1 blocked$/);
+  const total = dialog.getByTestId('delete-total');
+  await expect(total).toHaveText(/· 1 blocked$/);
   await expect(dialog.getByTestId('block-reason')).toHaveText(
     'Inside a folder this app never deletes from',
   );
+  // The one entry that is going, and its size is the whole of what the batch may free.
+  const promised = await printedSize(total);
   await dialog.getByRole('button', { name: 'Move to the Trash' }).click();
 
-  await expect(dialog.getByTestId('result-summary')).toHaveText(/^Moved 1 item to the Trash · /);
+  await expect(dialog.getByTestId('result-summary')).toHaveText(
+    `Moved 1 item to the Trash · ${promised}`,
+  );
   await expect(dialog.getByTestId('result-skipped')).toContainText(`${ROOT}/Library`);
   await dialog.getByRole('button', { name: 'Close' }).click();
 
@@ -297,6 +302,10 @@ test.describe('screenshots for the PR', () => {
    * Trash" and "Delete permanently" behind the backdrop, and the dialog armed for the
    * deletion that cannot be taken back, acknowledgement ticked so the button is live.
    *
+   * It was this picture that showed the two reds carrying the same words as well as the
+   * same variant; the dialog's now says "Delete for good", and the assertion below is by
+   * name so that this test holds them apart as well as showing them.
+   *
    * Not `fullPage`: the backdrop is `fixed`, and a full-page shot of a fixed layer past the
    * fold is a picture of the layout coming apart rather than of the app.
    */
@@ -310,9 +319,12 @@ test.describe('screenshots for the PR', () => {
     const dialog = page.getByRole('dialog');
     await expect(dialog.getByRole('radio', { name: 'Permanent' })).toBeChecked();
     await dialog.getByRole('checkbox', { name: /I understand/ }).check();
-    const confirm = dialog.getByTestId('confirm-delete');
+    const confirm = dialog.getByRole('button', { name: 'Delete for good' });
     await expect(confirm).toHaveAttribute('data-variant', 'danger');
     await expect(confirm).toBeEnabled();
+    // Reached by name rather than by test id, so that the shot is taken of a screen whose
+    // two red buttons say different things — which is the point of the shot.
+    await expect(bar(page).getByRole('button', { name: 'Delete permanently' })).toBeVisible();
 
     await page.screenshot({ path: test.info().outputPath('explorer-selection.png') });
   });

@@ -176,17 +176,28 @@ both use the same store. Cancelled scans are not persisted. Format details:
   refresh is off there because its preamble is an inline script the policy
   blocks — the page then renders nothing, which is also what `just dev` would do
   if the header were set on the ordinary dev server. `e2e/csp.spec.ts` is the
-  positive control: it checks the header arrived and plants three violations
-  through the DOM. Not through `eval` — `page.evaluate` runs its argument
-  through the debugger, which the policy does not cover, so an eval planted
-  there runs and proves nothing.
-- The fixture's ids move when a batch does: `renumberTree` in
-  `src/mocks/fixtures.ts` re-numbers the surviving tree breadth first, siblings
-  largest first, once per batch that removed anything — `install_patches`
-  rebuilding the arena. So `fixtureNodes` is a live binding, a node read before a
-  batch is a snapshot of the old arena, and `fixtureNodeView(id)` answers for
-  whichever node holds that slot now rather than throwing. That is what lets a UI
-  test see the hazard the re-anchor exists for.
+  positive control: it checks the header arrived, and plants four violations
+  through the page's own loader — an inline `<script>`, a `blob:` worker, a
+  `data:` font and a `setTimeout` handed a **string**, which is the eval class.
+  Never a bare `eval('…')` inside `page.evaluate`: that compiles through the
+  debugger, which the policy does not cover, so it runs and proves nothing.
+  A third test, marked `test.fail()`, plants a violation and does not declare
+  it — the only thing that can fail it is the watcher itself, which is how the
+  alarm is kept honest. Deleting the teardown assertion or making the fixture
+  non-`auto` leaves every other spec green.
+- The fixture's ids move when a batch does. `patchTree(gone, touched)` in
+  `src/mocks/fixtures.ts` is the only way to change that tree: it drops the
+  subtrees that went and then re-numbers what is left, breadth first and
+  siblings largest first — `patch_paths` and `install_patches` in one, so the
+  two halves cannot come apart. `touched` is every entry **removed or failed**,
+  the predicate `ExplorerPage`'s `afterBatch` re-anchors on, so a batch that
+  only failed still moves the arena. The consequences a UI test leans on:
+  `fixtureNodes` is a live binding, a node read before a batch is a snapshot of
+  the old arena, and `fixtureNodeView(id)` answers for whichever node holds that
+  slot now rather than throwing. `fixtures.test.ts` checks the numbering
+  invariants over both arenas — the built one and the patched one — because a
+  renumbering that sorted by the wrong field passed every other test in the
+  suite.
 - The deletion guards are pinned by cases both implementations answer:
   `crates/core/tests/fixtures/guard-cases.json`, run by
   `the_shared_guard_cases_hold` in `crates/core/src/action/guards.rs` over a temp

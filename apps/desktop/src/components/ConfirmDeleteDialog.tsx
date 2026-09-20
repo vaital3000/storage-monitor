@@ -68,9 +68,24 @@ const MODE_EXPLANATIONS: Record<DeletionMode, string> = {
   permanent: 'Items are deleted immediately. This cannot be undone.',
 };
 
+/**
+ * What the confirming button says. Neither label repeats the entry point that opened the
+ * dialog, and for the same reason both times: two live buttons a few hundred pixels apart,
+ * reading the same words, is one mis-click.
+ *
+ * The Trash pair is separated on two axes — "Move to Trash" against "Move to the Trash",
+ * and `primary` against the bar's ordinary style. The permanent pair had neither: the same
+ * string *and* the same `danger` variant. So this one says **Delete for good**.
+ *
+ * It states the consequence rather than the mechanism, which is what a confirming button
+ * is for: "without the Trash" names a route the user still has to translate into
+ * "unrecoverable". The price is that this label no longer derives from the heading above
+ * it ("Delete 2 items permanently?"), which the Trash label does; that is worth paying to
+ * keep the two red buttons apart.
+ */
 const CONFIRM_LABELS: Record<DeletionMode, string> = {
   trash: 'Move to the Trash',
-  permanent: 'Delete permanently',
+  permanent: 'Delete for good',
 };
 
 const RUNNING_LABELS: Record<DeletionMode, string> = {

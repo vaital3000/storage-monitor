@@ -325,7 +325,9 @@ describe('ConfirmDeleteDialog', () => {
     expect(screen.getByTestId('mode-explanation')).toHaveTextContent(
       'Items are deleted immediately. This cannot be undone.',
     );
-    expect(confirmButton()).toHaveTextContent('Delete permanently');
+    // Not "Delete permanently", which is what the action bar's entry point says: the two
+    // are the same red, and two identical red buttons on one screen is a mis-click.
+    expect(confirmButton()).toHaveTextContent('Delete for good');
     expect(confirmButton()).toBeDisabled();
 
     fireEvent.click(confirmButton());
@@ -658,7 +660,7 @@ describe('ConfirmDeleteDialog', () => {
       'radio:permanent',
       'checkbox',
       'Cancel',
-      'Delete permanently',
+      'Delete for good',
     ]);
   });
 

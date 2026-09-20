@@ -321,7 +321,7 @@ describe('mockActionRun', () => {
     expect(run([design.path]).outcome.freedBytes).toBe(design.size);
     expect(() => fixtureNode('Documents/Design/hero-assets.psd')).toThrow('unknown fixture path');
     expect(fixtureNodeView(psd.id).path).not.toBe(psd.path);
-    // The captured nodes are the old arena's: `removeSubtree` shrank them before the
+    // The captured nodes are the old arena's: the splice shrank them before the
     // renumbering copied what was left, so their sizes are right and their ids are not.
     expect(documents.children).toEqual([thesis.id]);
     expect(documents.size).toBe(thesis.size);

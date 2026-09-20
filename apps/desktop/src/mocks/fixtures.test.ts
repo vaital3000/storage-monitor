@@ -8,10 +8,37 @@ import {
   fixtureNodeView,
   fixtureNodes,
   fixtureStatusDone,
+  patchTree,
   previousSizes,
 } from './fixtures';
 
 const GB = 1e9;
+
+/**
+ * How `Tree::flatten` numbers an arena: every id is its own slot, a node's children hold a
+ * contiguous range, and siblings come largest first with ties by name. Also each child's
+ * `parent`, which is the other field the numbering writes.
+ *
+ * A function rather than a test, because the arena is numbered twice — once when the
+ * fixture is built and again by `renumberTree` after a batch — and only the first of those
+ * used to be checked. A renumbering that sorted by the wrong field would pass every
+ * deletion test in the suite while quietly handing the oracle an order the backend would
+ * never produce.
+ */
+function expectArenaNumbering(): void {
+  for (const node of fixtureNodes) {
+    expect(fixtureNodes[node.id]).toBe(node);
+    for (let i = 0; i < node.children.length; i += 1) {
+      const child = fixtureNodes[node.children[i]];
+      expect(child.parent).toBe(node.id);
+      if (i === 0) continue;
+      expect(node.children[i]).toBe(node.children[i - 1] + 1);
+      const before = fixtureNodes[node.children[i - 1]];
+      expect(before.size >= child.size).toBe(true);
+      if (before.size === child.size) expect(before.name < child.name).toBe(true);
+    }
+  }
+}
 
 describe('fixture tree', () => {
   it('is a home folder of about 60 nodes and about 180 GB', () => {
@@ -25,18 +52,40 @@ describe('fixture tree', () => {
   });
 
   it('numbers nodes breadth first with contiguous, size-sorted sibling ranges', () => {
-    for (const node of fixtureNodes) {
-      expect(fixtureNodes[node.id]).toBe(node);
-      for (let i = 1; i < node.children.length; i += 1) {
-        expect(node.children[i]).toBe(node.children[i - 1] + 1);
-        const [before, after] = [
-          fixtureNodes[node.children[i - 1]],
-          fixtureNodes[node.children[i]],
-        ];
-        expect(before.size >= after.size).toBe(true);
-        if (before.size === after.size) expect(before.name < after.name).toBe(true);
-      }
-    }
+    expectArenaNumbering();
+  });
+
+  it('numbers them the same way again after a batch has patched it', () => {
+    const movies = fixtureNode('Movies');
+    const under = (node: { path: string }) =>
+      node.path === movies.path || node.path.startsWith(`${movies.path}/`);
+    const [before, subtree] = [fixtureNodes.length, fixtureNodes.filter(under).length];
+    const pictures = fixtureNode('Pictures').id;
+
+    patchTree([movies], true);
+
+    // The batch really did move the numbering, so the invariants below are being checked
+    // over a second arena rather than over the one the fixture was built with: Pictures
+    // sat behind Movies in the root's list and has taken its number.
+    expect(fixtureNodes.length).toBe(before - subtree);
+    expect(fixtureNodes.some(under)).toBe(false);
+    expect(fixtureNode('Pictures').id).toBe(pictures - 1);
+    expectArenaNumbering();
+  });
+
+  it('rebuilds the arena for a batch that removed nothing but touched something', () => {
+    // `touched` covers the entries that **failed** as well as the ones that went. In the
+    // app a failure leaves a subtree it cannot describe, so it rescans that path and
+    // rebuilds the arena around whatever is left; here there is no half-deleted state to
+    // find, so the shape and the numbering come back identical — measured, and the reason
+    // this test asserts the identities rather than the ids. What it pins is that the arm
+    // reaches the fixture at all, and that it leaves a well-formed arena behind.
+    const before = fixtureNodes;
+    patchTree([], true);
+    expect(fixtureNodes.map((node) => node.path)).toEqual(before.map((node) => node.path));
+    expect(fixtureNodes.map((node) => node.id)).toEqual(before.map((node) => node.id));
+    expect(fixtureNodes[0]).not.toBe(before[0]);
+    expectArenaNumbering();
   });
 
   it('keeps directory totals equal to the sum of their children', () => {
@@ -52,7 +101,6 @@ describe('fixture tree', () => {
         expect(node.fileCount).toBe(1);
       }
       for (const child of children) {
-        expect(child.parent).toBe(node.id);
         expect(child.path).toBe(`${node.path}/${child.name}`);
       }
     }

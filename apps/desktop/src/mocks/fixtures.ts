@@ -6,10 +6,10 @@
 // This file is the tree and nothing else. `actions.ts` mirrors the guards and the engine
 // over it, and `actionLog.ts` mirrors the record of what they did.
 //
-// The tree is mutable from `removeSubtree` down: a batch takes rows out of it and then
-// `renumberTree` hands out new ids over what is left, exactly as a deletion followed by
-// `ScanManager::patch_paths` and `install_patches` does in the app. `resetFixtureTree` puts
-// the whole tree back, and `resetMockActions` calls it between tests.
+// The tree is mutable through `patchTree` and nowhere else: a batch takes rows out of it
+// and then every id is handed out again over what is left, exactly as a deletion followed
+// by `ScanManager::patch_paths` and `install_patches` does in the app. `resetFixtureTree`
+// puts the whole tree back, and `resetMockActions` calls it between tests.
 
 import type { Crumb, Delta, DiskUsage, NodeId, NodeKind, NodeView, ScanStatus } from '../lib/ipc';
 
@@ -432,8 +432,11 @@ export function parentOf(node: FixtureNode): FixtureNode | undefined {
  *
  * The arithmetic stands in for the rescan the manager really does. In the fixture the two
  * agree, because nothing else can have changed on a disk that is this array.
+ *
+ * Not exported: on its own it leaves the arena holding nodes that are gone, and
+ * `fixtureStatusDone` counts directories over that arena. `patchTree` is the way in.
  */
-export function removeSubtree(node: FixtureNode): void {
+function removeSubtree(node: FixtureNode): void {
   const parent = parentOf(node);
   if (parent !== undefined) {
     parent.children.splice(parent.children.indexOf(node.id), 1);
@@ -457,13 +460,12 @@ export function removeSubtree(node: FixtureNode): void {
  * what `install_patches` does to the arena, and `replace_subtrees` to every sibling group
  * holding a node whose size changed.
  *
- * Once per batch that touched anything, never per entry, because the splice is one. Every
- * id the caller was holding now means a different node, or nothing; the nodes themselves
- * are new objects, so a reference taken before this is a snapshot of the old arena and not
- * a window onto the new one. Both of those are the app's own behaviour, and until the
- * fixture did this no UI test could see either.
+ * Every id the caller was holding now means a different node, or nothing; the nodes
+ * themselves are new objects, so a reference taken before this is a snapshot of the old
+ * arena and not a window onto the new one. Both of those are the app's own behaviour, and
+ * until the fixture did this no UI test could see either.
  */
-export function renumberTree(): void {
+function renumberTree(): void {
   const old = fixtureNodes;
   const nodes: FixtureNode[] = [];
   const pending: Array<{ id: NodeId; children: readonly NodeId[] }> = [];
@@ -482,6 +484,29 @@ export function renumberTree(): void {
   }
   fixtureNodes = nodes;
   byPath = new Map(nodes.map((node) => [node.path, node]));
+}
+
+/**
+ * The splice, as `ScanManager::patch_paths` and `install_patches` do it together: the
+ * subtrees in `gone` leave the tree, and then every id is handed out again over what is
+ * left. The only way to change this tree, so that the two halves cannot come apart — the
+ * arena is left holding nodes that no longer exist if the second one is skipped, and
+ * `fixtureStatusDone` counts its directories.
+ *
+ * `touched` is not `gone.length > 0`, and that is the whole reason it is a parameter. The
+ * app splices for every path in `touched` — every entry **removed or failed** — and a
+ * failed entry is still on disk: its subtree is rescanned rather than dropped, and the
+ * arena is rebuilt all the same. So a batch that only failed removes no node and moves
+ * every id. `ExplorerPage`'s `afterBatch` reads the same two verdicts to decide whether to
+ * re-anchor, and these two have to agree.
+ */
+export function patchTree(gone: readonly FixtureNode[], touched: boolean): void {
+  for (const node of gone) {
+    removeSubtree(node);
+  }
+  if (touched) {
+    renumberTree();
+  }
 }
 
 /** Every node back as the fixture was built. Half of `resetMockActions`. */

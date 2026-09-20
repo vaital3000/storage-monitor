@@ -20,8 +20,7 @@ import {
   FIXTURE_ROOT,
   type FixtureNode,
   fixtureEntry,
-  removeSubtree,
-  renumberTree,
+  patchTree,
   resetFixtureTree,
 } from './fixtures';
 import { appendToLog, resetActionLog } from './actionLog';
@@ -262,6 +261,13 @@ export function mockActionRun(
   // One instant for the whole batch, read before the first deletion.
   const at = new Date().toISOString();
   const entries: EntryOutcome[] = [];
+  /**
+   * What the splice takes out, collected rather than removed as we go. The ready entries
+   * of a batch are pairwise disjoint and free of duplicates — `dropNested` says so, and
+   * `guard-cases.json` pins it on both sides — so nothing in this loop can depend on an
+   * earlier entry having already left the tree.
+   */
+  const gone: FixtureNode[] = [];
   let freedBytes = 0;
   for (const entry of preview.entries) {
     if (entry.status.state === 'blocked') {
@@ -279,20 +285,24 @@ export function mockActionRun(
       entries.push({ path: entry.path, kind: entry.kind, result });
       continue;
     }
-    removeSubtree(node);
+    gone.push(node);
     freedBytes += entry.size;
     // The size the plan carried and the dialog promised, never a re-read of a subtree that
     // is no longer there.
     const result = { result: 'removed', bytes: entry.size } as const;
     entries.push({ path: entry.path, kind: entry.kind, result });
   }
-  // `touched` in `actions.rs`: the paths of everything removed or failed, and the splice
-  // runs only if there is one. Nothing here can fail, so removing something is the whole
-  // of it — and one renumbering for the batch, not one per entry, because the splice is
-  // one. From here on every id the caller was holding names another node, or nothing.
-  if (entries.some((entry) => entry.result.result === 'removed')) {
-    renumberTree();
-  }
+  // `touched` in `actions.rs`: everything **removed or failed**, and the splice runs only
+  // if there is one. The second verdict is unreachable from here — the mock has no port
+  // that can refuse a deletion — and it is in the predicate anyway, because the day a
+  // failure arm lands the oracle must splice for it rather than quietly stop. It is the
+  // predicate `ExplorerPage`'s `afterBatch` uses to decide whether to re-anchor, and the
+  // two have to agree. One splice for the batch, from here on every id the caller was
+  // holding names another node, or nothing.
+  const touched = entries.some(
+    (entry) => entry.result.result === 'removed' || entry.result.result === 'failed',
+  );
+  patchTree(gone, touched);
   const outcome: Outcome = { entries, freedBytes, at, mode };
   appendToLog(outcome);
   return { outcome, recorded: true, treeStale: false };
