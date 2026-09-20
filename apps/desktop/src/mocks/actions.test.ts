@@ -297,11 +297,20 @@ describe('mockActionRun', () => {
     expect(() => fixtureNode('Movies/family-2025.mov')).toThrow(
       'unknown fixture path /Users/demo/Movies/family-2025.mov',
     );
-    expect(fixtureNodeView(movies.id).children.map((child) => child.name)).toEqual([
+    // Through the path, because `movies.id` is no longer the id of this directory: the
+    // batch renumbered the arena. The two assertions below are about that.
+    const moved = fixtureNode('Movies');
+    expect(fixtureNodeView(moved.id).children.map((child) => child.name)).toEqual([
       'screen-recording.mp4',
     ]);
-    expect(fixtureNodeView(movies.id).childrenTotal).toBe(1);
-    expect(() => fixtureNodeView(film.id)).toThrow(`unknown node ${film.id}`);
+    expect(fixtureNodeView(moved.id).childrenTotal).toBe(1);
+    // Movies lost 18.9 GB of 22.2 and sank past four siblings, so its own id moved too.
+    expect(moved.id).not.toBe(movies.id);
+    // And the ids the caller was holding do not throw, which is the hazard and not an
+    // oversight: the slot a deleted node had is somebody else's now, and asking again with
+    // it answers about a directory nobody asked about.
+    expect(fixtureNodeView(movies.id).path).not.toBe(movies.path);
+    expect(fixtureNodeView(film.id).path).not.toBe(film.path);
   });
 
   it('takes the whole subtree with a directory', () => {
@@ -311,11 +320,16 @@ describe('mockActionRun', () => {
     const thesis = fixtureNode('Documents/thesis.docx');
     expect(run([design.path]).outcome.freedBytes).toBe(design.size);
     expect(() => fixtureNode('Documents/Design/hero-assets.psd')).toThrow('unknown fixture path');
-    expect(() => fixtureNodeView(psd.id)).toThrow(`unknown node ${psd.id}`);
+    expect(fixtureNodeView(psd.id).path).not.toBe(psd.path);
+    // The captured nodes are the old arena's: `removeSubtree` shrank them before the
+    // renumbering copied what was left, so their sizes are right and their ids are not.
     expect(documents.children).toEqual([thesis.id]);
     expect(documents.size).toBe(thesis.size);
     expect(documents.logicalSize).toBe(thesis.logicalSize);
     expect(documents.fileCount).toBe(1);
+    // Gone from the arena, not left in it as a hole: the ids that follow close up.
+    expect(fixtureNodes.map((node) => node.path)).not.toContain(psd.path);
+    expect(fixtureNodes.map((node) => node.id)).toEqual(fixtureNodes.map((_, id) => id));
   });
 
   it('skips every blocked entry with the reason the preview gave, and keeps it in place', () => {
@@ -344,7 +358,9 @@ describe('mockActionRun', () => {
     ]);
     expect(result.outcome.freedBytes).toBe(movies.size);
     expect(() => fixtureNode('Movies')).toThrow('unknown fixture path');
-    expect(fixtureNodes[0].children).not.toContain(movies.id);
+    // By path: every id in the root's list is a new one, and one of them is the number
+    // Movies used to have.
+    expect(fixtureNodes[0].children.map((id) => fixtureNodes[id].name)).not.toContain('Movies');
   });
 
   it('runs a permanent batch the same way, and says so', () => {

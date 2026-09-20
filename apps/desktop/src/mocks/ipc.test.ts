@@ -256,7 +256,9 @@ describe('resetIpcMock', () => {
 
     resetIpcMock();
 
-    expect(fixtureNode('Movies')).toBe(movies);
+    // Equal and not the same object: a reset hands out a fresh copy of the tree the walker
+    // left, because the batch above renumbered the arena rather than editing it in place.
+    expect(fixtureNode('Movies')).toEqual(movies);
     expect(await activityLog()).toEqual({ entries: [], damaged: 0 });
     expect(fixtureNodes[0].size).toBe(fixtureStatusDone().bytes);
   });

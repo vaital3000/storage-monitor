@@ -13,13 +13,19 @@ function bridge(): { invoke: RawInvoke } {
   return internals as { invoke: RawInvoke };
 }
 
-/** Routes every command through `wrap`; `original()` runs the handler underneath. */
+/**
+ * Routes every command through `wrap`; `original()` runs the handler underneath.
+ *
+ * `args` is the body the command was called with — `{ id, limit }` for `tree_node`,
+ * `{ paths, mode }` for the two action commands. Handed over because the name alone cannot
+ * answer *which* node the page asked for, and that is the whole of what a re-anchor does.
+ */
 export function wrapInvoke(
-  wrap: (cmd: string, original: () => Promise<unknown>) => Promise<unknown>,
+  wrap: (cmd: string, original: () => Promise<unknown>, args: unknown) => Promise<unknown>,
 ): void {
   const internals = bridge();
   const inner = internals.invoke;
-  internals.invoke = (cmd, args, options) => wrap(cmd, () => inner(cmd, args, options));
+  internals.invoke = (cmd, args, options) => wrap(cmd, () => inner(cmd, args, options), args);
 }
 
 /**

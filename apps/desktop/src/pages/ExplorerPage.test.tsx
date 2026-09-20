@@ -488,6 +488,23 @@ describe('ExplorerPage deleting the selection', () => {
       .map((entry) => entry.textContent ?? '');
   }
 
+  /**
+   * The `id` every `tree_node` from now on asks for, in order. Which id the page asks for
+   * is the whole of the re-anchor — the crumbs only say where it ended up — and it is
+   * readable at all because `wrapInvoke` hands the wrapper the arguments as well as the
+   * command.
+   */
+  function treeNodeIds(): Array<number | undefined> {
+    const ids: Array<number | undefined> = [];
+    wrapInvoke((cmd, original, args) => {
+      if (cmd === 'tree_node') {
+        ids.push((args as { id: number | undefined }).id);
+      }
+      return original();
+    });
+    return ids;
+  }
+
   /** Two clicks React cannot re-render between, which is what a state guard would miss. */
   function clickTwice(button: HTMLElement): void {
     act(() => {
@@ -1062,6 +1079,57 @@ describe('ExplorerPage deleting the selection', () => {
     // root is the one id a splice cannot move.
     await waitFor(() => expect(crumbs()).toEqual(['demo']));
     expect(names()).toContain('Downloads');
+  });
+
+  it('asks for the root by number once a batch has patched, not for a name', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').id;
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+    const ids = treeNodeIds();
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    await settle();
+
+    // The crumbs say where the page ended up; this says what it asked for on the way, and
+    // the root — `ROOT_ID`, the one id a splice cannot move — is the last of them.
+    //
+    // The first is the directory it was leaving, and that is `invalidateQueries`: it
+    // refetches whatever is being observed at that instant, and at that instant React has
+    // not re-rendered with the re-anchored id yet. A wasted round trip rather than a
+    // hazard — the splice is installed before `action_run` answers, so the reply describes
+    // the new arena — but it is why the first id here is not 0. `refetchType: 'none'`
+    // would drop it and leave the re-anchor to fetch; this pins today's behaviour so that
+    // a change to it is a decision rather than a surprise.
+    expect(ids).toEqual([downloads, 0]);
+  });
+
+  it('never renders the directory the id it was holding names afterwards', async () => {
+    await scanned();
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    const movies = fixtureNode('Movies');
+    const dialog = await ask(['family-2025.mov'], 'Move to Trash');
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    await settle();
+
+    // Movies lost 18.9 GB of its 22.2 and sank past its siblings, so the arena the mock
+    // rebuilt hands its old number to somebody else — which is what the app's own splice
+    // does, and what no test could see while the fixture kept its ids for ever.
+    const stranger = fixtureNodeView(movies.id);
+    expect(stranger.path).not.toBe(movies.path);
+    // The rows on screen are the root's, and not that stranger's. Both halves matter: the
+    // first alone passes for a page that never navigated anywhere.
+    expect(names()).toEqual(fixtureNodeView(0).children.map((child) => child.name));
+    expect(names()).not.toEqual(stranger.children.map((child) => child.name));
   });
 
   it('stays where it is when the batch removed nothing', async () => {

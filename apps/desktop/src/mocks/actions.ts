@@ -21,6 +21,7 @@ import {
   type FixtureNode,
   fixtureEntry,
   removeSubtree,
+  renumberTree,
   resetFixtureTree,
 } from './fixtures';
 import { appendToLog, resetActionLog } from './actionLog';
@@ -284,6 +285,13 @@ export function mockActionRun(
     // is no longer there.
     const result = { result: 'removed', bytes: entry.size } as const;
     entries.push({ path: entry.path, kind: entry.kind, result });
+  }
+  // `touched` in `actions.rs`: the paths of everything removed or failed, and the splice
+  // runs only if there is one. Nothing here can fail, so removing something is the whole
+  // of it — and one renumbering for the batch, not one per entry, because the splice is
+  // one. From here on every id the caller was holding names another node, or nothing.
+  if (entries.some((entry) => entry.result.result === 'removed')) {
+    renumberTree();
   }
   const outcome: Outcome = { entries, freedBytes, at, mode };
   appendToLog(outcome);
