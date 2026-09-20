@@ -61,7 +61,9 @@ function rowFor(path: string): HTMLElement {
 }
 
 function paths(): string[] {
-  return rows().map((row) => cells(row)[1].textContent ?? '');
+  // The path line only. The detail of a failed or skipped entry sits under it in the same
+  // cell, so the cell's own text is the two of them run together.
+  return rows().map((row) => cells(row)[1].firstElementChild?.textContent ?? '');
 }
 
 /** Waits for the record to arrive: every test here starts with the query in flight. */
