@@ -72,6 +72,39 @@ them, so a directory the user navigates back to renders old ids for one round
 trip. Nothing can be deleted wrongly — a batch carries absolute paths, not ids —
 but a click in that window is door 4 one hop removed.
 
+Two facts of the tree are not recomputed by a splice, and both of them show.
+
+**Hard-link attribution is redone inside the patch and nowhere else**, so it
+drifts in _both_ directions. `attribute_hard_links` runs once per walk, over the
+links that walk collected, and gives the bytes to the smallest path among them;
+a patch is its own walk over its own path. Delete the path that owned the bytes
+of a hard-linked file and its twins elsewhere in the tree keep reporting 0 until
+the next full scan — they are outside the patch, and nothing revisits them.
+Delete beside a surviving link whose winner lives outside the patch and the
+opposite happens: inside the rescan that link is the only one of its inode, so
+it takes the full size back, its ancestors count those bytes twice, and the home
+total _grows_ after a deletion — wrong in the app's primary metric. Measured on
+two directories sharing one inode: a full scan gives `a 8192, b 0`, and
+rescanning `b` gives `b 8192`. A pnpm store hard-links into every
+`node_modules`, so this is not exotic. Avoiding it means carrying the whole
+tree's `(dev, ino)` set — 3.7 M entries for a rare case — which is the trade the
+design rejected. The next full scan puts both directions right.
+
+**The snapshot is not rewritten, so the deltas keep measuring from before the
+deletion.** `install_patches` replaces the tree and touches nothing else: a
+batch writes no snapshot, and `previous_sizes` — the index every
+`ChildView.delta` is measured against — stays the one the last full scan
+loaded. So the Δ column subtracts a pre-deletion snapshot from a post-deletion
+tree as soon as the batch lands, and the next full scan, which does write a
+snapshot, still compares against the one taken before the deletion: the freed
+bytes read as a shrink there too. `top_growers` keeps only positive deltas, so
+the growers list says nothing about a deletion at all. That is the intended
+reading rather than a defect — a deletion is negative growth, honestly reported
+— and a patched snapshot would be worse: a snapshot is what the volume was at a
+point in time, and rewriting one records a measurement that never happened. The
+one figure that is re-read after every batch is `disk_usage`, because Permanent
+mode really does change the free space.
+
 Rebuilding is fast enough to be uninteresting: sorting every sibling group
 instead of only the changed ones is also correct and measured at 96-105 ms over
 3.7 M nodes either way. The optimisation is an optimisation, not a rule.

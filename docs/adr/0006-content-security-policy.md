@@ -84,7 +84,11 @@ applied, the scan ran.
 
 **What the guard test does and does not prove.** It proves the line is still
 there and still closed. It cannot prove the app runs under it, because nothing
-automated launches the app. The Playwright suite is the nearest available
+automated launches the app. Nor is the line quite the header: the built app
+serves these ten directives plus a `sha256-` source Tauri adds to `script-src`
+for the one inline script of the built `index.html` — measured on that run — so
+what this test and the e2e server hold is the policy as authored, which is the
+only part anyone here decides. The Playwright suite is the nearest available
 substitute: its mock server reads this same policy out of `tauri.conf.json` and
 serves it on port 1430, so the served header cannot drift from the shipped one,
 and every spec runs under it. That substitute is weaker than it looks — the
