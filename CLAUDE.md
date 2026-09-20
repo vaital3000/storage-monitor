@@ -15,12 +15,16 @@ modules for developer artifacts. The full design is in
 crates/core/              Rust library: all logic lives here (scanner, snapshots, modules, actions)
   src/scan/               parallel walker (walker.rs), arena tree (tree.rs), live counters (progress.rs)
   src/snapshot/           persisted snapshots: model.rs (format), store.rs (files), delta.rs (growers)
+  src/action/             deleting: model.rs (Plan to Outcome), guards.rs (Limits::check),
+                          engine.rs (preview, execute), log.rs (the actions.jsonl record)
+  src/system/             the System port: every deletion and the clock (real.rs, test.rs)
   src/disk.rs             volume usage through statvfs
-  src/paths.rs            data dir (STORAGE_MONITOR_DATA_DIR), snapshots dir, home dir
+  src/paths.rs            data dir (STORAGE_MONITOR_DATA_DIR), snapshots dir, actions log, home dir
 crates/modules/<id>/      One crate per cleanup module (from phase 3 on)
 crates/cli/               `storage-monitor` binary, thin wrapper over core, JSON output
 apps/desktop/src-tauri/   Tauri commands and app state, thin wrapper over core
   src/scan_manager.rs     the one scan per window: worker thread, progress events, snapshot
+  src/actions.rs          a batch end to end: re-plan, execute, record, patch the tree
   src/views.rs            camelCase payloads that cross IPC (ScanStatus, NodeView)
   src/commands.rs         Tauri commands over the manager and core
 apps/desktop/src/         React UI. Backend calls only through src/lib/ipc.ts
@@ -28,7 +32,8 @@ apps/desktop/src/         React UI. Backend calls only through src/lib/ipc.ts
                           blockReasons.ts (a guard verdict in words), pages.ts
   hooks/                  useScan: the scan state machine fed by scan:progress and scan:done
   pages/                  ExplorerPage, ActivityPage and the placeholder of the later phases
-  components/             app shell, NodeTable, Treemap (ECharts), Breadcrumbs, ScanProgress
+  components/             app shell, NodeTable, Treemap (ECharts), Breadcrumbs, ScanProgress,
+                          ConfirmDeleteDialog (the one door to a deletion)
   mocks/                  IPC mock and the /Users/demo fixture (unit tests, e2e, `just dev-web`)
     ipc.ts                the commands; fixtures.ts the scanned tree
     actions.ts            mirrors core's action/{guards,engine}.rs; actionLog.ts its log.rs
@@ -78,6 +83,21 @@ desktop app saves a snapshot after every completed scan, the CLI on `scan --save
 both use the same store. Cancelled scans are not persisted. Format details:
 `docs/adr/0004-snapshot-format.md`.
 
+Deletions are recorded in `actions.jsonl`, beside `snapshots/` in the same data
+dir (so `STORAGE_MONITOR_DATA_DIR` moves it too): one JSON object per line, one
+line per entry of a batch, newest at the end. The file is created `0o600` —
+it names every path the user has ever deleted — and only on creation, so a mode
+someone set by hand is kept. A batch is one append: all its lines in a single
+`write_all` into an `O_APPEND` handle, so two writers cannot interleave, and a
+batch with no entries writes nothing at all. `Ok` from `ActionLog::append` means
+the bytes reached the volume (`sync_all`); `Err` means the caller has deleted
+something it has not recorded, which is why `action_run` reports it instead of
+swallowing it. A write cut short costs its own line and nothing more:
+`ActionLog::tail` counts it in `damaged` rather than failing the read, and the
+next `append` starts a fresh line. Unlike snapshots, which are pruned to ten,
+**nothing prunes this file** — it is the record, and it grows by one line per
+entry the app was asked to delete; `tail` reads all of it to return the end.
+
 ## Workflow
 
 - Never commit to `main`. Branch, open a PR, wait for green CI, squash-merge.
@@ -125,6 +145,17 @@ both use the same store. Cancelled scans are not persisted. Format details:
   (`formatBytes` in the UI, `human_bytes` in the CLI).
 - Hard-linked data is attributed to the lexicographically smallest path; the
   other links report 0 bytes.
+- Deleting goes through the `System` port (`crates/core/src/system/`), never
+  through `std::fs`: `move_to_trash`, `remove`, `symlink_metadata` and the clock
+  are all on it, so tests run against `TestSystem` — a temp tree, a Trash that is
+  another folder, a clock a test moves — on any platform, and a deletion outside
+  that tree panics instead of wiping a developer's `$HOME`. The port takes
+  absolute paths in normal form only and refuses anything else untouched, because
+  the kernel reads the path as written: `remove("/a/b/..")` empties `/a/b` and
+  `remove("/a/link/")` deletes what the link points at. Two things under
+  `action/` do reach `std::fs` on purpose, and neither deletes: `ActionLog`
+  writes the record, and `guards::judged_form` resolves a path to decide the
+  verdict on it.
 - CLI output: write through a locked `stdout` and treat `BrokenPipe` as a
   quiet exit, so `storage-monitor ... --json | head` never panics.
 - The Content Security Policy in `tauri.conf.json` stays closed: no

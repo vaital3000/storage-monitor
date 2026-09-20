@@ -10,8 +10,8 @@ Most analyzers answer "where is the space". Storage Monitor answers "what can I
 free right now, and why", with a preview and a confirmation before anything is
 touched. Deletion goes to the Trash by default.
 
-> Status: pre-alpha. Phase 1 done: the scanner, snapshots with growth deltas
-> and the Explorer screen; cleanup modules are next. See the
+> Status: pre-alpha. The scanner, snapshots with growth deltas, the Explorer and
+> deletion from it are done; cleanup modules are next. See the
 > [roadmap](docs/plans/2026-09-17-storage-monitor-design.md#14-roadmap).
 
 ## What it does today
@@ -27,12 +27,27 @@ touched. Deletion goes to the Trash by default.
   reported with a lock, not silently skipped; a mount point is shown, not
   entered.
 - Reveal in Finder from any row.
+- Delete from the Explorer: tick rows (click, Space, Shift for a range) and a
+  dialog previews the batch before anything is touched — every row with what
+  will happen to it, and a reason for every row that is refused. The scan root,
+  `~/Library` and the other denylisted paths, anything outside the scanned root
+  and a path already covered by another are blocked there, not attempted.
+- Two modes. **Move to the Trash** is the default and is recoverable; **Delete
+  for good** is permanent and waits for an explicit "I understand that this
+  cannot be undone" that a change of mode clears again.
+- The tree is patched after a batch instead of rescanned, so the rows go, the
+  parents shrink and the free space is re-read in a moment rather than in
+  another full scan.
+- Activity screen: what the app deleted, newest first — when, path, mode, result
+  and size — from an append-only record that nothing prunes.
 - A snapshot per scan, so the next scan shows what grew.
 - A CLI with the same scanner and JSON output for scripts.
 
-## Screenshot
+## Screenshots
 
 ![The Explorer: treemap and table of a home folder with growth since the previous scan](docs/images/explorer.png)
+
+![The Activity screen: what was deleted, newest first, with mode, result and size](docs/images/activity.png)
 
 ## CLI
 
