@@ -92,6 +92,28 @@ async function scanned(): Promise<void> {
   await screen.findByRole('table');
 }
 
+/**
+ * Clicks Rescan and waits for the table the new scan brings. `meanwhile` runs between the
+ * two, for a test that needs something to land while the walk is still going.
+ *
+ * What it waits for is deliberately *not* "a table is on screen". `useScan`'s `start` awaits
+ * the backend, so the finished scan's table is still mounted when the click returns, and a
+ * wait any table satisfies is over before the rescan has even begun — leaving everything
+ * after it racing the thing it was written to wait for. That is not a hypothetical: it is how
+ * the one flaky test in this file reached CI, where the assertions met the *Loading…* of the
+ * new tree, in which the selection bar does not exist at all. It passed everywhere else only
+ * because a 20 ms `settle()` happened to be longer than a whole simulated rescan.
+ *
+ * The page unmounts the view while the new tree loads, so the table that comes back is a
+ * different element — and that, not its presence, is what says the rescan landed.
+ */
+async function rescanned(meanwhile?: () => unknown): Promise<void> {
+  const replaced = screen.getByTestId('node-rows');
+  fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+  await meanwhile?.();
+  await waitFor(() => expect(screen.getByTestId('node-rows')).not.toBe(replaced));
+}
+
 describe('ExplorerPage before a scan', () => {
   it('shows the default root, the Scan button and the Full Disk Access note', async () => {
     renderWithClient(<ExplorerPage />);
@@ -734,8 +756,7 @@ describe('ExplorerPage deleting the selection', () => {
     fireEvent.click(box('Downloads'));
     expect(barShows()).toBe(true);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
-    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    await rescanned();
     // A `NodeId` means nothing across a scan: the row that takes id 6 in the new tree is not
     // the row that was ticked in the old one.
     await waitFor(() => expect(box('Downloads')).not.toBeChecked());
@@ -911,9 +932,7 @@ describe('ExplorerPage deleting the selection', () => {
     // Nothing is modal yet, and Rescan is right there in the header — a user who ticked a
     // folder and thought better of it can reach it. The preview lands while the walk is
     // still going, so no navigation and no generation has moved when the reply arrives.
-    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
-    release();
-    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    await rescanned(release);
     await settle();
 
     // A modal nobody asked for, over a tree with nothing ticked, whose button would move
@@ -955,11 +974,9 @@ describe('ExplorerPage deleting the selection', () => {
     fireEvent.click(box('Downloads'));
     fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
 
-    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
     // One plain macrotask before `waitFor` takes over: inside its `act` scope the reply
     // held above never settles, and the simulated scan's own timers never get a turn.
-    await settle();
-    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    await rescanned(settle);
     fireEvent.click(box('Downloads'));
     fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
 
