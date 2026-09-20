@@ -116,7 +116,7 @@ both use the same store. Cancelled scans are not persisted. Format details:
   The Activity query (`['activity']`) is the one deliberate exception — `staleTime: 0`,
   so every open re-reads the action log — and nothing invalidates it after a batch,
   because the shell renders one page at a time and that screen is unmounted whenever a
-  deletion runs. A screen that deletes *while* Activity is mounted is what would change
+  deletion runs. A screen that deletes _while_ Activity is mounted is what would change
   that; `ExplorerPage`'s `afterBatch` and the page's own `useQuery` both say so.
 - `StatusEmitter::emit` runs while the manager lock is held: an implementation
   must never call back into `ScanManager`.
