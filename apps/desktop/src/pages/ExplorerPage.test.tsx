@@ -1,7 +1,9 @@
+import { emit } from '@tauri-apps/api/event';
 import { mockIPC } from '@tauri-apps/api/mocks';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
+import { SCAN_DONE_EVENT, type BatchResult } from '../lib/ipc';
 import {
   DIFFERENT_VOLUME,
   FIXTURE_ROOT,
@@ -14,7 +16,7 @@ import {
 } from '../mocks/fixtures';
 import { installIpcMock, revealed, setMockScanDelay } from '../mocks/ipc';
 import { charts, lastChart } from '../test/echarts';
-import { holdReply, replyOnce } from '../test/invoke';
+import { holdReply, recordCommands, replyOnce, wrapInvoke } from '../test/invoke';
 import { renderWithClient } from '../test/render';
 import ExplorerPage from './ExplorerPage';
 
@@ -40,8 +42,20 @@ function rows(): HTMLElement[] {
   return within(screen.getByTestId('node-rows')).getAllByRole('row');
 }
 
+/**
+ * The cells of a row that hold data, numbered from the name: name, size, %, Δ, files,
+ * modified, actions. The checkbox the page hands the table sits in front of them, so the
+ * numbering is taken from the end — where it stays put whether or not a column is added in
+ * front of it.
+ */
+const DATA_CELLS = 7;
+
+function cellsOf(row: HTMLElement): HTMLElement[] {
+  return within(row).getAllByRole('cell').slice(-DATA_CELLS);
+}
+
 function nameOf(row: HTMLElement): string {
-  return within(row).getAllByRole('cell')[0].textContent ?? '';
+  return cellsOf(row)[0].textContent ?? '';
 }
 
 function names(): string[] {
@@ -57,7 +71,12 @@ function row(name: string): HTMLElement {
 }
 
 function cells(name: string): HTMLElement[] {
-  return within(row(name)).getAllByRole('cell');
+  return cellsOf(row(name));
+}
+
+/** The tick box of a row, by the label the table gives it. */
+function box(name: string): HTMLElement {
+  return within(row(name)).getByRole('checkbox');
 }
 
 function crumbs(): string[] {
@@ -432,5 +451,780 @@ describe('ExplorerPage after a scan', () => {
     release();
     await waitFor(() => expect(crumbs()).toEqual(['demo']));
     expect(names()[0]).toBe('Library');
+  });
+});
+
+describe('ExplorerPage deleting the selection', () => {
+  /**
+   * The action bar, which is in the layout whether or not it has anything to say: the first
+   * tick must not move the rows under the pointer. `aria-hidden` is how it says which.
+   */
+  function bar(): HTMLElement {
+    return screen.getByTestId('selection-bar');
+  }
+
+  function barShows(): boolean {
+    return bar().getAttribute('aria-hidden') === null;
+  }
+
+  /** Ticks every row of `rows` and opens the dialog from one of the bar's two buttons. */
+  async function ask(rows: string[], button: string): Promise<HTMLElement> {
+    for (const name of rows) {
+      fireEvent.click(box(name));
+    }
+    fireEvent.click(screen.getByRole('button', { name: button }));
+    return screen.findByRole('dialog');
+  }
+
+  /** The dialog's confirming button, which is not the bar's button of the same name. */
+  function confirmButton(dialog: HTMLElement): HTMLElement {
+    return within(dialog).getByTestId('confirm-delete');
+  }
+
+  /** The paths listed in the dialog, in the order it shows them. */
+  function listed(dialog: HTMLElement): string[] {
+    return within(within(dialog).getByTestId('delete-entries'))
+      .getAllByTitle(new RegExp(`^${FIXTURE_ROOT}`))
+      .map((entry) => entry.textContent ?? '');
+  }
+
+  /**
+   * The `id` every `tree_node` from now on asks for, in order. Which id the page asks for
+   * is the whole of the re-anchor — the crumbs only say where it ended up — and it is
+   * readable at all because `wrapInvoke` hands the wrapper the arguments as well as the
+   * command.
+   */
+  function treeNodeIds(): Array<number | undefined> {
+    const ids: Array<number | undefined> = [];
+    wrapInvoke((cmd, original, args) => {
+      if (cmd === 'tree_node') {
+        ids.push((args as { id: number | undefined }).id);
+      }
+      return original();
+    });
+    return ids;
+  }
+
+  /** Two clicks React cannot re-render between, which is what a state guard would miss. */
+  function clickTwice(button: HTMLElement): void {
+    act(() => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+  }
+
+  it('shows the count and the summed size of the ticked rows, and announces them', async () => {
+    await scanned();
+    // By role, because a live region is what it is: an element that says its content when
+    // the content changes. `data-testid` names it; `role` is what makes it work.
+    const announcement = screen.getByRole('status');
+    expect(announcement).toHaveAttribute('data-testid', 'selection-status');
+    expect(announcement.textContent).toBe('');
+    expect(barShows()).toBe(false);
+    // Hidden means hidden: a bar nobody can see holds no buttons anyone can reach, by any
+    // of the three ways there are to reach one — the accessibility tree, the tab order and
+    // a click through whatever is drawn over it.
+    expect(screen.queryByRole('button', { name: 'Move to Trash' })).not.toBeInTheDocument();
+    for (const button of within(bar()).getAllByRole('button', { hidden: true })) {
+      expect(button).toBeDisabled();
+    }
+    // And the one that matters to everyone else: it is not drawn. The class is the
+    // behaviour here, the way a variant's colour is — jsdom applies no stylesheet, so
+    // there is nothing else to ask.
+    expect(bar()).toHaveClass('invisible');
+
+    const total = fixtureNode('Downloads').size + fixtureNode('Movies').size;
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(box('Movies'));
+    expect(barShows()).toBe(true);
+    expect(bar()).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
+    // A row cannot carry `aria-selected` while the table is not a grid, so the count is what
+    // a screen reader hears when Space ticks a row — once, from the region that is always
+    // mounted, and not a second time from the words next to the buttons.
+    expect(announcement).toHaveTextContent(`2 items selected · ${formatBytes(total)}`);
+    expect(within(bar()).getByText(/selected/)).toHaveAttribute('aria-hidden', 'true');
+    // Named, because it is the only place in the app where a selection can be acted on —
+    // and a `group` rather than a `toolbar`, which would promise one tab stop and arrow
+    // keys between the controls that these three ordinary buttons do not give.
+    expect(bar()).toHaveAttribute('role', 'group');
+    expect(bar()).toHaveAccessibleName('Selection');
+    expect(within(bar()).getByRole('button', { name: 'Delete permanently' })).toHaveAttribute(
+      'data-variant',
+      'danger',
+    );
+
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(box('Movies'));
+    expect(barShows()).toBe(false);
+    expect(announcement.textContent).toBe('');
+  });
+
+  it('opens the dialog over exactly the ticked rows, in the Trash mode', async () => {
+    await scanned();
+    const total = fixtureNode('Downloads').size + fixtureNode('Movies').size;
+    const dialog = await ask(['Downloads', 'Movies'], 'Move to Trash');
+
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Downloads`, `${FIXTURE_ROOT}/Movies`]);
+    expect(within(dialog).getByTestId('delete-total')).toHaveTextContent(
+      `2 items · ${formatBytes(total)}`,
+    );
+    expect(within(dialog).getByRole('radio', { name: 'Trash' })).toBeChecked();
+    expect(confirmButton(dialog)).toBeEnabled();
+  });
+
+  it('opens in the Permanent mode from the danger button, still behind the tick', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Delete permanently');
+
+    expect(within(dialog).getByRole('radio', { name: 'Permanent' })).toBeChecked();
+    expect(within(dialog).getByTestId('mode-explanation')).toHaveTextContent('cannot be undone');
+    expect(confirmButton(dialog)).toBeDisabled();
+    // The two red buttons this screen now shows at once do not read alike. Asserted here
+    // because this is the only place both exist: the bar keeps "Delete permanently", which
+    // is the vocabulary of the mode, and the dialog's confirm says what it does.
+    expect(confirmButton(dialog)).toHaveTextContent('Delete for good');
+    expect(within(bar()).getByRole('button', { name: 'Delete permanently' })).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /I understand/ }));
+    expect(confirmButton(dialog)).toBeEnabled();
+  });
+
+  it('deletes the ticked rows, drops the selection and shrinks the header', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').size;
+    const scanned0 = fixtureStatusDone();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+
+    fireEvent.click(confirmButton(dialog));
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent(
+      `Moved 1 item to the Trash · ${formatBytes(downloads)}`,
+    );
+
+    await waitFor(() => expect(names()).not.toContain('Downloads'));
+    expect(barShows()).toBe(false);
+    await waitFor(() =>
+      expect(screen.getByTestId('scan-summary')).toHaveTextContent(
+        formatBytes(scanned0.bytes - downloads),
+      ),
+    );
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('runs the mode the dialog was switched to, not the one it was opened in', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').size;
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+
+    fireEvent.click(within(dialog).getByRole('radio', { name: 'Permanent' }));
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /I understand/ }));
+    fireEvent.click(confirmButton(dialog));
+
+    // The report reads `outcome.mode`, which is the mode `action_run` was called with — so
+    // this sentence is the one place the page's choice of mode can be seen from outside.
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent(
+      `Deleted 1 item · ${formatBytes(downloads)}`,
+    );
+    expect(within(dialog).queryByText(/Moved/)).not.toBeInTheDocument();
+  });
+
+  it('holds the dialog on the running batch until the report arrives', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const release = holdReply('action_run');
+
+    fireEvent.click(confirmButton(dialog));
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Moving to the Trash…');
+    expect(confirmButton(dialog)).toBeDisabled();
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeDisabled();
+
+    release();
+    expect(await within(dialog).findByTestId('result-summary')).toBeInTheDocument();
+  });
+
+  it('is ready for the next batch once one is done', async () => {
+    await scanned();
+    const first = await ask(['Downloads'], 'Move to Trash');
+    fireEvent.click(confirmButton(first));
+    await within(first).findByTestId('result-summary');
+    fireEvent.click(within(first).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(names()).not.toContain('Downloads'));
+
+    // The guard that keeps two batches from overlapping is a ref, and a ref nobody puts
+    // back is an app that deletes once and then quietly does nothing for the rest of the
+    // session — with both buttons still enabled.
+    const second = await ask(['Movies'], 'Move to Trash');
+    fireEvent.click(confirmButton(second));
+    await within(second).findByTestId('result-summary');
+    fireEvent.click(within(second).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(names()).not.toContain('Movies'));
+  });
+
+  it('re-reads the tree and the volume the batch changed', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const commands = recordCommands();
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+
+    // The cache is keyed by a generation the splice never reaches, so nothing upstream
+    // refetches: without these three the Explorer keeps drawing the tree that was thrown
+    // away, the disk bar keeps the free space of before, and the header keeps the bytes.
+    await waitFor(() => expect(commands).toContain('tree_node'));
+    await waitFor(() => expect(commands).toContain('disk_usage'));
+    await waitFor(() => expect(commands).toContain('scan_status'));
+  });
+
+  it('deletes what it can when one entry is blocked, and names the blocked one', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').size;
+    const dialog = await ask(['Library', 'Downloads'], 'Move to Trash');
+    expect(within(dialog).getByTestId('delete-total')).toHaveTextContent('1 blocked');
+
+    fireEvent.click(confirmButton(dialog));
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent(
+      `Moved 1 item to the Trash · ${formatBytes(downloads)}`,
+    );
+    const skipped = within(dialog).getByTestId('result-skipped');
+    expect(skipped).toHaveTextContent(`${FIXTURE_ROOT}/Library`);
+    expect(skipped).toHaveTextContent('Inside a folder this app never deletes from');
+
+    await waitFor(() => expect(names()).not.toContain('Downloads'));
+    expect(names()).toContain('Library');
+  });
+
+  it('leaves everything alone when the dialog is cancelled', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const commands = recordCommands();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await settle();
+    expect(commands).not.toContain('action_run');
+    expect(names()).toContain('Downloads');
+    // The ticks are still there: nothing was deleted, so nothing about them is stale.
+    expect(box('Downloads')).toBeChecked();
+    expect(barShows()).toBe(true);
+  });
+
+  it('drops the selection when the directory changes', async () => {
+    await scanned();
+    fireEvent.click(box('Downloads'));
+    expect(barShows()).toBe(true);
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    expect(barShows()).toBe(false);
+
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Breadcrumb' })).getByRole('button', {
+        name: 'demo',
+      }),
+    );
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(box('Downloads')).not.toBeChecked();
+    expect(barShows()).toBe(false);
+  });
+
+  it('drops the selection when a rescan renumbers the tree', async () => {
+    await scanned();
+    fireEvent.click(box('Downloads'));
+    expect(barShows()).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    // A `NodeId` means nothing across a scan: the row that takes id 6 in the new tree is not
+    // the row that was ticked in the old one.
+    await waitFor(() => expect(box('Downloads')).not.toBeChecked());
+    expect(barShows()).toBe(false);
+  });
+
+  it('says it is checking while the preview is on its way, and checks once', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    const commands = recordCommands();
+    fireEvent.click(box('Downloads'));
+    clickTwice(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    expect(screen.getByTestId('selection-status')).toHaveTextContent(
+      'Checking what would be deleted…',
+    );
+    expect(screen.getByRole('button', { name: 'Move to Trash' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete permanently' })).toBeDisabled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    release();
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('radio', { name: 'Trash' })).toBeChecked();
+    expect(commands.filter((cmd) => cmd === 'action_preview')).toHaveLength(1);
+  });
+
+  it('says a refused preview for what it is: nothing was deleted', async () => {
+    await scanned();
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Could not check what would be deleted');
+    expect(alert).toHaveTextContent('no scan result');
+    expect(alert).toHaveTextContent('Nothing was deleted.');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    // The sentence of a batch that ran and failed belongs to a batch that ran.
+    expect(screen.queryByText('The deletion did not run')).not.toBeInTheDocument();
+
+    // A second attempt is allowed, and takes the error away with it.
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(screen.queryByTestId('preview-error')).not.toBeInTheDocument();
+  });
+
+  it('keeps the rows and the ticks when the batch itself is refused', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    replyOnce('action_run', () => {
+      throw 'the volume went away';
+    });
+
+    fireEvent.click(confirmButton(dialog));
+    expect(await within(dialog).findByTestId('run-error')).toHaveTextContent(
+      'the volume went away',
+    );
+    expect(within(dialog).getByRole('heading', { name: 'The deletion did not run' })).toBeVisible();
+    expect(within(dialog).queryByTestId('result-summary')).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(names()).toContain('Downloads');
+    expect(box('Downloads')).toBeChecked();
+
+    // A refusal is one of the four ways out of a batch, and the guard has to come back from
+    // every one of them. A page that deletes, meets a refusal and then quietly refuses for
+    // the rest of the session looks exactly like a page that is working.
+    const retry = await ask([], 'Move to Trash');
+    fireEvent.click(confirmButton(retry));
+    expect(await within(retry).findByTestId('result-summary')).toBeInTheDocument();
+  });
+
+  it('drops a refused preview when the directory changes', async () => {
+    await scanned();
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    await screen.findByTestId('preview-error');
+
+    // It names rows of a directory the user has left, whose ticks the page has dropped.
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    expect(screen.queryByTestId('preview-error')).not.toBeInTheDocument();
+  });
+
+  it('keeps Backspace working while a refused preview is on screen', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('q3-report.pdf'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    await screen.findByTestId('preview-error');
+
+    // Nothing here is modal: the banner is a message, not a dialog, and a page that holds
+    // the keyboard until someone finds the Dismiss button is a page that is stuck.
+    fireEvent.keyDown(document.body, { key: 'Backspace' });
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+  });
+
+  it('holds Backspace from the moment the preview is asked for', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const release = holdReply('action_preview');
+    fireEvent.click(box('q3-report.pdf'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // The one window with no backdrop to stop the key: the dialog is not up yet, and the
+    // preview on its way is about the directory this would walk out of.
+    fireEvent.keyDown(document.body, { key: 'Backspace' });
+    await settle();
+    expect(crumbs()).toEqual(['demo', 'Downloads']);
+
+    release();
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('forgets a preview whose directory the user left, and takes the next one', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    release();
+    await settle();
+    // No dialog over rows nobody is looking at, and no "Checking…" about them either.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    fireEvent.click(box('family-2025.mov'));
+    expect(bar()).toHaveTextContent('1 item selected');
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Movies/family-2025.mov`]);
+  });
+
+  it('takes the next directory’s question while the abandoned one is still in flight', async () => {
+    await scanned();
+    // Never released: the abandoned preview is still on the wire for the whole test.
+    holdReply('action_preview');
+    const commands = recordCommands();
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    fireEvent.click(box('family-2025.mov'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // A page that looks idle and ignores the click is worse than a page that looks busy:
+    // the guard belongs to the batch, and a preview left behind must not hold it.
+    expect(commands.filter((cmd) => cmd === 'action_preview')).toHaveLength(2);
+    expect(screen.getByTestId('selection-status')).toHaveTextContent(
+      'Checking what would be deleted…',
+    );
+  });
+
+  it('drops the question a rescan replaced, before it can be answered', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // Nothing is modal yet, and Rescan is right there in the header — a user who ticked a
+    // folder and thought better of it can reach it. The preview lands while the walk is
+    // still going, so no navigation and no generation has moved when the reply arrives.
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    release();
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    await settle();
+
+    // A modal nobody asked for, over a tree with nothing ticked, whose button would move
+    // 28.7 GB against sizes and verdicts from the scan before it.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
+  });
+
+  it('drops an unanswered question when a rescan lands on the open dialog', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    expect(dialog).toBeInTheDocument();
+
+    await act(() => emit(SCAN_DONE_EVENT, fixtureStatusDone()));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('keeps the report when a rescan lands on it, because nothing else says what ran', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+
+    // The other half of the same rule: a question may be dropped, an answer may not.
+    // `recorded` and `treeStale` are reported here and nowhere else.
+    await act(() => emit(SCAN_DONE_EVENT, fixtureStatusDone()));
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    // The same element throughout, not one that went away with the tree and came back: a
+    // remounted dialog is a stranger — new focus, and the mode reset to what it opened in.
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByTestId('result-summary')).toBeInTheDocument();
+  });
+
+  it('frees the page for the next question when a rescan takes one', async () => {
+    await scanned();
+    // Never released: the abandoned preview is on the wire for the whole test.
+    holdReply('action_preview');
+    const commands = recordCommands();
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }));
+    // One plain macrotask before `waitFor` takes over: inside its `act` scope the reply
+    // held above never settles, and the simulated scan's own timers never get a turn.
+    await settle();
+    await waitFor(() => expect(screen.getByTestId('node-rows')).toBeInTheDocument());
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    // A scan replaces every id as surely as a navigation does, and leaves the same page
+    // behind: one that looks idle and ignores the click.
+    expect(commands.filter((cmd) => cmd === 'action_preview')).toHaveLength(2);
+  });
+
+  it('keeps a refusal on screen after the ticks that caused it are gone', async () => {
+    await scanned();
+    replyOnce('action_preview', () => {
+      throw 'no scan result';
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    await screen.findByTestId('preview-error');
+
+    // The table stays live through all of this, so the ticks can go before the alert is
+    // read. An alert that hides itself — and disables its own Dismiss — is worse than none.
+    fireEvent.click(box('Downloads'));
+    expect(barShows()).toBe(true);
+    expect(screen.getByTestId('preview-error')).toHaveTextContent('no scan result');
+    expect(screen.getByRole('button', { name: 'Move to Trash' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByTestId('preview-error')).not.toBeInTheDocument();
+    expect(barShows()).toBe(false);
+  });
+
+  it('runs the batch the dialog listed, not the ticks as they are at the end', async () => {
+    await scanned();
+    const release = holdReply('action_preview');
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(box('Movies'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+    // Live table, again: a tick can go while the guards are still answering about it.
+    fireEvent.click(box('Movies'));
+    release();
+
+    const dialog = await screen.findByRole('dialog');
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Downloads`, `${FIXTURE_ROOT}/Movies`]);
+    fireEvent.click(confirmButton(dialog));
+
+    // What the dialog listed is what runs. The user agreed to a list of paths, not to a
+    // recomputation of a selection that moved behind the modal.
+    expect(await within(dialog).findByTestId('result-summary')).toHaveTextContent('Moved 2 items');
+  });
+
+  it('opens the question that is still being asked, not the one it replaced', async () => {
+    await scanned();
+    // A gate per call, not one for both: the abandoned reply has to land *while* the live
+    // one is still on the wire, which is the only ordering in which one flag shared by two
+    // calls goes wrong — and the ordering `holdReply` cannot produce.
+    const gates: Array<() => void> = [];
+    wrapInvoke(async (name, original) => {
+      const reply = original();
+      if (name !== 'action_preview') return reply;
+      reply.catch(() => undefined);
+      await new Promise<void>((open) => gates.push(open));
+      return reply;
+    });
+    fireEvent.click(box('Downloads'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    fireEvent.click(box('family-2025.mov'));
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Trash' }));
+
+    gates[0]();
+    await settle();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    // The live question still opens: the reply that came back to a page that had moved on
+    // gave up its own place and nobody else's.
+    gates[1]();
+    const dialog = await screen.findByRole('dialog');
+    expect(listed(dialog)).toEqual([`${FIXTURE_ROOT}/Movies/family-2025.mov`]);
+  });
+
+  it('goes back to the top from any depth, not one level up', async () => {
+    await scanned();
+    fireEvent.click(row('Documents'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Documents']));
+    fireEvent.click(row('Design'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Documents', 'Design']));
+
+    const dialog = await ask(['mockups.sketch'], 'Move to Trash');
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    // The parent is as renumbered as the row that went; only the root is fixed.
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+  });
+
+  it('runs one batch, whatever the dialog manages to ask for', async () => {
+    await scanned();
+    const dialog = await ask(['Downloads'], 'Move to Trash');
+    const commands = recordCommands();
+
+    // Two overlapping batches resolve their ids against one generation, and whichever
+    // splices second is dropped — leaving rows for entries that are gone. The dialog cannot
+    // stop this: it renders the status it is handed, and neither click has been answered.
+    clickTwice(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    expect(commands.filter((cmd) => cmd === 'action_run')).toHaveLength(1);
+  });
+
+  it('goes back to the top of the tree, because the splice renumbered it', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    // `replace_subtrees` rebuilds the arena and re-sorts every group holding a node whose
+    // size changed, so the id this page navigates by can name another directory now. The
+    // root is the one id a splice cannot move.
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(names()).toContain('Downloads');
+  });
+
+  it('asks for the root by number once a batch has patched, not for a name', async () => {
+    await scanned();
+    const downloads = fixtureNode('Downloads').id;
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+    const ids = treeNodeIds();
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    await settle();
+
+    // The crumbs say where the page ended up; this says what it asked for on the way, and
+    // the root — `ROOT_ID`, the one id a splice cannot move — is the last of them.
+    //
+    // The first is the directory it was leaving, and that is `invalidateQueries`: it
+    // refetches whatever is being observed at that instant, and at that instant React has
+    // not re-rendered with the re-anchored id yet. A wasted round trip rather than a
+    // hazard — the splice is installed before `action_run` answers, so the reply describes
+    // the new arena — but it is why the first id here is not 0. `refetchType: 'none'`
+    // would drop it and leave the re-anchor to fetch; this pins today's behaviour so that
+    // a change to it is a decision rather than a surprise.
+    expect(ids).toEqual([downloads, 0]);
+  });
+
+  it('never renders the directory the id it was holding names afterwards', async () => {
+    await scanned();
+    fireEvent.click(row('Movies'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Movies']));
+    const movies = fixtureNode('Movies');
+    const dialog = await ask(['family-2025.mov'], 'Move to Trash');
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    await settle();
+
+    // Movies lost 18.9 GB of its 22.2 and sank past its siblings, so the arena the mock
+    // rebuilt hands its old number to somebody else — which is what the app's own splice
+    // does, and what no test could see while the fixture kept its ids for ever.
+    const stranger = fixtureNodeView(movies.id);
+    expect(stranger.path).not.toBe(movies.path);
+    // A directory with rows of its own, so showing the root's is a choice this page made
+    // and not the only thing it could have drawn: keeping the old id would have put these
+    // on screen, under breadcrumbs naming a folder nobody opened.
+    expect(stranger.children.length).toBeGreaterThan(0);
+    expect(names()).toEqual(fixtureNodeView(0).children.map((child) => child.name));
+  });
+
+  it('stays where it is when the batch removed nothing', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+
+    // What the guards cannot see coming: an entry that goes missing between the preview and
+    // the syscall. Nothing was removed and nothing failed, so `touched` sends the splice no
+    // paths at all and every id the page holds still means what it did.
+    const skippedOnly: BatchResult = {
+      outcome: {
+        entries: [
+          {
+            path: `${FIXTURE_ROOT}/Downloads/q3-report.pdf`,
+            kind: 'file',
+            result: { result: 'skipped', reason: 'missing' },
+          },
+        ],
+        freedBytes: 0,
+        at: '2026-09-18T09:31:00Z',
+        mode: 'trash',
+      },
+      recorded: true,
+      treeStale: false,
+    };
+    replyOnce('action_run', () => skippedOnly);
+    const commands = recordCommands();
+
+    fireEvent.click(confirmButton(dialog));
+    await within(dialog).findByTestId('result-summary');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await settle();
+
+    expect(crumbs()).toEqual(['demo', 'Downloads']);
+    expect(names()).toContain('q3-report.pdf');
+    expect(commands).not.toContain('tree_node');
+    // The selection goes anyway: the question it was asked for has been answered.
+    expect(barShows()).toBe(false);
+  });
+
+  it('patches the tree for an entry that failed, although nothing was removed', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    const dialog = await ask(['q3-report.pdf'], 'Move to Trash');
+
+    // A deletion that failed halfway leaves a branch nobody can describe from here, so
+    // `touched` sends it to the splice next to the entries that went — and the ids move for
+    // a batch that freed not one byte.
+    const oneFailed: BatchResult = {
+      outcome: {
+        entries: [
+          {
+            path: `${FIXTURE_ROOT}/Downloads/q3-report.pdf`,
+            kind: 'file',
+            result: { result: 'failed', message: 'Operation not permitted (os error 1)' },
+          },
+        ],
+        freedBytes: 0,
+        at: '2026-09-18T09:31:00Z',
+        mode: 'trash',
+      },
+      recorded: true,
+      treeStale: false,
+    };
+    replyOnce('action_run', () => oneFailed);
+    const commands = recordCommands();
+
+    fireEvent.click(confirmButton(dialog));
+    // Waited for, not asserted on: what the report says about a failure is the dialog's
+    // own test. What this one is about is the two lines below.
+    await within(dialog).findByTestId('result-failed');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(crumbs()).toEqual(['demo']));
+    expect(commands).toContain('tree_node');
+  });
+
+  it('leaves Backspace alone while the dialog is open', async () => {
+    await scanned();
+    fireEvent.click(row('Downloads'));
+    await waitFor(() => expect(crumbs()).toEqual(['demo', 'Downloads']));
+    await ask(['q3-report.pdf'], 'Move to Trash');
+
+    fireEvent.keyDown(document.body, { key: 'Backspace' });
+    await settle();
+    expect(crumbs()).toEqual(['demo', 'Downloads']);
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
   });
 });

@@ -4,7 +4,14 @@
 
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC } from '@tauri-apps/api/mocks';
-import { SCAN_DONE_EVENT, SCAN_PROGRESS_EVENT, type AppInfo, type ScanStatus } from '../lib/ipc';
+import {
+  SCAN_DONE_EVENT,
+  SCAN_PROGRESS_EVENT,
+  type AppInfo,
+  type BatchResult,
+  type DeletionMode,
+  type ScanStatus,
+} from '../lib/ipc';
 import {
   FIXTURE_ROOT,
   fixtureDisk,
@@ -13,6 +20,8 @@ import {
   fixtureNodes,
   fixtureStatusDone,
 } from './fixtures';
+import { type HeldScan, mockActionPreview, mockActionRun, resetMockActions } from './actions';
+import { mockActivityTail } from './actionLog';
 
 export const MOCK_APP_INFO: AppInfo = { name: 'Storage Monitor', version: '0.0.0-mock' };
 
@@ -26,9 +35,20 @@ export function setMockScanDelay(ms: number): void {
   mockScanDelayMs = ms;
 }
 
+/**
+ * Makes every simulated scan from now on end in `failed` with this message, until it is set
+ * back to null. `Inner::fail` leaves a root and no result behind, which is the one state a
+ * window can be in where the guards run and the plan has no sizes to carry — so this is how
+ * a screen stages "a batch after a scan that did not finish".
+ */
+export function setMockScanFailure(message: string | null): void {
+  scanFailure = message;
+}
+
 const PROGRESS_TICKS = 6;
 const DEFAULT_CHILDREN_LIMIT = 500;
 const DEFAULT_GROWERS_LIMIT = 10;
+const DEFAULT_ACTIVITY_LIMIT = 100;
 
 /** Directories the simulated scan claims to be reading, one per tick, shallow to deep. */
 const PROGRESS_PATHS: readonly string[] = (() => {
@@ -56,6 +76,8 @@ const IDLE: ScanStatus = {
 let status: ScanStatus = IDLE;
 /** A tree is available: the last scan finished or was cancelled. */
 let hasResult = false;
+/** What the next scan fails with, or null while the machine is behaving. */
+let scanFailure: string | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 
 type IpcHandler = Parameters<typeof mockIPC>[0];
@@ -81,6 +103,22 @@ function stringArgument(args: IpcArgs, name: string): string | undefined {
 function numberArgument(args: IpcArgs, name: string): number | undefined {
   const value = argument(args, name);
   return typeof value === 'number' ? value : undefined;
+}
+
+/**
+ * The two arguments of both action commands, refused the way Tauri refuses a body it cannot
+ * deserialize into `Vec<String>` and `Mode`: with an error, never with a guess.
+ */
+function batchArguments(args: IpcArgs, cmd: string): { paths: string[]; mode: DeletionMode } {
+  const paths = argument(args, 'paths');
+  if (!Array.isArray(paths) || paths.some((path) => typeof path !== 'string')) {
+    commandError(`invalid args \`paths\` for command \`${cmd}\`: expected a list of paths`);
+  }
+  const mode = argument(args, 'mode');
+  if (mode !== 'trash' && mode !== 'permanent') {
+    commandError(`invalid args \`mode\` for command \`${cmd}\`: expected trash or permanent`);
+  }
+  return { paths: paths as string[], mode };
 }
 
 /** A command's `Err(String)`: Tauri rejects with the string itself, not with an `Error`. */
@@ -121,9 +159,13 @@ function publish(event: string): void {
   void emit(event, { ...status });
 }
 
-function finish(final: ScanStatus): void {
+/**
+ * The end of a scan. `holdsTree` is what `Inner::complete` does and `Inner::fail` does not:
+ * a failed scan keeps its root and leaves no tree at all.
+ */
+function finish(final: ScanStatus, holdsTree = true): void {
   status = final;
-  hasResult = true;
+  hasResult = holdsTree;
   publish(SCAN_DONE_EVENT);
 }
 
@@ -133,6 +175,22 @@ function advance(tick: number): void {
   }
   const done = fixtureStatusDone();
   if (tick > PROGRESS_TICKS) {
+    if (scanFailure !== null) {
+      // The counters stay the walker's own, as they do in the app: with no result to read,
+      // `ScanManager::status` answers from the live progress of the walk that stopped.
+      finish(
+        {
+          ...status,
+          state: 'failed',
+          currentPath: '',
+          error: scanFailure,
+          hasPrevious: false,
+          previousTakenAt: null,
+        },
+        false,
+      );
+      return;
+    }
     finish({ ...done, root: status.root });
     return;
   }
@@ -178,6 +236,33 @@ function scanCancel(): ScanStatus {
   return { ...status };
 }
 
+/**
+ * What the window holds, as the guards and the plan see it: the root outlives the tree, so a
+ * batch that arrives while a scan runs is guarded by the root and planned without sizes.
+ */
+function heldScan(): HeldScan {
+  if (status.root === null) {
+    return { held: 'nothing' };
+  }
+  return hasResult ? { held: 'tree', root: status.root } : { held: 'root', root: status.root };
+}
+
+/**
+ * A batch, with the totals of the scan brought up to date afterwards.
+ *
+ * `patched_stats` does the same in the app: the files, the folders and the bytes come from
+ * the tree the splice installed, while the read errors stay the ones the scan met. Without
+ * it the header would go on claiming the bytes of rows that are gone.
+ */
+function runBatch(paths: string[], mode: DeletionMode): BatchResult {
+  const batch = mockActionRun(paths, mode, heldScan());
+  if (hasResult) {
+    const patched = fixtureStatusDone();
+    status = { ...status, files: patched.files, dirs: patched.dirs, bytes: patched.bytes };
+  }
+  return batch;
+}
+
 const handle: IpcHandler = (cmd, args) => {
   switch (cmd) {
     case 'get_app_info':
@@ -211,6 +296,16 @@ const handle: IpcHandler = (cmd, args) => {
       return status.hasPrevious
         ? fixtureGrowers().slice(0, numberArgument(args, 'limit') ?? DEFAULT_GROWERS_LIMIT)
         : [];
+    case 'action_preview': {
+      const { paths, mode } = batchArguments(args, cmd);
+      return mockActionPreview(paths, mode, heldScan());
+    }
+    case 'action_run': {
+      const { paths, mode } = batchArguments(args, cmd);
+      return runBatch(paths, mode);
+    }
+    case 'activity_log':
+      return mockActivityTail(numberArgument(args, 'limit') ?? DEFAULT_ACTIVITY_LIMIT);
     case 'plugin:opener|reveal_item_in_dir': {
       // `revealItemInDir(path)` sends `{ paths: [path] }`.
       const paths = argument(args, 'paths');
@@ -224,12 +319,17 @@ const handle: IpcHandler = (cmd, args) => {
   }
 };
 
-/** Back to idle: no scan, no tree, no revealed paths, no pending ticks. Keeps the delay. */
+/**
+ * Back to idle: no scan, no tree, no revealed paths, no pending ticks, and the fixture whole
+ * again with an empty action log. Keeps the delay.
+ */
 export function resetIpcMock(): void {
   clearTimer();
   status = IDLE;
   hasResult = false;
+  scanFailure = null;
   revealed.length = 0;
+  resetMockActions();
 }
 
 declare global {
@@ -238,6 +338,7 @@ declare global {
     __STORAGE_MONITOR_MOCK__?: {
       revealed: string[];
       setMockScanDelay: (ms: number) => void;
+      setMockScanFailure: (message: string | null) => void;
     };
   }
 }
@@ -272,5 +373,5 @@ export function installIpcMock(): void {
   resetIpcMock();
   mockIPC(handle, { shouldMockEvents: true });
   fixUnlisten();
-  window.__STORAGE_MONITOR_MOCK__ = { revealed, setMockScanDelay };
+  window.__STORAGE_MONITOR_MOCK__ = { revealed, setMockScanDelay, setMockScanFailure };
 }

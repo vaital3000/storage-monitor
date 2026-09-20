@@ -222,6 +222,70 @@ describe('useScan', () => {
     expect(result.current.status.error).toBe('Error: boom');
   });
 
+  it('refreshes the counters of a finished scan without bumping the generation', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    await act(() => result.current.start());
+    await waitFor(() => expect(result.current.status.state).toBe('done'));
+    const generation = result.current.generation;
+    const bytes = result.current.status.bytes;
+
+    // What a batch leaves behind: the manager's counters have moved and no event says so.
+    const patched: ScanStatus = { ...fixtureStatusDone(), bytes: bytes - 1, files: 3, dirs: 2 };
+    replyOnce('scan_status', () => patched);
+    await act(() => result.current.refresh());
+    expect(result.current.status).toEqual(patched);
+    // The scan did not change, so no tree query may be thrown away.
+    expect(result.current.generation).toBe(generation);
+  });
+
+  it('leaves a running scan alone when refreshed: the events are fresher', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    setMockScanDelay(10_000);
+    await act(() => result.current.start());
+    const running: ScanStatus = { ...result.current.status, files: 42, currentPath: '/x' };
+    await act(() => emit(SCAN_PROGRESS_EVENT, running));
+
+    replyOnce('scan_status', () => ({ ...IDLE_STATUS, state: 'running', root: FIXTURE_ROOT }));
+    await act(() => result.current.refresh());
+    expect(result.current.status).toEqual(running);
+  });
+
+  it('drops a refresh that a finished scan overtook', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    await act(() => result.current.start());
+    await waitFor(() => expect(result.current.status.state).toBe('done'));
+
+    const release = holdReply('scan_status');
+    let refreshing!: Promise<void>;
+    act(() => {
+      refreshing = result.current.refresh();
+    });
+    // A scan finished while the reply was on its way. "Terminal" cannot tell the state that
+    // was read from the newer one that replaced it, so the reply has to name the tree it
+    // was read from — otherwise the counters of a scan two generations old land on screen.
+    const newer: ScanStatus = { ...fixtureStatusDone(), bytes: 1, files: 1, dirs: 1 };
+    await act(() => emit(SCAN_DONE_EVENT, newer));
+    release();
+    await act(() => refreshing);
+    expect(result.current.status).toEqual(newer);
+  });
+
+  it('keeps the counters when the refresh is refused', async () => {
+    const { result } = renderScan();
+    await ready(result);
+    await act(() => result.current.start());
+    await waitFor(() => expect(result.current.status.state).toBe('done'));
+
+    replyOnce('scan_status', () => {
+      throw 'no scan result';
+    });
+    await act(() => result.current.refresh());
+    expect(result.current.status).toEqual(fixtureStatusDone());
+  });
+
   it('stops listening after unmount, without leaking a listener', async () => {
     const warn = vi.spyOn(console, 'warn');
     try {

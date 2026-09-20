@@ -398,7 +398,8 @@ The repository must be operable by an agent without a human explaining it:
 |---|---|---|
 | 0 | Walking skeleton: workspace, empty Tauri window, CI, release pipeline, repo docs | `v0.1.0` release with a downloadable `.dmg` and CLI built by CI |
 | 1 | Scanner, snapshots, CLI `scan`, Explorer screen | Scan of the home folder with treemap and deltas. Done 2026-09-18 (v0.2.0). |
-| 2 | Module framework, action engine, Cleanup / Activity / Settings screens | A dummy module can be cleaned end-to-end in both modes |
+| 2a | Action engine, deletion from the Explorer, Activity screen, CSP | Selected entries are deleted in both modes, recorded and patched out of the tree. Done 2026-09-20. |
+| 2b | Module framework, process execution through `System`, Cleanup and Settings screens | A dummy module can be cleaned end-to-end in both modes |
 | 3 | git-worktrees module | Verdicts match the rules on the author's machine; PR lookup works |
 | 4 | docker module | Works with Docker Desktop and OrbStack |
 | 5 | xcode module | DerivedData, simulators, runtimes, archives |

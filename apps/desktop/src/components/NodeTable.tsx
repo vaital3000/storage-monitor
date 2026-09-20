@@ -10,12 +10,21 @@ import {
   TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react';
 import { countLabel, formatBytes, formatDate, formatDelta, formatPercent } from '../lib/format';
 import type { ChildView, NodeId, NodeKind, NodeView } from '../lib/ipc';
 import { describeNodeError, type NodeErrorMark } from '../lib/nodeErrors';
 
-interface NodeTableProps {
+interface BaseProps {
   node: NodeView;
   /** Focus the first row when another directory arrives (the keyboard brought us there). */
   focusFirstRow?: boolean;
@@ -24,6 +33,23 @@ interface NodeTableProps {
   /** "Reveal in Finder" was clicked for the absolute `path`. */
   onReveal: (path: string) => void;
 }
+
+/**
+ * The selection belongs to the page, which keeps it across a sort and drops it on a
+ * navigation and on a new generation: the table renders the set it is given and reports
+ * the set the user asked for, and never edits one on its own. The two props travel
+ * together — `selection` alone would tick boxes that can never change — and without them
+ * there is no checkbox column.
+ */
+type SelectionProps =
+  | {
+      /** Ids of the selected rows. */
+      selection: ReadonlySet<NodeId>;
+      onSelectionChange: (selection: ReadonlySet<NodeId>) => void;
+    }
+  | { selection?: never; onSelectionChange?: never };
+
+type NodeTableProps = BaseProps & SelectionProps;
 
 type SortKey = 'name' | 'size' | 'delta' | 'fileCount' | 'mtime';
 type Direction = 'asc' | 'desc';
@@ -34,7 +60,7 @@ interface Sort {
 }
 
 interface Column {
-  key: SortKey | 'percent' | 'actions';
+  key: SortKey | 'select' | 'percent' | 'actions';
   label: string;
   numeric: boolean;
   sortable: boolean;
@@ -49,11 +75,26 @@ const MTIME_TITLE = 'Directory modification time, not the newest content';
 const NAME_PADDING = 'pl-3 pr-1';
 const NUMERIC_PADDING = 'px-2';
 const ACTIONS_PADDING = 'px-1';
+const SELECT_PADDING = 'px-2';
+const CHECKBOX_CLASS =
+  'size-4 cursor-pointer align-middle accent-blue-600 focus-visible:outline-2 focus-visible:outline-blue-500';
 
-// Fixed widths for the other columns (452 px in total), each sized for its widest value at
-// 13 px (`2026-09-18`, `100.0%`, `−999.9 MB`, `123,456`); the name column takes the rest:
-// 188 px at the window's minimum width of 900 px, which fits "Application Support" next
-// to its marker.
+/** The checkbox column, in front of the others when the page hands the table a selection. */
+const SELECT_COLUMN: Column = {
+  key: 'select',
+  label: '',
+  numeric: false,
+  sortable: false,
+  width: 'w-8',
+  padding: SELECT_PADDING,
+};
+
+// Fixed widths for every column but the name, each sized for its widest value at 13 px
+// (`2026-09-18`, `100.0%`, `−999.9 MB`, `123,456`): 452 px here, and 484 px once
+// SELECT_COLUMN adds its 32 px. The name column takes the rest — 188 px at the window's
+// minimum width of 900 px, 156 px with the checkboxes — and those 32 px are the slack
+// "Application Support" was using: measured there, it fills its 120 px exactly, so with a
+// checkbox in front of it the name truncates into its title.
 const COLUMNS: readonly Column[] = [
   {
     key: 'name',
@@ -192,11 +233,29 @@ interface RowProps {
   parent: NodeView;
   /** Size of the largest sibling; the inline bar is relative to it. */
   maxSize: number;
+  selected: boolean;
+  /**
+   * Null when the table has no checkbox column. `extend` is a shift-click: take in every
+   * row between the anchor and this one. Values and one shared handler, not a closure per
+   * row, so that `memo` below has something to compare.
+   */
+  onToggle: ((id: NodeId, extend: boolean) => void) | null;
   onOpen: (id: NodeId) => void;
   onReveal: (path: string) => void;
 }
 
-function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
+// A selection changes two rows and re-renders the table; at the 500 rows `tree_node` hands
+// out, that is 500 rows of work for two ticks. Memoized, it is two — as long as every prop
+// stays a value or a handler that outlives the render (`toggleRow`, `onOpen`, `onReveal`).
+const Row = memo(function Row({
+  child,
+  parent,
+  maxSize,
+  selected,
+  onToggle,
+  onOpen,
+  onReveal,
+}: RowProps) {
   const isDir = child.kind === 'dir';
   const path = `${parent.path}/${child.name}`;
   const mark = child.error === null ? null : describeNodeError(child.error);
@@ -205,24 +264,78 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
     if (isDir) onOpen(child.id);
   };
   const onKeyDown = (event: KeyboardEvent<HTMLTableRowElement>) => {
+    // Space picks the row out; it must neither scroll the table nor open the directory.
+    // From the row it never extends a range — there is no second row to point at — while
+    // Shift+Space on the box itself does, through the click the browser synthesizes.
+    if (event.key === ' ' && onToggle !== null) {
+      event.preventDefault();
+      onToggle(child.id, false);
+      return;
+    }
     if (event.key === 'Enter' && isDir) {
       event.preventDefault();
       open();
     }
   };
   const numeric = `${NUMERIC_PADDING} py-1.5 text-right whitespace-nowrap tabular-nums`;
+  // A 16 px tick is not enough to see a range by, so the row says it in a colour too, and
+  // `data-selected` lets a test say it in a value. Neither reaches assistive technology:
+  // a row toggled with Space changes a descendant of the focused element and nothing
+  // announces it, which would need a `grid` and `aria-selected`.
+  //
+  // Phase 2a decided not to promote this table (Task 14, and the plan's Task 14 section
+  // says why): `role="grid"` is a contract for one tab stop and cell navigation, and every
+  // row here is a tab stop. Until that changes, what a screen reader hears when a row is
+  // ticked is the page's live count over the action bar, not the row.
+  const tone = selected
+    ? 'bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/50 dark:hover:bg-blue-900/50'
+    : isDir
+      ? 'hover:bg-neutral-100 dark:hover:bg-neutral-800'
+      : 'hover:bg-neutral-50 dark:hover:bg-neutral-800/50';
   return (
     <tr
       tabIndex={0}
       data-kind={child.kind}
+      data-selected={selected ? 'true' : undefined}
       onClick={open}
       onKeyDown={onKeyDown}
       className={`group border-t border-neutral-100 outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-inset dark:border-neutral-800 ${
-        isDir
-          ? 'cursor-pointer hover:bg-neutral-100 dark:hover:bg-neutral-800'
-          : 'cursor-default hover:bg-neutral-50 dark:hover:bg-neutral-800/50'
-      }`}
+        isDir ? 'cursor-pointer' : 'cursor-default'
+      } ${tone}`}
     >
+      {onToggle !== null && (
+        // A click that lands beside the box must not open the directory: a mis-click of a
+        // few pixels would navigate away, and the page drops the selection when it does.
+        <td className={`${SELECT_PADDING} py-1.5`} onClick={(event) => event.stopPropagation()}>
+          <input
+            type="checkbox"
+            aria-label={`Select ${child.name}`}
+            checked={selected}
+            // React reports a checkbox's change from the click that made it — including
+            // the click a browser synthesizes for Space — so the modifier rides on the
+            // native event; anything that is not a mouse event is a plain toggle.
+            onChange={(event) =>
+              onToggle(
+                child.id,
+                event.nativeEvent instanceof MouseEvent && event.nativeEvent.shiftKey,
+              )
+            }
+            // Space is the box's own key, and the row would answer it again. Enter is
+            // held back for a different reason: on a checkbox it does nothing, and the
+            // row would turn that nothing into opening a directory — which costs a user
+            // standing here mid-selection the whole selection, with no undo. A key whose
+            // old cost was zero does not get to start discarding work.
+            //
+            // Everything else belongs to the table around it. The arrows that move
+            // between rows run on the body, and a blanket guard would strand the focus
+            // on the box a selecting user is standing on.
+            onKeyDown={(event) => {
+              if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
+            }}
+            className={CHECKBOX_CLASS}
+          />
+        </td>
+      )}
       <td className={`max-w-0 ${NAME_PADDING} py-1.5`}>
         <div className="flex min-w-0 items-center gap-1.5">
           <KindIcon kind={child.kind} />
@@ -255,7 +368,13 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
             event.stopPropagation();
             onReveal(path);
           }}
-          onKeyDown={(event) => event.stopPropagation()}
+          // The two keys that press a button, held for the same reasons as at the box:
+          // the row would open the directory on the Enter that revealed the row, and
+          // toggle it on the Space that did. The arrows stay the table's, so the focus
+          // is never stranded on this button either.
+          onKeyDown={(event) => {
+            if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
+          }}
           className="rounded p-0.5 text-muted opacity-35 group-hover:opacity-100 group-focus-visible:opacity-100 hover:text-neutral-700 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-neutral-200"
         >
           <SquareArrowOutUpRight className="size-3.5" />
@@ -263,17 +382,42 @@ function Row({ child, parent, maxSize, onOpen, onReveal }: RowProps) {
       </td>
     </tr>
   );
+});
+
+/** How this table takes part in a selection: null when the page gave it none to render. */
+interface Selecting {
+  selected: ReadonlySet<NodeId>;
+  change: (selection: ReadonlySet<NodeId>) => void;
+}
+
+/** Position of the row with this id in the order the table shows, or -1 when it is gone. */
+function indexOfRow(sorted: readonly ChildView[], id: NodeId): number {
+  return sorted.findIndex((child) => child.id === id);
+}
+
+function countSelected(sorted: readonly ChildView[], selection: ReadonlySet<NodeId>): number {
+  return sorted.reduce((count, child) => (selection.has(child.id) ? count + 1 : count), 0);
+}
+
+/** Hands the page a selection only when it differs: a click that changed nothing is not news. */
+function report(selecting: Selecting, next: ReadonlySet<NodeId>): void {
+  const same =
+    next.size === selecting.selected.size && [...next].every((id) => selecting.selected.has(id));
+  if (!same) selecting.change(next);
 }
 
 /**
  * The children of one directory: sortable, keyboard-navigable (Enter opens a directory,
- * arrows move between rows), with a "Reveal in Finder" button per row.
+ * Space selects a row, arrows move between rows), with a "Reveal in Finder" button per row
+ * and, when the page owns a selection, a checkbox per row.
  */
 export default function NodeTable({
   node,
   focusFirstRow = false,
   onOpen,
   onReveal,
+  selection,
+  onSelectionChange,
 }: NodeTableProps) {
   const [sort, setSort] = useState<Sort>({ key: 'size', direction: 'desc' });
   const sorted = useMemo(() => sortChildren(node.children, sort), [node.children, sort]);
@@ -283,6 +427,10 @@ export default function NodeTable({
   );
   const body = useRef<HTMLTableSectionElement>(null);
   const shownId = useRef(node.id);
+  // The row a range extends from: the last one the user ticked, kept as an id rather than
+  // as an index, because a re-sort moves every row and the range the user means is the one
+  // the table shows now. It belongs to the rows on screen, and goes when they do.
+  const anchor = useRef<NodeId | null>(null);
 
   // After a keyboard navigation, keyboard users continue from the first row of the new
   // directory; a click leaves the focus where the pointer put it.
@@ -292,7 +440,79 @@ export default function NodeTable({
     if (focusFirstRow) body.current?.querySelector('tr')?.focus({ preventScroll: true });
   }, [node.id, focusFirstRow]);
 
-  const toggle = (key: SortKey) => {
+  // A `NodeId` only means something inside the arena that handed it out, and a rescan or
+  // the splice after a batch replaces every id in it while the root keeps `node.id` — so
+  // `node.id` cannot tell one generation of rows from the next. A new `children` array
+  // can: the query refetches into a new one when the rows change, and keeps the old one
+  // when nothing did. The anchor is the only id the page cannot reach, so it dies here
+  // with the rows it was taken from.
+  useEffect(() => {
+    anchor.current = null;
+  }, [node.children]);
+
+  // One answer to "does this table select?", so the column, the boxes and the handlers can
+  // never disagree about it.
+  const selecting: Selecting | null =
+    selection !== undefined && onSelectionChange !== undefined
+      ? { selected: selection, change: onSelectionChange }
+      : null;
+  const selectedRows = selecting === null ? 0 : countSelected(sorted, selecting.selected);
+  // An empty table has nothing selected, whatever `every` would say about no rows at all.
+  const allSelected = selectedRows > 0 && selectedRows === sorted.length;
+  const someSelected = selectedRows > 0 && selectedRows < sorted.length;
+
+  // What a row's handler has to read, kept where a handler that never changes can find it.
+  // In a layout effect, which runs as part of the commit: a passive one would also be
+  // flushed before the next click, but only because React flushes those before a discrete
+  // event, which is behaviour and not a promise — and it would leave a caller that is not
+  // a discrete event (a drag-select, a `requestAnimationFrame`, an effect on the page)
+  // reading one commit behind, in the one place where a stale `sorted` means ranging over
+  // rows that are no longer the rows on screen.
+  const shown = useRef({ sorted, selecting });
+  useLayoutEffect(() => {
+    shown.current = { sorted, selecting };
+  });
+
+  // One handler for every row, stable for the life of the table: 500 rows carrying 500 new
+  // closures would re-render all of them for one tick, whatever `memo` says. `toggleAll`
+  // below needs none of this and keeps reading the render it belongs to — there is one
+  // header box, it re-renders with the table, and a ref there would buy nothing and cost
+  // a second way of reading the same two values.
+  const toggleRow = useCallback((id: NodeId, extend: boolean) => {
+    const { sorted, selecting } = shown.current;
+    if (selecting === null) return;
+    // A range extends from a row that is still selected. Anything else — the page clearing
+    // the selection behind the table, the header, the user unticking the anchor itself —
+    // leaves nothing to extend from, and a plain toggle is what the user is looking at.
+    const from =
+      anchor.current !== null && selecting.selected.has(anchor.current)
+        ? indexOfRow(sorted, anchor.current)
+        : -1;
+    const to = indexOfRow(sorted, id);
+    anchor.current = id;
+    const next = new Set(selecting.selected);
+    if (extend && from !== -1 && to !== -1) {
+      for (let i = Math.min(from, to); i <= Math.max(from, to); i += 1) {
+        next.add(sorted[i].id);
+      }
+    } else if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    report(selecting, next);
+  }, []);
+
+  const toggleAll = () => {
+    if (selecting === null) return;
+    // The header is about the rows on screen: it reports exactly them, or nothing — never
+    // a row the table did not show.
+    report(selecting, allSelected ? new Set() : new Set(sorted.map((child) => child.id)));
+  };
+
+  const columns = selecting === null ? COLUMNS : [SELECT_COLUMN, ...COLUMNS];
+
+  const toggleSort = (key: SortKey) => {
     setSort((current) =>
       current.key === key
         ? { key, direction: current.direction === 'asc' ? 'desc' : 'asc' }
@@ -316,12 +536,15 @@ export default function NodeTable({
       <table className="w-full table-fixed border-collapse text-base">
         <thead className="bg-neutral-50 text-sm dark:bg-neutral-800/60">
           <tr>
-            {COLUMNS.map((column) => {
+            {columns.map((column) => {
               const active = column.sortable && sort.key === column.key;
               return (
                 <th
                   key={column.key}
                   scope="col"
+                  // Without a label of its own the column would take the name of the box
+                  // inside it, and a screen reader would call every row's box "Select all".
+                  aria-label={column.key === 'select' ? 'Select' : undefined}
                   title={column.title}
                   aria-sort={
                     active ? (sort.direction === 'asc' ? 'ascending' : 'descending') : undefined
@@ -330,10 +553,23 @@ export default function NodeTable({
                     column.numeric ? 'text-right' : 'text-left'
                   }`}
                 >
-                  {column.sortable ? (
+                  {column.key === 'select' ? (
+                    <input
+                      type="checkbox"
+                      // What "all" covers is what the table shows, which is not every child
+                      // of a truncated node: say so rather than promise the rest.
+                      aria-label={node.truncated ? 'Select all shown' : 'Select all'}
+                      checked={allSelected}
+                      ref={(box) => {
+                        if (box !== null) box.indeterminate = someSelected;
+                      }}
+                      onChange={toggleAll}
+                      className={CHECKBOX_CLASS}
+                    />
+                  ) : column.sortable ? (
                     <button
                       type="button"
-                      onClick={() => toggle(column.key as SortKey)}
+                      onClick={() => toggleSort(column.key as SortKey)}
                       className="inline-flex items-center gap-1 rounded hover:text-neutral-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-neutral-200"
                     >
                       {column.label}
@@ -360,6 +596,8 @@ export default function NodeTable({
                 child={child}
                 parent={node}
                 maxSize={maxSize}
+                selected={selecting !== null && selecting.selected.has(child.id)}
+                onToggle={selecting === null ? null : toggleRow}
                 onOpen={onOpen}
                 onReveal={onReveal}
               />
@@ -368,7 +606,7 @@ export default function NodeTable({
         ) : (
           <tbody>
             <tr className="border-t border-neutral-100 dark:border-neutral-800">
-              <td colSpan={COLUMNS.length} className="px-3 py-8 text-center text-muted">
+              <td colSpan={columns.length} className="px-3 py-8 text-center text-muted">
                 {node.error === null ? 'Empty folder' : describeNodeError(node.error).title}
               </td>
             </tr>

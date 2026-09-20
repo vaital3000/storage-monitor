@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use storage_monitor_core::paths;
-use storage_monitor_core::scan::{ScanOptions, ScanProgress, ScanResult, scan};
+use storage_monitor_core::scan::{
+    NodeId, NodeKind, ScanOptions, ScanProgress, ScanResult, ScanStats, Tree, replace_subtrees,
+    rescan_path, scan,
+};
 use storage_monitor_core::snapshot::{
     DEFAULT_FILE_THRESHOLD, DEFAULT_KEEP, Delta, Snapshot, SnapshotStore, deltas, top_growers,
 };
@@ -34,7 +37,9 @@ pub trait StatusEmitter: Send + Sync + 'static {
     fn emit(&self, event: &str, status: &ScanStatus);
 }
 
-impl StatusEmitter for tauri::AppHandle {
+/// Generic over the runtime so that the same window bootstrap builds over the mock one:
+/// `lib::configure` is where that matters, and nothing here changes with it.
+impl<R: tauri::Runtime> StatusEmitter for tauri::AppHandle<R> {
     fn emit(&self, event: &str, status: &ScanStatus) {
         if let Err(err) = tauri::Emitter::emit(self, event, status) {
             eprintln!("cannot emit {event}: {err}");
@@ -193,13 +198,144 @@ impl ScanManager {
         self.lock().growers.iter().take(limit).cloned().collect()
     }
 
+    /// Which arena the manager holds. Bumped by every scan and by every splice, because
+    /// both replace every id in it. Not on the wire: the UI counts its own generations from
+    /// `scan:done`, and this one exists so that a patch can tell whether the ids it was
+    /// built from are still the manager's.
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Rescans every path of a finished batch and splices the results into the tree, so the
+    /// Explorer agrees with the disk again. Paths the tree does not know are ignored, and
+    /// nothing happens at all while no scan result is held — during a scan there is none,
+    /// and the scan itself is about to produce a truthful tree. All three of those are
+    /// [`TreeState::Current`], the unresolved path included: there is no row on screen for
+    /// what the batch deleted, so there is nothing to warn about. That last one is a
+    /// positive answer about a lookup that failed, and it is only true while the caller
+    /// hands over the spelling the scan recorded — the rule the next paragraph is about.
+    ///
+    /// **The paths are the ones the UI sent.** [`Tree::find`] matches the spelling the scan
+    /// recorded, component by component; the normalized path the guards hand to the `System`
+    /// port is a different value whenever the scan root was reached through a symlink or
+    /// spelled otherwise than the disk does. Patching by that one is silent — no splice, and
+    /// the Explorer goes on showing a directory that is gone.
+    ///
+    /// Three steps, and the middle one is why they are three:
+    ///
+    /// 1. under the lock: take the result and resolve the paths to ids;
+    /// 2. **off the lock**: rescan every one of them. A rescan walks the disk and can take
+    ///    seconds, and every tree query of the window goes through the same lock;
+    /// 3. under the lock again: splice, but only if the arena from step 1 is still the one
+    ///    the manager holds — a scan that finished meanwhile has replaced every id in it.
+    ///
+    /// The splice is one call for the whole batch: [`replace_subtrees`] rebuilds the arena,
+    /// so its cost is per call and not per path, and ids resolved before it mean nothing
+    /// after it.
+    ///
+    /// Call it from a worker, never from a [`StatusEmitter`]: the rebuild carries a live
+    /// `assert!` and takes the lock, and an emitter runs while the manager is already
+    /// locked. A panic in it poisons the lock, which [`Self::lock`] recovers from, and
+    /// leaves the previous result in place — the tree stays stale rather than broken. The
+    /// caller catches that panic and reports the staleness; see `actions::run_batch`.
+    #[must_use = "a stale tree is something the window has to tell the user about"]
+    pub fn patch_paths(&self, paths: &[PathBuf]) -> TreeState {
+        let Some((result, generation, ids)) = self.patch_targets(paths) else {
+            return TreeState::Current;
+        };
+        // Outside the lock. `rescan_targets` is a free function so that it cannot reach the
+        // manager even by accident: the window has to stay readable while the disk is walked.
+        let (patches, complete) = rescan_targets(&result, &ids);
+        TreeState::of(self.install_patches(generation, patches), complete)
+    }
+
+    /// Step 1: the result to rescan against, the generation it belongs to, and the ids of
+    /// the paths this tree knows. `None` when there is nothing to do.
+    ///
+    /// Only the two reads are under the lock. [`Tree::find`] walks one sibling group per
+    /// component, and a sibling group here is as wide as the directory: the 500 rows a
+    /// selection can hold, in a directory with a million children, is seconds of a frozen
+    /// window right after a deletion. `plan_for` resolves the same paths off the lock
+    /// already, and step 3 re-checks the generation, so nothing is weakened by reading the
+    /// tree through the `Arc` instead.
+    fn patch_targets(&self, paths: &[PathBuf]) -> Option<(Arc<ScanResult>, u64, Vec<NodeId>)> {
+        let (result, generation) = {
+            let inner = self.lock();
+            (Arc::clone(inner.result.as_ref()?), inner.generation)
+        };
+        let mut ids: Vec<NodeId> = paths
+            .iter()
+            .filter_map(|path| result.tree.find(path))
+            // The root is not patchable — an arena without one is not a tree — and
+            // `replace_subtrees` drops such a patch. Dropping it here instead is what keeps
+            // that from costing a full rescan of the scan root first, which is the
+            // 25-second walk this whole mechanism exists to avoid. No batch can produce it:
+            // the guards refuse the root before anything is touched.
+            .filter(|&id| id != Tree::ROOT)
+            .collect();
+        // One rescan per node: the same directory can arrive twice under two spellings, and
+        // `Tree::find` accepts more than one of them (`a/b` and `a/b/.` name one node).
+        // Cost only, and only for a direct caller: through `run_batch` the second spelling
+        // is blocked as `Nested` long before it gets here, and `replace_subtrees` keeps the
+        // last patch for a repeated id either way. Nothing about safety rests on it.
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return None;
+        }
+        Some((result, generation, ids))
+    }
+
+    /// Step 3: the whole batch in one splice, or nothing. `true` when the tree changed —
+    /// `false` says the patch was dropped, which is what leaves the tree stale.
+    ///
+    /// The rebuild itself runs under the lock — a copy of the arena, a few hundred
+    /// milliseconds for a few million nodes — because the tree it is built from has to be
+    /// the one it replaces. Installing it bumps the generation: every id in the arena is a
+    /// new id now, and a reader holding the old ones is reading a tree that no longer
+    /// exists.
+    fn install_patches(&self, generation: u64, patches: Vec<(NodeId, Option<Tree>)>) -> bool {
+        if patches.is_empty() {
+            return false;
+        }
+        let mut inner = self.lock();
+        if inner.generation != generation {
+            return false;
+        }
+        let Some(current) = inner.result.clone() else {
+            return false;
+        };
+        let tree = replace_subtrees(&current.tree, patches);
+        let patched = ScanResult {
+            root: current.root.clone(),
+            started_at: current.started_at,
+            duration_ms: current.duration_ms,
+            stats: patched_stats(&current.stats, &tree),
+            cancelled: current.cancelled,
+            tree,
+        };
+        inner.result = Some(Arc::new(patched));
+        inner.generation += 1;
+        // The lock goes before `current` does. `current` is a strong reference to the arena
+        // that was just replaced — hundreds of megabytes of it — and locals drop in reverse
+        // declaration order, so without this line its refcount falls while the guard is
+        // still alive. Today that costs nothing, because `patch_paths` holds the same `Arc`
+        // until it returns and the deallocation happens there instead; but that is a
+        // property of the caller's frame, and this function should not need one to be
+        // right. `start` releases the lock before dropping the previous tree for the same
+        // reason.
+        drop(inner);
+        true
+    }
+
     /// Body of the worker thread: a panic anywhere in the scan or the store becomes a
     /// `Failed` state, so the manager can never be stuck in `Running`. The scan and the
     /// store run unlocked; `scan:done` is emitted under the lock, so a ticker that wakes
     /// up afterwards finds the scan over and stays quiet.
     fn run(&self, root: PathBuf, progress: &ScanProgress, emitter: &dyn StatusEmitter) {
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-            scan(&ScanOptions::new(root), progress)
+            scan(&scan_options(root), progress)
                 .map(|result| Finished::persist(result, &self.snapshots_dir))
         }));
         let mut inner = self.lock();
@@ -336,19 +472,122 @@ impl Inner {
     }
 }
 
+/// Whether the tree the manager holds can still be shown as a description of the disk.
+///
+/// A deletion is the one thing that makes the difference visible: the row is either gone
+/// from the Explorer or it is a row for something that is not there any more, and only the
+/// code that tried to patch it knows which. It is an enum rather than the `bool` it wraps
+/// because the two booleans it is built from run the other way — `install_patches` returns
+/// `true` for *installed* — and a silent inversion here would report the good case as the
+/// bad one for ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeState {
+    /// The tree describes the disk as well as it did before the batch.
+    Current,
+    /// At least one row the batch deleted is still in the tree, and only a scan can put it
+    /// right.
+    Stale,
+}
+
+impl TreeState {
+    /// `installed`: the splice landed. `complete`: every path of the batch produced a patch
+    /// to splice. Anything less than both is a tree with a row nobody can act on.
+    fn of(installed: bool, complete: bool) -> Self {
+        if installed && complete {
+            Self::Current
+        } else {
+            Self::Stale
+        }
+    }
+}
+
+/// Step 2 of [`ScanManager::patch_paths`]: a fresh tree for every id, walked off the lock,
+/// and whether every one of them could be looked at.
+///
+/// Takes the result rather than the manager, so that the step that walks the disk has no
+/// way to reach the lock the other two steps take.
+///
+/// A path that cannot be rescanned is left out of the batch and its branch stays as the
+/// scan left it: a rescan fails when nobody can read the path, and a tree that cannot be
+/// read is not a tree that can be said to be gone. That is the `false` in the second half
+/// of the answer — the branch is still there and may name something that is not. A path
+/// that *is* gone is not a failure: it comes back as `None`, which is the patch that drops
+/// the branch.
+fn rescan_targets(result: &ScanResult, ids: &[NodeId]) -> (Vec<(NodeId, Option<Tree>)>, bool) {
+    let options = scan_options(result.root.clone());
+    let mut patches = Vec::with_capacity(ids.len());
+    let mut complete = true;
+    for &id in ids {
+        let path = result.tree.path(id);
+        match rescan_path(&path, &options) {
+            Ok(replacement) => patches.push((id, replacement)),
+            Err(err) => {
+                eprintln!("cannot rescan {}: {err}", path.display());
+                complete = false;
+            }
+        }
+    }
+    (patches, complete)
+}
+
+/// The options every scan of this app runs with, and every rescan that patches one.
+///
+/// One function for both, because a rescan that did not keep the rules of the scan it
+/// patches would splice in a branch the scan itself would never have produced — a volume it
+/// refused to enter, or a directory it was told to exclude. Add an option here, not at one
+/// of the two call sites.
+fn scan_options(root: PathBuf) -> ScanOptions {
+    ScanOptions::new(root)
+}
+
+/// The stats of a scan whose tree has just been patched.
+///
+/// `bytes`, `files` and `dirs` describe the tree, and the tree has changed: `ScanStats::bytes`
+/// is documented as the root node's size, and a header that disagrees with the rows below it
+/// — or with the free space the batch just gave back — is a header nobody can trust. They are
+/// recomputed here, the first two off the root node and the third in one pass over the arena,
+/// which is noise next to the rebuild that just ran.
+///
+/// `errors` and `hardlinks_skipped` describe the walk instead, like the `duration_ms` and
+/// `started_at` kept beside them: a patch has nothing to say about what a scan met on its way
+/// or how long it took, and pretending otherwise would date the whole scan to the deletion.
+/// The one number a patch can move the wrong way is `bytes`, and not through anything here:
+/// a rescan re-attributes hard links inside the branch alone, so a surviving link whose twin
+/// lives outside it takes its bytes back and the total *grows* after a deletion (see
+/// [`rescan_path`], and the design's section 6). The next full scan puts it right.
+fn patched_stats(stats: &ScanStats, tree: &Tree) -> ScanStats {
+    ScanStats {
+        // Widening, not narrowing: `file_count` is a `u32` because that is what the walker
+        // counts into, so a tree big enough to overflow it has overflowed there first.
+        files: u64::from(tree.root().file_count),
+        dirs: tree
+            .iter()
+            .filter(|(_, node)| node.kind == NodeKind::Dir)
+            .count() as u64,
+        bytes: tree.root().size,
+        errors: stats.errors,
+        hardlinks_skipped: stats.hardlinks_skipped,
+    }
+}
+
 fn panic_message(payload: &(dyn Any + Send)) -> String {
-    let message = payload
+    format!("the scan panicked: {}", panic_text(payload))
+}
+
+/// What a panic payload says, for a caller that has its own sentence to put it in.
+pub(crate) fn panic_text(payload: &(dyn Any + Send)) -> String {
+    payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_owned());
-    format!("the scan panicked: {message}")
+        .unwrap_or_else(|| "unknown panic".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
 
     use storage_monitor_core::scan::{Node, NodeKind, ScanStats, Subtree, Tree};
 
@@ -706,6 +945,375 @@ mod tests {
         inner.complete(second);
         assert_eq!(inner.state, ScanState::Done);
         assert!(inner.status().has_previous);
+    }
+
+    /// Everything that is deleted while the window is open goes through this: a scan, a
+    /// deletion on disk, then the patch.
+    fn scanned_fixture() -> (ScanManager, tempfile::TempDir, tempfile::TempDir) {
+        let data = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let manager = manager_in(data.path());
+        manager
+            .start(Arc::new(Events::default()), fixture.path().to_path_buf())
+            .unwrap();
+        assert_eq!(wait_until_finished(&manager).state, ScanState::Done);
+        (manager, fixture, data)
+    }
+
+    fn root_child(manager: &ScanManager, name: &str) -> Option<u64> {
+        manager
+            .with_result(|result, _| {
+                let tree = &result.tree;
+                tree.children(Tree::ROOT)
+                    .find(|id| &*tree.get(*id).unwrap().name == name)
+                    .map(|id| tree.get(id).unwrap().size)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn patching_a_deleted_path_drops_the_branch_and_bumps_the_generation() {
+        let (manager, fixture, _data) = scanned_fixture();
+        let before = manager
+            .with_result(|result, _| result.tree.root().size)
+            .unwrap();
+        let a = root_child(&manager, "a").expect("the fixture has a/");
+        let generation = manager.lock().generation;
+
+        fs::remove_dir_all(fixture.path().join("a")).unwrap();
+        assert_eq!(
+            manager.patch_paths(&[fixture.path().join("a")]),
+            TreeState::Current,
+            "the splice landed, so the tree describes the disk again"
+        );
+
+        assert_eq!(root_child(&manager, "a"), None, "the branch is gone");
+        assert_eq!(root_children(&manager), vec!["b.bin"]);
+        assert_eq!(
+            manager
+                .with_result(|result, _| result.tree.root().size)
+                .unwrap(),
+            before - a,
+        );
+        assert_eq!(
+            manager.lock().generation,
+            generation + 1,
+            "every id in the arena changed"
+        );
+    }
+
+    #[test]
+    fn a_patch_leaves_the_stats_of_the_scan_that_ran_and_recomputes_the_tree_facts() {
+        let (manager, fixture, _data) = scanned_fixture();
+        let before = manager
+            .with_result(|result, _| result.stats.clone())
+            .unwrap();
+        let duration_ms = manager.status().duration_ms;
+        assert_eq!((before.files, before.dirs), (3, 2));
+
+        fs::remove_dir_all(fixture.path().join("a")).unwrap();
+        assert_eq!(
+            manager.patch_paths(&[fixture.path().join("a")]),
+            TreeState::Current
+        );
+
+        let status = manager.status();
+        let after = manager
+            .with_result(|result, _| result.stats.clone())
+            .unwrap();
+        assert_eq!(after.files, 1, "two files left the tree");
+        assert_eq!(after.dirs, 1, "and so did one directory");
+        assert_eq!(
+            after.bytes,
+            manager
+                .with_result(|result, _| result.tree.root().size)
+                .unwrap(),
+            "the documented invariant: bytes is the root node's size"
+        );
+        assert!(after.bytes < before.bytes);
+        assert_eq!(
+            (after.errors, after.hardlinks_skipped),
+            (before.errors, before.hardlinks_skipped),
+            "what the walk met is not the patch's to change"
+        );
+        assert_eq!(
+            (status.files, status.dirs, status.bytes),
+            (after.files, after.dirs, after.bytes),
+            "the header the UI reads says the same"
+        );
+        assert_eq!(
+            status.duration_ms, duration_ms,
+            "the walk took what it took"
+        );
+    }
+
+    /// The other half of the rule, on numbers that are not zero: what the walk met on its
+    /// way is not the patch's to change. An unreadable directory counts one error per entry
+    /// it could not read, which is not the same as the one node that carries the message —
+    /// recomputing either of these from the tree would quietly change the header.
+    #[test]
+    fn a_patch_keeps_what_the_walk_met() {
+        if crate::running_as_root() {
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        // Two entries that can be listed but not stat'ed: 2 errors, 1 error node.
+        let locked = fixture.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        for name in ["x.bin", "y.bin"] {
+            fs::write(locked.join(name), b"x").unwrap();
+        }
+        // And one hard link, so `hardlinks_skipped` is not zero either.
+        fs::hard_link(
+            fixture.path().join("b.bin"),
+            fixture.path().join("twin.bin"),
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o444)).unwrap();
+        let manager = manager_in(data.path());
+        manager
+            .start(Arc::new(Events::default()), fixture.path().to_path_buf())
+            .unwrap();
+        let finished = wait_until_finished(&manager);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(finished.state, ScanState::Done, "{finished:?}");
+        let before = manager
+            .with_result(|result, _| result.stats.clone())
+            .unwrap();
+        assert_eq!(before.errors, 2, "two entries could not be read");
+        assert_eq!(before.hardlinks_skipped, 1);
+
+        fs::remove_dir_all(fixture.path().join("a")).unwrap();
+        assert_eq!(
+            manager.patch_paths(&[fixture.path().join("a")]),
+            TreeState::Current
+        );
+
+        let after = manager
+            .with_result(|result, _| result.stats.clone())
+            .unwrap();
+        assert_eq!(
+            after.errors, 2,
+            "the walk met two, and the error table holds one"
+        );
+        assert_eq!(after.hardlinks_skipped, 1);
+        assert_eq!(after.files, before.files - 2, "a/ took two files with it");
+        assert_eq!(after.dirs, before.dirs - 1);
+    }
+
+    /// The stats recomputed from an untouched tree are the ones the walk counted; without
+    /// that, every patch would shift the header by whatever the two rules disagree about.
+    #[test]
+    fn the_recomputed_tree_facts_agree_with_the_walker() {
+        let data = tempfile::tempdir().unwrap();
+        let fixture = wide_fixture(200);
+        let manager = manager_in(data.path());
+        manager
+            .start(Arc::new(Events::default()), fixture.path().to_path_buf())
+            .unwrap();
+        assert_eq!(wait_until_finished(&manager).state, ScanState::Done);
+        manager
+            .with_result(|result, _| {
+                let patched = patched_stats(&result.stats, &result.tree);
+                assert_eq!(patched.bytes, result.stats.bytes);
+                assert_eq!(patched.files, result.stats.files);
+                assert_eq!(patched.dirs, result.stats.dirs);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_path_the_tree_does_not_know_is_no_patch_at_all() {
+        let (manager, fixture, data) = scanned_fixture();
+        let generation = manager.lock().generation;
+        let before = root_children(&manager);
+        // A second spelling of `a/`, which names the same directory and is not what the
+        // scan recorded. Built here rather than taken from `canonicalize`, whose answer
+        // depends on whether this machine reaches its temporary directory through a
+        // symlink: where it does not, the path would be a key of the tree after all and
+        // this test would assert the opposite of what it means.
+        let link = data.path().join("link");
+        std::os::unix::fs::symlink(fixture.path(), &link).unwrap();
+        let through_link = link.join("a");
+        assert_ne!(through_link, fixture.path().join("a"));
+        assert!(through_link.is_dir(), "it still names the same directory");
+
+        assert_eq!(
+            manager.patch_paths(&[
+                fixture.path().join("never-existed"),
+                PathBuf::from("/elsewhere"),
+                through_link,
+            ]),
+            TreeState::Current,
+            "no row of this tree names any of them"
+        );
+
+        assert_eq!(root_children(&manager), before);
+        assert_eq!(
+            manager.lock().generation,
+            generation,
+            "no splice, so no new ids"
+        );
+    }
+
+    /// A rescan that fails says nothing about whether the path is there — a permission, a
+    /// loop — so its branch stays as the scan left it. Dropping it would tell the user the
+    /// directory is gone on the strength of an error that means the opposite.
+    #[test]
+    fn a_path_that_cannot_be_rescanned_keeps_its_branch() {
+        if crate::running_as_root() {
+            return;
+        }
+        let (manager, fixture, _data) = scanned_fixture();
+        let generation = manager.lock().generation;
+        let before = manager
+            .with_result(|result, _| result.tree.root().size)
+            .unwrap();
+        // Nothing below `a` can even be stat'ed now, so the rescan of `a/one.bin` fails
+        // rather than reporting it gone.
+        let locked = fixture.path().join("a");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let state = manager.patch_paths(&[locked.join("one.bin")]);
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            state,
+            TreeState::Stale,
+            "the branch may name something that is gone, and only a scan can tell"
+        );
+        assert_eq!(root_children(&manager), vec!["a", "b.bin"]);
+        assert!(
+            manager
+                .with_result(|result, _| result.tree.find(&locked.join("one.bin")).is_some())
+                .unwrap(),
+            "the branch is still there"
+        );
+        assert_eq!(
+            manager
+                .with_result(|result, _| result.tree.root().size)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            manager.lock().generation,
+            generation,
+            "an empty batch of patches is not a splice"
+        );
+    }
+
+    /// The root is the one node a splice cannot replace, so a patch naming it is dropped
+    /// before the rescan rather than after: after would mean walking the whole scan root —
+    /// the 25-second rescan the patching exists to avoid — and then throwing the result away.
+    #[test]
+    fn patching_the_scan_root_is_not_a_patch() {
+        let (manager, fixture, _data) = scanned_fixture();
+        let generation = manager.lock().generation;
+        let before = root_children(&manager);
+
+        // The claim itself: nothing is left to rescan. A splice that merely discarded the
+        // result afterwards would satisfy every assertion below it.
+        assert!(
+            manager
+                .patch_targets(&[fixture.path().to_path_buf()])
+                .is_none(),
+            "the root is dropped before the walk, not after it"
+        );
+        assert_eq!(
+            manager.patch_paths(&[fixture.path().to_path_buf()]),
+            TreeState::Current,
+            "and nothing was deleted that the tree is now wrong about"
+        );
+
+        assert_eq!(root_children(&manager), before);
+        assert_eq!(manager.lock().generation, generation);
+    }
+
+    #[test]
+    fn patching_without_a_result_does_nothing() {
+        let data = tempfile::tempdir().unwrap();
+        let manager = manager_in(data.path());
+        assert_eq!(
+            manager.patch_paths(&[PathBuf::from("/anything")]),
+            TreeState::Current,
+            "there is no tree to be wrong"
+        );
+        assert_eq!(manager.lock().generation, 0);
+        assert!(manager.with_result(|_, _| ()).is_none());
+    }
+
+    /// The three steps are a contract: what is rescanned off the lock is spliced back only
+    /// if the arena it was resolved against is still the one the manager holds. A scan that
+    /// finished meanwhile has replaced every id in it.
+    #[test]
+    fn a_patch_resolved_against_an_older_arena_is_dropped() {
+        let (manager, fixture, _data) = scanned_fixture();
+        let (result, generation, ids) = manager
+            .patch_targets(&[fixture.path().join("a")])
+            .expect("the tree knows a/");
+        assert_eq!(ids.len(), 1);
+        let (patches, complete) = rescan_targets(&result, &ids);
+        assert!(complete);
+        assert_eq!(patches.len(), 1);
+
+        // A rescan lands between the resolution and the splice.
+        manager
+            .start(Arc::new(Events::default()), fixture.path().to_path_buf())
+            .unwrap();
+        assert_eq!(wait_until_finished(&manager).state, ScanState::Done);
+        let current = manager.lock().generation;
+        assert_ne!(current, generation);
+
+        assert!(!manager.install_patches(generation, patches));
+        assert_eq!(
+            manager.lock().generation,
+            current,
+            "a dropped patch changes nothing, the generation included"
+        );
+        assert_eq!(root_children(&manager), vec!["a", "b.bin"]);
+    }
+
+    /// The same patch, installed on the generation it was resolved against.
+    #[test]
+    fn a_patch_resolved_against_the_current_arena_is_installed() {
+        let (manager, fixture, _data) = scanned_fixture();
+        let (result, generation, ids) = manager
+            .patch_targets(&[fixture.path().join("a")])
+            .expect("the tree knows a/");
+        fs::remove_dir_all(fixture.path().join("a")).unwrap();
+        // Nothing here can touch the manager: `rescan_targets` takes the result, not the
+        // manager, so the walk has no name for the lock. That is the step-2 contract, and
+        // it is the signature that holds it, not an assertion — a lock held across this
+        // call would hang the suite rather than fail it.
+        let (patches, complete) = rescan_targets(&result, &ids);
+        assert!(complete);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, ids[0]);
+        assert!(patches[0].1.is_none(), "a/ is gone, so it is dropped");
+
+        assert!(manager.install_patches(generation, patches));
+        assert_eq!(root_children(&manager), vec!["b.bin"]);
+        assert_eq!(manager.lock().generation, generation + 1);
+    }
+
+    /// The two booleans the three steps produce, and the one answer the window gets. They
+    /// run the other way round — `install_patches` returns `true` for the good case — so the
+    /// table is written out rather than reasoned about.
+    #[test]
+    fn only_an_installed_and_complete_patch_leaves_the_tree_current() {
+        assert_eq!(TreeState::of(true, true), TreeState::Current);
+        assert_eq!(
+            TreeState::of(false, true),
+            TreeState::Stale,
+            "the splice was dropped"
+        );
+        assert_eq!(
+            TreeState::of(true, false),
+            TreeState::Stale,
+            "a path could not be rescanned"
+        );
+        assert_eq!(TreeState::of(false, false), TreeState::Stale);
     }
 
     #[test]

@@ -71,4 +71,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: cargo clippy -p storage-monitor-desktop --all-targets -- -D warnings
       - run: cargo test -p storage-monitor-desktop
+      # Also on macOS: the deletion guards behave differently on a case-insensitive
+      # volume, and the ubuntu job above always takes the other branch. Without this,
+      # a regression of the aliasing fix passes CI green.
+      - run: cargo test -p storage-monitor-core --features testing
       - run: pnpm --filter @storage-monitor/desktop tauri build --debug --no-bundle

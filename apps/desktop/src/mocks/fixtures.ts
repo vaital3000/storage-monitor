@@ -1,7 +1,15 @@
-// A deterministic home folder for mock mode, unit tests and e2e: about 60 nodes and
-// 180 GB, with the artifacts the cleanup modules will target, two folders the scanner
-// cannot read, one it could read only in part, one mount point it skips, and a previous
-// snapshot for deltas.
+// The scanned tree the mock answers from: a deterministic home folder for mock mode, unit
+// tests and e2e — about 60 nodes and 180 GB, with the artifacts the cleanup modules will
+// target, two folders the scanner cannot read, one it could read only in part, one mount
+// point it skips, and a previous snapshot for deltas.
+//
+// This file is the tree and nothing else. `actions.ts` mirrors the guards and the engine
+// over it, and `actionLog.ts` mirrors the record of what they did.
+//
+// The tree is mutable through `patchTree` and nowhere else: a batch takes rows out of it
+// and then every id is handed out again over what is left, exactly as a deletion followed
+// by `ScanManager::patch_paths` and `install_patches` does in the app. `resetFixtureTree`
+// puts the whole tree back, and `resetMockActions` calls it between tests.
 
 import type { Crumb, Delta, DiskUsage, NodeId, NodeKind, NodeView, ScanStatus } from '../lib/ipc';
 
@@ -226,7 +234,8 @@ function build(spec: Spec): Built {
   };
 }
 
-function bySizeThenName(a: Built, b: Built): number {
+/** Siblings largest first, ties by name: the order `Tree::flatten` numbers them in. */
+function bySizeThenName(a: { size: number; name: string }, b: { size: number; name: string }) {
   return b.size - a.size || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 }
 
@@ -251,10 +260,22 @@ function flatten(root: Built): FixtureNode[] {
   return nodes;
 }
 
-/** Every node of the fixture, indexed by id. */
-export const fixtureNodes: readonly FixtureNode[] = flatten(build(HOME));
+/** Every node as the walker left it; `resetFixtureTree` puts this back. */
+const SCANNED: readonly FixtureNode[] = flatten(build(HOME));
 
-const byPath = new Map(fixtureNodes.map((node) => [node.path, node]));
+function copyOf(nodes: readonly FixtureNode[]): FixtureNode[] {
+  return nodes.map((node) => ({ ...node, children: [...node.children] }));
+}
+
+/**
+ * Every node of the tree **as it is now**, indexed by id.
+ *
+ * Reassigned, not mutated, by `renumberTree` below — which is why it is a `let` and why
+ * everything here reads it through the binding rather than through a copy taken at import.
+ */
+export let fixtureNodes: readonly FixtureNode[] = copyOf(SCANNED);
+
+let byPath = new Map(fixtureNodes.map((node) => [node.path, node]));
 
 /** The node at an absolute or root-relative path; throws for a path outside the fixture. */
 export function fixtureNode(path: string): FixtureNode {
@@ -280,7 +301,15 @@ function deltaOf(node: FixtureNode): number | null {
   return before === undefined ? null : node.size - before;
 }
 
-/** One page of the tree, built like `NodeView::build`; throws for an unknown id. */
+/**
+ * One page of the tree, built like `NodeView::build`; throws for an id the arena has not
+ * handed out.
+ *
+ * An id that named a node the last batch deleted does **not** throw — it names whatever
+ * node holds that slot now, which is the whole hazard `docs/adr/0005` is about: nothing
+ * upstream renumbers the ids the UI is holding, so asking again with one of them quietly
+ * answers about another directory.
+ */
 export function fixtureNodeView(id: NodeId = 0, limit = 500): NodeView {
   const node = fixtureNodes[id];
   if (node === undefined) {
@@ -324,11 +353,7 @@ export function fixtureNodeView(id: NodeId = 0, limit = 500): NodeView {
   };
 }
 
-/**
- * Growing directories, largest first, like `snapshot::top_growers`: a directory is left
- * out when one child explains at least 80% of its growth (the child is listed instead).
- */
-export function fixtureGrowers(): Delta[] {
+function computeGrowers(): Delta[] {
   const growing: Delta[] = [];
   for (const [path, before] of previousSizes) {
     const node = fixtureNode(path);
@@ -346,6 +371,21 @@ export function fixtureGrowers(): Delta[] {
     .sort((a, b) => b.delta - a.delta || (a.path < b.path ? -1 : 1));
 }
 
+/** The growers as the finished scan left them; `fixtureGrowers` hands out copies. */
+const GROWERS: readonly Delta[] = computeGrowers();
+
+/**
+ * Growing directories, largest first, like `snapshot::top_growers`: a directory is left
+ * out when one child explains at least 80% of its growth (the child is listed instead).
+ *
+ * Read once, when the fixture is built, because that is when `ScanManager` computes the
+ * list it hands to `top_growers` — a splice does not touch it. So a batch cannot change
+ * these numbers, and a path a batch deleted still reports the size the scan recorded.
+ */
+export function fixtureGrowers(): Delta[] {
+  return GROWERS.map((grower) => ({ ...grower }));
+}
+
 /** A 1 TB volume with the fixture's home folder on it. */
 export function fixtureDisk(): DiskUsage {
   const total = 994_662_584_320;
@@ -355,18 +395,122 @@ export function fixtureDisk(): DiskUsage {
 
 /** The status of the finished fixture scan, with a previous snapshot to compare against. */
 export function fixtureStatusDone(): ScanStatus {
-  const count = (test: (node: FixtureNode) => boolean) => fixtureNodes.filter(test).length;
   return {
     state: 'done',
     root: FIXTURE_ROOT,
-    files: count((n) => n.kind !== 'dir'),
-    dirs: count((n) => n.kind === 'dir'),
+    // The three `patched_stats` reads from the tree, from where it reads them: the root's
+    // own file count, the directories still in the arena, and the root's size.
+    files: fixtureNodes[0].fileCount,
+    dirs: fixtureNodes.filter((node) => node.kind === 'dir').length,
     bytes: fixtureNodes[0].size,
-    errors: count((n) => n.error === PERMISSION_DENIED) + PARTIAL_READ_ERRORS,
+    // The errors are the scan's, and a patch does not touch them — `patched_stats` carries
+    // `stats.errors` through untouched. Deleting a folder the walker could not read does not
+    // unmake the moment it could not read it, so this counts over `SCANNED`, the tree as it
+    // was walked, and not over the one a batch has since taken rows out of.
+    errors: SCANNED.filter((node) => node.error === PERMISSION_DENIED).length + PARTIAL_READ_ERRORS,
     currentPath: '',
     durationMs: SCAN_DURATION_MS,
     error: null,
     hasPrevious: true,
     previousTakenAt: PREVIOUS_TAKEN_AT,
   };
+}
+
+/** The entry at an absolute path, or `undefined` when nothing is there: the mock's `stat`. */
+export function fixtureEntry(path: string): FixtureNode | undefined {
+  return byPath.get(path);
+}
+
+/** The parent of a node, or `undefined` for the root. */
+export function parentOf(node: FixtureNode): FixtureNode | undefined {
+  return node.parent === null ? undefined : fixtureNodes[node.parent];
+}
+
+/**
+ * Takes a node and everything under it out of the tree, and shrinks every ancestor by what
+ * it held — which is what a deletion followed by `patch_paths` leaves behind.
+ *
+ * The arithmetic stands in for the rescan the manager really does. In the fixture the two
+ * agree, because nothing else can have changed on a disk that is this array.
+ *
+ * Not exported: on its own it leaves the arena holding nodes that are gone, and
+ * `fixtureStatusDone` counts directories over that arena. `patchTree` is the way in.
+ */
+function removeSubtree(node: FixtureNode): void {
+  const parent = parentOf(node);
+  if (parent !== undefined) {
+    parent.children.splice(parent.children.indexOf(node.id), 1);
+  }
+  for (let ancestor = parent; ancestor !== undefined; ancestor = parentOf(ancestor)) {
+    ancestor.size -= node.size;
+    ancestor.logicalSize -= node.logicalSize;
+    ancestor.fileCount -= node.fileCount;
+  }
+  const gone: FixtureNode[] = [node];
+  for (let next = 0; next < gone.length; next += 1) {
+    byPath.delete(gone[next].path);
+    for (const child of gone[next].children) {
+      gone.push(fixtureNodes[child]);
+    }
+  }
+}
+
+/**
+ * Hands out new ids: breadth first, siblings largest first, over what is left — which is
+ * what `install_patches` does to the arena, and `replace_subtrees` to every sibling group
+ * holding a node whose size changed.
+ *
+ * Every id the caller was holding now means a different node, or nothing; the nodes
+ * themselves are new objects, so a reference taken before this is a snapshot of the old
+ * arena and not a window onto the new one. Both of those are the app's own behaviour, and
+ * until the fixture did this no UI test could see either.
+ */
+function renumberTree(): void {
+  const old = fixtureNodes;
+  const nodes: FixtureNode[] = [];
+  const pending: Array<{ id: NodeId; children: readonly NodeId[] }> = [];
+  const place = (node: FixtureNode, parent: NodeId | null): NodeId => {
+    const id = nodes.length;
+    nodes.push({ ...node, id, parent, children: [] });
+    pending.push({ id, children: node.children });
+    return id;
+  };
+  place(old[0], null);
+  for (let next = 0; next < pending.length; next += 1) {
+    const { id, children } = pending[next];
+    for (const child of children.map((childId) => old[childId]).sort(bySizeThenName)) {
+      nodes[id].children.push(place(child, id));
+    }
+  }
+  fixtureNodes = nodes;
+  byPath = new Map(nodes.map((node) => [node.path, node]));
+}
+
+/**
+ * The splice, as `ScanManager::patch_paths` and `install_patches` do it together: the
+ * subtrees in `gone` leave the tree, and then every id is handed out again over what is
+ * left. The only way to change this tree, so that the two halves cannot come apart — the
+ * arena is left holding nodes that no longer exist if the second one is skipped, and
+ * `fixtureStatusDone` counts its directories.
+ *
+ * `touched` is not `gone.length > 0`, and that is the whole reason it is a parameter. The
+ * app splices for every path in `touched` — every entry **removed or failed** — and a
+ * failed entry is still on disk: its subtree is rescanned rather than dropped, and the
+ * arena is rebuilt all the same. So a batch that only failed removes no node and moves
+ * every id. `ExplorerPage`'s `afterBatch` reads the same two verdicts to decide whether to
+ * re-anchor, and these two have to agree.
+ */
+export function patchTree(gone: readonly FixtureNode[], touched: boolean): void {
+  for (const node of gone) {
+    removeSubtree(node);
+  }
+  if (touched) {
+    renumberTree();
+  }
+}
+
+/** Every node back as the fixture was built. Half of `resetMockActions`. */
+export function resetFixtureTree(): void {
+  fixtureNodes = copyOf(SCANNED);
+  byPath = new Map(fixtureNodes.map((node) => [node.path, node]));
 }

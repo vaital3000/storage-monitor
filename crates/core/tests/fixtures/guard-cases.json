@@ -1,0 +1,255 @@
+{
+  "about": [
+    "The safety rules of `Limits::check`, as cases both implementations answer.",
+    "",
+    "`crates/core/src/action/guards.rs` builds each scenario's tree in a temp directory and",
+    "runs `Limits::with_home` over it. `apps/desktop/src/mocks/actions.test.ts` runs the same",
+    "cases through `limitsFor`/`checkPath` over the /Users/demo fixture. A rule that changes",
+    "in one and not the other reddens a test here instead of drifting quietly, which is what",
+    "every divergence found by hand in this phase looked like beforehand.",
+    "",
+    "Scope: the six numbered placement rules, and nothing past them. `expect: \"ready\"` means",
+    "the rules let the path through — not that anything is there, which is the next stage's",
+    "question, and not that the batch will delete it, which the nesting pass may still refuse.",
+    "Both of those have their own tests on both sides.",
+    "",
+    "`root` and `home` are relative to the scenario's base: the temp directory in Rust, the",
+    "fixture root in TypeScript. Every path of `tree` must exist in both, so the entries here",
+    "are a subset of the fixture. A case's `base` is one of: `root`, `home`, `parent` (the",
+    "parent of the root), `sibling` (the root's own path with the case's path appended to its",
+    "last component) or `absolute` (the path as written).",
+    "",
+    "`nesting` is the other half: `drop_nested` decides which entries of one batch survive the",
+    "others, takes nothing but paths, and its tie-break is one predicate on each side. Its",
+    "paths are relative to each side's root, and `keep` is its answer, entry by entry."
+  ],
+  "scenarios": [
+    {
+      "name": "the home folder is the scan root, which is what `default_root` gives",
+      "root": "",
+      "home": "",
+      "tree": {
+        "dirs": ["Library", "Library/Caches", "Movies", "Downloads", ".Trash"],
+        "files": ["Movies/family-2025.mov", "Downloads/q3-report.pdf"]
+      },
+      "cases": [
+        {
+          "base": "root",
+          "path": "Movies",
+          "expect": "ready",
+          "why": "an ordinary folder of the scanned home: the denied entry for the home itself was dropped as the ancestor of the root"
+        },
+        {
+          "base": "root",
+          "path": "Movies/family-2025.mov",
+          "expect": "ready",
+          "why": "and a file inside it"
+        },
+        {
+          "base": "root",
+          "path": ".Trash",
+          "expect": "ready",
+          "why": "a folder the walker could not read is still a folder the user may delete"
+        },
+        {
+          "base": "root",
+          "path": "nope",
+          "expect": "ready",
+          "why": "the placement rules pass; whether anything is there is the next stage's question"
+        },
+        {
+          "base": "root",
+          "path": "./Movies",
+          "expect": "ready",
+          "why": "`.` is noise to `Path::components`"
+        },
+        {
+          "base": "root",
+          "path": "Downloads/../Movies",
+          "expect": "ready",
+          "why": "the rules judge the resolved path, and this one resolves inside the root"
+        },
+        {
+          "base": "root",
+          "path": "Library/../Movies",
+          "expect": "ready",
+          "why": "a path that leaves a denied folder is not in it"
+        },
+        {
+          "base": "root",
+          "path": "Library",
+          "expect": "denylisted",
+          "why": "`~/Library` is denied while the home folder is the scan root"
+        },
+        {
+          "base": "root",
+          "path": "Library/Caches",
+          "expect": "denylisted",
+          "why": "and everything below it"
+        },
+        {
+          "base": "root",
+          "path": "Library2",
+          "expect": "ready",
+          "why": "a name that starts with a denied name is not inside it: rule 6 compares components, and a bare string prefix would refuse this one. Nothing need be there — the rules judge placement, and rule 2 resolves the parent, not the entry"
+        },
+        {
+          "base": "sibling",
+          "path": "2",
+          "expect": "outsideRoots",
+          "why": "and rule 5 the same way round: a neighbour of the root whose name begins with the root's is outside it"
+        },
+        {
+          "base": "home",
+          "path": "Library/Caches/..",
+          "expect": "malformed",
+          "why": "rule 1 runs before the denylist: a path with no last component names something other than it appears to"
+        },
+        {
+          "base": "root",
+          "path": "",
+          "expect": "isRoot",
+          "why": "the scan root itself"
+        },
+        {
+          "base": "parent",
+          "path": "",
+          "expect": "isRoot",
+          "why": "and every ancestor of it, which would otherwise read as `outsideRoots` — true, and no help to anyone"
+        },
+        {
+          "base": "root",
+          "path": "Movies/..",
+          "expect": "malformed",
+          "why": "`remove(\"/a/b/..\")` empties `/a`"
+        },
+        {
+          "base": "absolute",
+          "path": "/",
+          "expect": "malformed",
+          "why": "no last component to judge, and rule 1 catches it before the denylist can"
+        },
+        {
+          "base": "absolute",
+          "path": "/etc/hosts",
+          "expect": "outsideRoots",
+          "why": "a real path outside the root, which on macOS resolves through /private"
+        },
+        {
+          "base": "absolute",
+          "path": "/System",
+          "expect": "outsideRoots",
+          "why": "rule 5 answers before the denylist does, and says the more useful thing"
+        }
+      ]
+    },
+    {
+      "name": "a scan root that is not the home folder, as a user-added root is not",
+      "root": "",
+      "home": "Documents",
+      "tree": {
+        "dirs": ["Library", "Documents", "Documents/Design"],
+        "files": []
+      },
+      "cases": [
+        {
+          "base": "root",
+          "path": "Library",
+          "expect": "ready",
+          "why": "the denied `Library` follows the home folder, and this scan's home is elsewhere"
+        },
+        {
+          "base": "home",
+          "path": "",
+          "expect": "denylisted",
+          "why": "the home folder itself is denied once it is not the root — the drop rule no longer takes it out of the list"
+        },
+        {
+          "base": "home",
+          "path": "Design",
+          "expect": "denylisted",
+          "why": "and everything under it"
+        },
+        {
+          "base": "home",
+          "path": "Library",
+          "expect": "denylisted",
+          "why": "which is where `<home>/Library` has moved to"
+        }
+      ]
+    },
+    {
+      "name": "a scan root inside the home folder",
+      "root": "Downloads",
+      "home": "",
+      "tree": {
+        "dirs": ["Library", "Downloads", "Movies"],
+        "files": ["Downloads/q3-report.pdf"]
+      },
+      "cases": [
+        {
+          "base": "root",
+          "path": "q3-report.pdf",
+          "expect": "ready",
+          "why": "inside the root the user chose"
+        },
+        {
+          "base": "root",
+          "path": "",
+          "expect": "isRoot",
+          "why": "the root itself, whatever it is inside"
+        },
+        {
+          "base": "home",
+          "path": "",
+          "expect": "isRoot",
+          "why": "the home folder is an ancestor of this root, so it is refused as one"
+        },
+        {
+          "base": "home",
+          "path": "Library",
+          "expect": "outsideRoots",
+          "why": "still denied, and rule 5 gets there first: it is not inside this root"
+        },
+        {
+          "base": "home",
+          "path": "Movies",
+          "expect": "outsideRoots",
+          "why": "a sibling of the root is outside it"
+        }
+      ]
+    }
+  ],
+  "nesting": [
+    {
+      "paths": ["Movies", "Movies/family-2025.mov"],
+      "keep": [true, false],
+      "why": "selecting a folder and something inside it is one click in a tree view"
+    },
+    {
+      "paths": ["Movies/family-2025.mov", "Movies"],
+      "keep": [false, true],
+      "why": "a strict ancestor always wins, whichever order the two arrive in"
+    },
+    {
+      "paths": ["Movies", "Movies"],
+      "keep": [true, false],
+      "why": "of several copies of one path the first survives — the tie-break, and the line most likely to be simplified away"
+    },
+    {
+      "paths": ["Library", "Library2"],
+      "keep": [true, true],
+      "why": "component-wise again: neither of these contains the other"
+    },
+    {
+      "paths": ["Movies", "Documents", "Movies/family-2025.mov", "Documents/Design"],
+      "keep": [true, true, false, false],
+      "why": "each entry is judged against every other, not only against its neighbour"
+    },
+    {
+      "paths": ["Documents/Design", "Documents", "Documents/Design"],
+      "keep": [false, true, false],
+      "why": "a later ancestor takes both copies of the entry below it"
+    }
+  ]
+}

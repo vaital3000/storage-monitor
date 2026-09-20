@@ -4,14 +4,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use storage_monitor_core::action::{ActionLog, LogTail, Mode, Preview};
 use storage_monitor_core::disk::{self, DiskUsage};
 use storage_monitor_core::paths;
 use storage_monitor_core::scan::{NodeId, Tree};
 use storage_monitor_core::snapshot::Delta;
-use tauri::{AppHandle, State};
+use storage_monitor_core::system::RealSystem;
+use tauri::{AppHandle, Runtime, State};
 
+use crate::actions::{self, BatchLock};
 use crate::scan_manager::ScanManager;
-use crate::views::{NodeView, ScanStatus};
+use crate::views::{BatchResult, NodeView, ScanStatus};
 
 const DEFAULT_CHILDREN_LIMIT: usize = 500;
 const DEFAULT_GROWERS_LIMIT: usize = 10;
@@ -27,9 +30,13 @@ pub fn default_root() -> Result<String, String> {
 }
 
 /// Starts a scan of `root` (default: the home folder); progress arrives as events.
+///
+/// Generic over the runtime, as every command reached through a generic
+/// [`configure`](crate::configure) has to be: the handle is the event sink, and the mock
+/// runtime the registration test builds over has a handle of its own.
 #[tauri::command]
-pub fn scan_start(
-    app: AppHandle,
+pub fn scan_start<R: Runtime>(
+    app: AppHandle<R>,
     manager: State<'_, ScanManager>,
     root: Option<String>,
 ) -> Result<ScanStatus, String> {
@@ -91,14 +98,155 @@ pub fn top_growers(manager: State<'_, ScanManager>, limit: Option<usize>) -> Vec
     manager.growers(limit.unwrap_or(DEFAULT_GROWERS_LIMIT))
 }
 
+/// What deleting `paths` would do, without touching anything: one row per path, with the
+/// guards' verdict on it.
+#[tauri::command]
+pub async fn action_preview(
+    manager: State<'_, ScanManager>,
+    sys: State<'_, RealSystem>,
+    paths: Vec<String>,
+    mode: Mode,
+) -> Result<Preview, String> {
+    let (manager, sys) = (manager.inner().clone(), sys.inner().clone());
+    let paths = to_paths(paths);
+    off_the_event_loop(move || actions::preview_batch(&manager, &sys, &paths, mode)).await
+}
+
+/// Deletes `paths`, records the batch and patches the tree. The two warnings of
+/// [`BatchResult`] come back with the outcome: an `Err` here means the batch did not run.
+///
+/// Takes paths and a mode, never a finished preview: a preview that came over the wire is a
+/// claim, and the guards run here on this side of it.
+#[tauri::command]
+pub async fn action_run(
+    manager: State<'_, ScanManager>,
+    sys: State<'_, RealSystem>,
+    log: State<'_, ActionLog>,
+    batches: State<'_, Arc<BatchLock>>,
+    paths: Vec<String>,
+    mode: Mode,
+) -> Result<BatchResult, String> {
+    let (manager, sys, log, batches) = (
+        manager.inner().clone(),
+        sys.inner().clone(),
+        log.inner().clone(),
+        Arc::clone(batches.inner()),
+    );
+    let paths = to_paths(paths);
+    off_the_event_loop(move || actions::run_batch(&manager, &sys, &log, &batches, paths, mode))
+        .await
+}
+
+/// What the app has deleted, for the Activity screen: the last `limit` entries of the
+/// action log, last line first, and how many lines could not be read.
+///
+/// [`actions::activity_tail`] is the contract — what `Err` means here, which answers stay
+/// inside the `Ok`, the default `limit` and what the read costs. This is the door to it.
+#[tauri::command]
+pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Result<LogTail, String> {
+    actions::activity_tail(log.inner(), limit)
+}
+
+fn to_paths(paths: Vec<String>) -> Vec<PathBuf> {
+    paths.into_iter().map(PathBuf::from).collect()
+}
+
+/// Runs `body` on a blocking thread, so the window keeps painting while a batch deletes and
+/// walks the disk — seconds of work, where every other command is a lookup. A panic in it,
+/// and the rebuild of the arena carries a live assertion, comes back as an error for the
+/// dialog instead of taking the window down.
+async fn off_the_event_loop<T: Send + 'static>(
+    body: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(body)
+        .await
+        .map_err(|err| format!("the batch did not finish: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_that_returns_comes_back_as_its_value() {
+        let value = tauri::async_runtime::block_on(off_the_event_loop(|| 7)).unwrap();
+        assert_eq!(value, 7);
+    }
+
+    /// A panic on the blocking thread reaches the UI as an error, which reads as "the batch
+    /// did not run" — and that is a lie about any panic raised *after* the entries were
+    /// deleted. It is why `run_batch` catches the splice itself: what happens here must stay
+    /// the report of a batch that never got that far.
+    #[test]
+    fn a_panicking_body_comes_back_as_an_error() {
+        let err = tauri::async_runtime::block_on(off_the_event_loop(|| {
+            panic!("the arena rebuild ran past its ceiling")
+        }))
+        .unwrap_err();
+        assert!(err.contains("did not finish"), "{err}");
+    }
 
     #[test]
     fn default_root_is_the_home_folder() {
         let root = default_root().unwrap();
         assert_eq!(Some(PathBuf::from(&root)), paths::home_dir());
         assert!(root.starts_with('/'), "{root}");
+    }
+
+    /// The command over the [`ActionLog`] the app manages. The batch is written through an
+    /// `ActionLog` of this test's own, built over the same path, and read back through the
+    /// command's `State<'_, ActionLog>` — and the two being separate handles is the point:
+    /// what comes back proves that the state resolves and that `log.inner()` forwards the
+    /// log the app was given, rather than proving that one object can see its own writes.
+    ///
+    /// The three answers themselves are pinned in `actions.rs`, against
+    /// [`actions::activity_tail`] directly, and the registration of this command is pinned
+    /// in `lib.rs` over real IPC with a sentinel line. What is left here that neither of
+    /// those has is the forwarding — so if this file ever gets crowded, this test is the
+    /// first thing to go, and it is the reason to keep it that should go first with it.
+    #[test]
+    fn the_activity_command_reads_the_log_the_app_manages() {
+        use storage_monitor_core::action::{EntryOutcome, EntryResult, Outcome};
+        use storage_monitor_core::scan::NodeKind;
+        use tauri::Manager;
+
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions.jsonl");
+        app.manage(ActionLog::new(path.clone()));
+
+        assert_eq!(
+            activity_log(app.state(), None).expect("nothing has been deleted yet"),
+            LogTail::default(),
+            "a log that was never written is an empty list, not a failure"
+        );
+
+        let entry = |name: &str| EntryOutcome {
+            path: PathBuf::from(name),
+            kind: NodeKind::File,
+            result: EntryResult::Removed { bytes: 1_024 },
+        };
+        ActionLog::new(path.clone())
+            .append(&Outcome {
+                entries: vec![entry("/h/older"), entry("/h/newer")],
+                freed_bytes: 2_048,
+                at: chrono::Utc::now(),
+                mode: Mode::Trash,
+            })
+            .expect("the log is written");
+        let tail = activity_log(app.state(), Some(1)).expect("the log reads");
+        assert_eq!(
+            tail.entries.len(),
+            1,
+            "the limit reaches the read: {tail:?}"
+        );
+        assert_eq!(tail.entries[0].path, "/h/newer", "newest first");
+
+        // The same log, now impossible to read: a directory in its place.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = activity_log(app.state(), None)
+            .expect_err("a read that failed must not reach the screen as an empty list");
+        assert!(err.contains("action log"), "{err}");
     }
 }

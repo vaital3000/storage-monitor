@@ -22,6 +22,7 @@ lz4_flex = "0.14"
 nix = { version = "0.31", features = ["fs"] }
 dirs = "7"
 tempfile = "3"
+trash = "5.2.9"
 
 # Debug builds carry the debug info of every dependency, which in a Tauri tree is
 # hundreds of crates and most of `target/debug`. Keep line tables for our own

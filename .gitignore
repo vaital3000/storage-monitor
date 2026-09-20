@@ -16,6 +16,14 @@ node_modules/
 # Frontend build output
 apps/desktop/dist/
 
+# Emitted beside the configs by a stray `tsc -b`: tsconfig.node.json is composite and
+# includes vite.config.ts, so it writes JavaScript, declarations and a build stamp there.
+# `pnpm typecheck` never does (tsconfig.json is noEmit), but one `tsc -b` leaves all three
+# where the next `git add -A` would take them.
+apps/desktop/vite.config.js
+apps/desktop/vite.config.d.ts
+apps/desktop/*.tsbuildinfo
+
 # Tauri generated files
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/target/

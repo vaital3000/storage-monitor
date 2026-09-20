@@ -31,11 +31,51 @@ export function formatPercent(part: number, whole: number): string {
   return `${((part / whole) * 100).toFixed(1)}%`;
 }
 
+const pad = (n: number) => String(n).padStart(2, '0');
+
 /** `2026-09-18`: the local calendar date of a Unix timestamp in seconds. */
 export function formatDate(unixSeconds: number): string {
   const date = new Date(unixSeconds * 1000);
-  const pad = (n: number) => String(n).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
+ * `2026-09-18 14:32:05`: the local date and time of day of an RFC 3339 stamp — and the
+ * stamp itself when this platform cannot read it.
+ *
+ * Seconds, because the caller is the action log, where every line of one batch carries the
+ * instant the batch began: without them two batches a few seconds apart read as one.
+ *
+ * The fallback is not defensive decoration, though it is narrower than it first looks.
+ * What *writes* the log cannot produce an unreadable stamp — `System::now` is `Utc::now`,
+ * whose nanoseconds never reach a leap second — but what *reads* it accepts more than
+ * `Date.parse` does, and a line can come from a hand-edited file or another writer. At
+ * least two stamps are legal to both readers and `NaN` here: a leap second (`23:59:60Z`)
+ * and a stamp with space around it, which `chrono` and the mock's own grammar (`^\s*…\s*$`)
+ * both take. A record of deletions may not print `NaN-NaN-NaN` over a line it is holding,
+ * so such a stamp is shown as it was written.
+ */
+export function formatTimestamp(rfc3339: string): string {
+  const ms = Date.parse(rfc3339);
+  if (Number.isNaN(ms)) {
+    return rfc3339;
+  }
+  const date = new Date(ms);
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `${formatDate(ms / 1000)} ${time}`;
+}
+
+/**
+ * `2026-09-18`: the local calendar date of an RFC 3339 stamp, with the same fallback as
+ * [`formatTimestamp`] — for the callers that want the day and not the minute.
+ *
+ * It exists because `formatDate` takes Unix seconds, so every caller holding a stamp was
+ * writing `formatDate(Date.parse(at) / 1000)`, which formats `NaN` into `NaN-NaN-NaN`
+ * rather than saying it could not read the stamp.
+ */
+export function formatStampDate(rfc3339: string): string {
+  const ms = Date.parse(rfc3339);
+  return Number.isNaN(ms) ? rfc3339 : formatDate(ms / 1000);
 }
 
 /**
@@ -79,7 +119,13 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
 }
 
-/** `1 item`, `12,345 read errors`: a count with its noun, pluralised with an `s`. */
-export function countLabel(count: number, singular: string): string {
-  return `${count.toLocaleString('en-US')} ${count === 1 ? singular : `${singular}s`}`;
+/**
+ * `1 item`, `12,345 read errors`, `2 damaged entries`: a count with its noun.
+ *
+ * The plural defaults to the singular with an `s`, which is every noun this app counts but
+ * one — so a caller whose noun ends in a `y` hands over its own rather than settling for
+ * "entrys".
+ */
+export function countLabel(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count.toLocaleString('en-US')} ${count === 1 ? singular : plural}`;
 }

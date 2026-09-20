@@ -9,8 +9,7 @@ interface SidebarProps {
 
 /**
  * The five sections of the design. Sections of later phases are disabled buttons, dimmed
- * and marked "soon" (the badge is part of their accessible name); only the Explorer
- * navigates.
+ * and marked "soon" (the badge is part of their accessible name); the rest navigate.
  */
 export default function Sidebar({ page, onNavigate, versionLabel }: SidebarProps) {
   return (
