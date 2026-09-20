@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/vaital3000/storage-monitor/compare/v0.2.0...v0.3.0) (2026-09-20)
+
+
+### Features
+
+* delete from the Explorer (phase 2a) ([#14](https://github.com/vaital3000/storage-monitor/issues/14)) ([48cc265](https://github.com/vaital3000/storage-monitor/commit/48cc265ef7be8269c198306aae2db8763f4dde36))
+
 ## [0.2.0](https://github.com/vaital3000/storage-monitor/compare/v0.1.0...v0.2.0) (2026-09-18)
 
 

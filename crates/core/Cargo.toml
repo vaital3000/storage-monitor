@@ -1,6 +1,6 @@
 [package]
 name = "storage-monitor-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Core library of Storage Monitor: disk scanner, module contract, action engine"
 edition.workspace = true
 rust-version.workspace = true
