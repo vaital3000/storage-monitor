@@ -24,9 +24,10 @@ apps/desktop/src-tauri/   Tauri commands and app state, thin wrapper over core
   src/views.rs            camelCase payloads that cross IPC (ScanStatus, NodeView)
   src/commands.rs         Tauri commands over the manager and core
 apps/desktop/src/         React UI. Backend calls only through src/lib/ipc.ts
-  lib/                    ipc.ts (typed commands and events), format.ts, nodeErrors.ts, pages.ts
+  lib/                    ipc.ts (typed commands and events), format.ts, nodeErrors.ts,
+                          blockReasons.ts (a guard verdict in words), pages.ts
   hooks/                  useScan: the scan state machine fed by scan:progress and scan:done
-  pages/                  ExplorerPage and the placeholder of the sections of later phases
+  pages/                  ExplorerPage, ActivityPage and the placeholder of the later phases
   components/             app shell, NodeTable, Treemap (ECharts), Breadcrumbs, ScanProgress
   mocks/                  IPC mock and the /Users/demo fixture (unit tests, e2e, `just dev-web`)
     ipc.ts                the commands; fixtures.ts the scanned tree

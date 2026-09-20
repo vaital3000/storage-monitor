@@ -309,6 +309,15 @@ deleted, bytes freed, and every failure with its reason.
 The Activity page replaces its placeholder with a table of the most recent log
 entries — time, path, mode, result, bytes — and an empty state.
 
+It is the record, so the three ways of losing lines quietly are all closed: the
+`damaged` count is on screen whether or not anything else was readable (which
+makes a log of nothing but torn lines something other than an empty one), a
+read that failed is an error with the backend's sentence and a retry rather
+than "No actions yet", and a full 200 entries back says it is the end of a file
+that nothing prunes. Nothing invalidates the query after a batch: the shell
+renders one page at a time, so the screen is always unmounted while a deletion
+runs and every open is a fresh read.
+
 ## 9. Testing
 
 Rust unit tests: each guard rule separately (a symlink is not resolved, the

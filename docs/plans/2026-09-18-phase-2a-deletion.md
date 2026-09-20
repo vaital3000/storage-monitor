@@ -1549,13 +1549,15 @@ git commit -m "feat(desktop): delete selected entries from the Explorer"
 
 **Files:**
 
-- Create: `apps/desktop/src/pages/ActivityPage.tsx`
-- Modify: `apps/desktop/src/lib/pages.ts`, the shell that routes to the pages
-- Test: `apps/desktop/src/pages/ActivityPage.test.tsx`
+- Create: `apps/desktop/src/pages/ActivityPage.tsx`, `apps/desktop/src/lib/blockReasons.ts`
+- Modify: `apps/desktop/src/lib/pages.ts`, `apps/desktop/src/App.tsx`, `apps/desktop/src/lib/format.ts`, `apps/desktop/src/components/ConfirmDeleteDialog.tsx`, `apps/desktop/src/test/render.tsx`
+- Test: `apps/desktop/src/pages/ActivityPage.test.tsx`, `apps/desktop/src/App.test.tsx`, `apps/desktop/src/lib/format.test.ts`
 
 **Step 1: Write the failing tests**
 
 An empty log renders "No actions yet"; entries render newest first with a formatted time, the path, the mode and the size; a failed entry shows its message; a row's path is the one the guards normalized, which under a symlinked scan root is **not** the spelling the Explorer showed — so do not try to match an Activity row back to a tree row by string; a **skipped** entry shows its reason, mapped from `detail` — and the map reads `result` first, because `detail` carries a failure message for `Failed` and a block reason for `Skipped`, so a failure whose message reads `denylisted` is not a blocked entry; a non-zero `damaged` count renders as "N damaged entries hidden", never silently; a log that could not be read renders as an error rather than as an empty list; the page refetches when it is opened after a batch.
+
+Four more the list above turned out to need: a log of nothing but damaged lines is **not** an empty log; a `skipped` line whose reason this build has no name for still gets a sentence; an entry that was removed and freed nothing shows `0 B` rather than the dash that means "nothing to say"; and the error's "Try again" actually reads the log again.
 
 **Step 2: Run to verify failure**
 
@@ -1563,7 +1565,21 @@ Run: `pnpm --filter @storage-monitor/desktop test src/pages/ActivityPage.test.ts
 
 **Step 3: Implement**
 
-Flip `available` to `true` for `activity` in `pages.ts` and route to the new page. A `useQuery` over `activityLog(200)` with `staleTime: 0`. Reuse `formatBytes` and `formatDate` from `src/lib/format.ts`; add a time-of-day format there if the date alone is not enough, with its own unit test.
+Flip `available` to `true` for `activity` in `pages.ts` and route to the new page. A `useQuery` over `activityLog(200)` with `staleTime: 0`. Reuse `formatBytes` from `src/lib/format.ts`, and add the stamp format below.
+
+**`formatDate` cannot be reused for the time, and the time of day is not optional.** It takes Unix seconds and `at` is an RFC 3339 string — `ExplorerPage` already carries the conversion at its one call site. `formatTimestamp` is that conversion, once, with the time of day: every line of a batch carries the instant the batch *began*, so a date alone makes two batches on one day one row of evidence. It gives a stamp it cannot read back **unchanged**, because `chrono`'s grammar is wider than `Date.parse`'s — a leap second is a stamp the backend writes, the mock's reader accepts and this engine answers `NaN` for, and `NaN-NaN-NaN` over a line of the record is the screen lying about it in the smallest possible way.
+
+**Nothing invalidates an activity query, and that is the decision rather than an omission.** `App` renders one page at a time, so a batch from the Explorer always runs while this page is unmounted: an `invalidateQueries({ queryKey: ['activity'] })` in `afterBatch` would mark a query nobody is observing, and the next mount re-reads regardless. It would be a line whose comment claims a benefit it does not have. What the screen leans on is the mount — and `staleTime: 0` is the library's default (`isStaleByTime(staleTime = 0)` in query-core 5.103.1), so writing it out pins nothing on its own; the test is a second mount over **one** `QueryClient`, which `staleTime: Infinity` fails. `renderWithClient` takes that client as a second argument for it, since a fresh one per render turns every remount into a first load. The cost is that the cached list is shown while the re-read is in flight; `gcTime: 0` would trade that for a loading flash on every open, over a read measured at 1.3 ms for 10 000 entries. **If a later phase mounts this screen beside something that deletes** — a split view, a deletion started from Cleanup in 2b — the invalidation becomes real and has to be added.
+
+**"No actions yet" is held back for a log that is genuinely empty.** The first and the sixth test above collide as written: a tail of `entries: []` with `damaged: 3` is not an empty log, and the empty state over it is the same silent loss `damaged` exists to prevent. The empty state needs `entries.length === 0` **and** `damaged === 0`; the damaged note renders whether or not anything else was readable.
+
+**The screen also says when it is showing only the end of the file.** `LogTail` carries no total and nothing prunes `actions.jsonl`, so 200 back may be 200 of 5 000. A full limit reads "The 200 most recent entries; the record may hold more", anything less is the plain count. (`=== LIMIT` and `>= LIMIT` are indistinguishable, because the reader never returns more than it was asked for — the one equivalent mutant of this task.)
+
+**A `BlockReason` this build has no words for.** `logDetail` answers `null` for it by design, so a row that renders what it is given is left with a blank explanation — exactly what `UNKNOWN_BLOCK_REASON` exists for in the dialog. Both screens now take the eight sentences and that fallback from `src/lib/blockReasons.ts`; the vocabulary was private to `ConfirmDeleteDialog`, and the record is not the dialog's junior.
+
+**The failure message names the path, so a failed row shows it twice.** `LogEntry::detail` says so outright: the message comes from `SystemError`'s `Display`, which formats `cannot delete <path>: …`. Taken, because the alternative is guessing which part of someone else's sentence is a path — `activity.png` will show it.
+
+**`App.test.tsx` belongs to this task.** Flipping `available` breaks "lists the five sections … the others disabled and marked soon", which is the shell's test and not the page's; and `home.png` loses the "soon" beside Activity.
 
 **Step 4: Run the tests and commit**
 

@@ -78,6 +78,23 @@ describe('ActivityPage', () => {
     expect(screen.queryByTestId('activity-damaged')).not.toBeInTheDocument();
   });
 
+  it('heads the screen and its columns, which is what says which column is which', async () => {
+    // "Trash" in the third cell means "the mode" only because of the row above it, and a
+    // header a screen reader cannot reach is not there at all — so the columns are read
+    // by role, in order, rather than counted.
+    record();
+    show();
+    await shown();
+    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Activity');
+    expect(screen.getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual([
+      'When',
+      'Path',
+      'Mode',
+      'Result',
+      'Size',
+    ]);
+  });
+
   it('shows when an entry was deleted, what it was, how, and what it freed', async () => {
     record({ path: under('Movies/holiday.mov'), mode: 'permanent', bytes: 4_000_000_000 });
     show();
