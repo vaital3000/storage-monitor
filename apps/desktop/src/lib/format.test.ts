@@ -7,6 +7,7 @@ import {
   formatDelta,
   formatDuration,
   formatPercent,
+  formatStampDate,
   formatTimestamp,
   shortenPath,
 } from './format';
@@ -156,6 +157,15 @@ describe('countLabel', () => {
 });
 
 describe('formatTimestamp', () => {
+  it('runs outside UTC, or half of what these tests check is invisible', () => {
+    // Every test below is written to hold in any zone, which is exactly why none of them
+    // can see a local/UTC mix-up when local *is* UTC — and a CI runner's clock is UTC.
+    // `vitest.config.ts` pins a zone with an offset and a summer time; this is the
+    // assertion that fails if that line goes away.
+    expect(new Date(2026, 8, 18).getTimezoneOffset()).not.toBe(0);
+    expect(new Date(2026, 0, 18).getTimezoneOffset()).not.toBe(0);
+  });
+
   it('shows the local date and time of day of an RFC 3339 stamp', () => {
     // Built locally and sent as the instant it is, so the expectation holds in every
     // time zone — the same trick `formatDate`'s test uses one describe above.
@@ -172,14 +182,31 @@ describe('formatTimestamp', () => {
   });
 
   it('gives back a stamp this platform cannot read, instead of NaN', () => {
-    // A leap second is a second to `chrono`, which is what writes the log and what the
-    // mock's reader was measured against; the ECMAScript date grammar stops at 59. So
-    // this is a line the backend can write and the browser cannot parse — and the first
-    // assertion is what says which of the two moved, on the day this fails.
+    // Two stamps the log's readers accept and this engine does not: a leap second, which
+    // is a second to `chrono` while the ECMAScript grammar stops at 59, and a stamp with
+    // space around it, which `chrono` and the mock's own grammar both allow. Neither is
+    // written by this app — `Utc::now` cannot produce one — but a hand-edited or
+    // foreign line can. The `Date.parse` assertions are what say which side moved, on
+    // the day one of these fails.
     const leap = '2026-06-30T23:59:60Z';
+    const spaced = ' 2026-09-18T09:15:00Z ';
     expect(Date.parse(leap)).toBeNaN();
+    expect(Date.parse(spaced)).toBeNaN();
     expect(formatTimestamp(leap)).toBe(leap);
+    expect(formatTimestamp(spaced)).toBe(spaced);
     expect(formatTimestamp('whenever')).toBe('whenever');
     expect(formatTimestamp('')).toBe('');
+  });
+});
+
+describe('formatStampDate', () => {
+  it('shows the local calendar date of a stamp, and the stamp when it cannot', () => {
+    // Half an hour before local midnight, so the instant has already crossed into the
+    // next day in the zone this suite is pinned to: a formatter reading the UTC clock
+    // answers the 19th here, and only a local one answers the 18th.
+    const at = new Date(2026, 8, 18, 23, 30, 0);
+    expect(formatStampDate(at.toISOString())).toBe('2026-09-18');
+    expect(formatStampDate('2026-06-30T23:59:60Z')).toBe('2026-06-30T23:59:60Z');
+    expect(formatStampDate('whenever')).toBe('whenever');
   });
 });

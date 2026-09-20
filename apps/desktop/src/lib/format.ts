@@ -46,11 +46,14 @@ export function formatDate(unixSeconds: number): string {
  * Seconds, because the caller is the action log, where every line of one batch carries the
  * instant the batch began: without them two batches a few seconds apart read as one.
  *
- * The fallback is not defensive decoration. `at` is written by `chrono`, whose grammar is
- * wider than the one `Date.parse` is required to accept — a leap second (`23:59:60Z`) is a
- * stamp `chrono` writes, the mock's reader takes and this engine answers `NaN` for. A
- * record of deletions may not print `NaN-NaN-NaN` over a line it is holding, so an
- * unreadable stamp is shown as it was written.
+ * The fallback is not defensive decoration, though it is narrower than it first looks.
+ * What *writes* the log cannot produce an unreadable stamp — `System::now` is `Utc::now`,
+ * whose nanoseconds never reach a leap second — but what *reads* it accepts more than
+ * `Date.parse` does, and a line can come from a hand-edited file or another writer. At
+ * least two stamps are legal to both readers and `NaN` here: a leap second (`23:59:60Z`)
+ * and a stamp with space around it, which `chrono` and the mock's own grammar (`^\s*…\s*$`)
+ * both take. A record of deletions may not print `NaN-NaN-NaN` over a line it is holding,
+ * so such a stamp is shown as it was written.
  */
 export function formatTimestamp(rfc3339: string): string {
   const ms = Date.parse(rfc3339);
@@ -60,6 +63,19 @@ export function formatTimestamp(rfc3339: string): string {
   const date = new Date(ms);
   const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
   return `${formatDate(ms / 1000)} ${time}`;
+}
+
+/**
+ * `2026-09-18`: the local calendar date of an RFC 3339 stamp, with the same fallback as
+ * [`formatTimestamp`] — for the callers that want the day and not the minute.
+ *
+ * It exists because `formatDate` takes Unix seconds, so every caller holding a stamp was
+ * writing `formatDate(Date.parse(at) / 1000)`, which formats `NaN` into `NaN-NaN-NaN`
+ * rather than saying it could not read the stamp.
+ */
+export function formatStampDate(rfc3339: string): string {
+  const ms = Date.parse(rfc3339);
+  return Number.isNaN(ms) ? rfc3339 : formatDate(ms / 1000);
 }
 
 /**

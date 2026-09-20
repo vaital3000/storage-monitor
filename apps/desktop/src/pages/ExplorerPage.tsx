@@ -9,7 +9,7 @@ import NodeTable from '../components/NodeTable';
 import ScanProgress from '../components/ScanProgress';
 import Treemap from '../components/Treemap';
 import { useScan } from '../hooks/useScan';
-import { basename, countLabel, formatBytes, formatDate, formatDuration } from '../lib/format';
+import { basename, countLabel, formatBytes, formatDuration, formatStampDate } from '../lib/format';
 import {
   actionPreview,
   actionRun,
@@ -137,9 +137,13 @@ interface ResultHeaderProps {
 
 function ResultHeader({ status, disk, onRescan }: ResultHeaderProps) {
   const root = status.root ?? '';
+  // Through `formatStampDate`, not `formatDate(Date.parse(at) / 1000)`: the same stamp
+  // this app cannot always read, and the same reason the Activity screen gives for
+  // refusing to print `NaN-NaN-NaN` over one. A snapshot is stamped by the app itself, so
+  // the unreadable case is remote here — which is why it read like that for a phase.
   const previous =
     status.hasPrevious && status.previousTakenAt !== null
-      ? formatDate(Date.parse(status.previousTakenAt) / 1000)
+      ? formatStampDate(status.previousTakenAt)
       : null;
   return (
     <header className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
@@ -481,6 +485,13 @@ export default function ExplorerPage() {
     // would go on drawing a tree that no longer exists.
     void queries.invalidateQueries({ queryKey: ['treeNode', generation] });
     void queries.invalidateQueries({ queryKey: ['diskUsage', generation] });
+    // And deliberately not `['activity']`, which this batch has just added lines to. The
+    // shell renders one page at a time, so the Activity screen is unmounted whenever this
+    // code runs: the invalidation would be aimed at a query nobody is observing, and that
+    // screen re-reads the log on every mount anyway (`staleTime: 0`, and the comment on
+    // its `useQuery` says so from the other end). A screen that deletes *while* Activity
+    // is mounted — a split view, a batch started from Cleanup in 2b — changes that, and
+    // is the case to add it for.
     // A batch emits no event, so the header's bytes and counters have to be asked for.
     void scan.refresh();
     // And the id this page navigates by is one of the ids that moved: `install_patches`
