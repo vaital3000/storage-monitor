@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 
 test('renders the app name and the mocked backend version', async ({ page }) => {
   await page.goto('/');

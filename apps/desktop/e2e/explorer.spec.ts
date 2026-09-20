@@ -1,7 +1,9 @@
 // The Explorer flow against the mocked backend (`vite --mode mock`): the simulated scan
 // keeps its browser pace (150 ms per tick) so the progress panel is visible.
 
-import { expect, test, type Locator, type Page } from '@playwright/test';
+// `test` comes from `./fixtures`, not from Playwright: it runs every one of these under the
+// window's own Content Security Policy and fails the test that trips it.
+import { expect, test, type Locator, type Page } from './fixtures';
 
 const ROOT = '/Users/demo';
 const PERMISSION_DENIED = 'Operation not permitted (os error 1)';
