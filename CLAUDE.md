@@ -113,6 +113,11 @@ both use the same store. Cancelled scans are not persisted. Format details:
   in `src/mocks/ipc.ts`.
 - Tree queries are keyed by the scan generation (`useScan().generation`) with
   `staleTime: Infinity`: a rescan refetches, an older result stays cached until then.
+  The Activity query (`['activity']`) is the one deliberate exception — `staleTime: 0`,
+  so every open re-reads the action log — and nothing invalidates it after a batch,
+  because the shell renders one page at a time and that screen is unmounted whenever a
+  deletion runs. A screen that deletes *while* Activity is mounted is what would change
+  that; `ExplorerPage`'s `afterBatch` and the page's own `useQuery` both say so.
 - `StatusEmitter::emit` runs while the manager lock is held: an implementation
   must never call back into `ScanManager`.
 - Sizes are allocated bytes (`st_blocks * 512`), formatted 1000-based
@@ -154,6 +159,11 @@ both use the same store. Cancelled scans are not persisted. Format details:
   simulated scan with `setMockScanDelay(0)` (`src/test/setup.ts`); Playwright
   keeps the browser pace and reaches the mock through
   `window.__STORAGE_MONITOR_MOCK__`.
+- Vitest runs in a pinned zone (`env: { TZ: 'America/New_York' }` in
+  `vitest.config.ts`), not in the machine's. The app formats instants into local
+  time, CI runners are UTC, and in UTC `getUTCHours` for `getHours` is the same
+  function — so the tests that exist for that mix-up cannot see it there.
+  `the_suite_runs_outside_utc` in `src/lib/format.test.ts` fails if the pin goes.
 - Playwright serves the mock on port 1430 and writes `explorer.png`,
   `explorer-dark.png` and `home.png` under `apps/desktop/test-results/`, which
   it wipes on every run.
