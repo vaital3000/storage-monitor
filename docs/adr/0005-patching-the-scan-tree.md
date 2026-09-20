@@ -18,7 +18,7 @@ impossible — removing one child would have to shift every id after it.
 
 ## Decision
 
-`Tree::replace_subtrees` rebuilds the arena rather than editing it, and
+`scan::replace_subtrees` rebuilds the arena rather than editing it, and
 `ScanManager::install_patches` bumps the generation when it installs the
 result. **A `NodeId` does not survive a generation.** Any reader holding ids
 from before the splice is reading a tree that no longer exists.
