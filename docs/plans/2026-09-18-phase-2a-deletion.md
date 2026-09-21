@@ -1683,3 +1683,68 @@ gh pr create --title "feat: delete from the Explorer (phase 2a)" --body "..."
 ```
 
 The body carries the test plan, the manual verification above, and the screenshots. Wait for green CI, self-review the diff, then squash-merge. release-please will open the release PR for `0.3.0` (a `feat` commit bumps the minor); close and reopen it once so CI runs, check that the diff is versions and changelog only, merge it, and verify the built assets like in the previous phases.
+
+---
+
+## Outcome (2026-09-21)
+
+Phase 2a shipped as [`v0.3.0`](https://github.com/vaital3000/storage-monitor/releases/tag/v0.3.0):
+PR #14, squash-merged 2026-09-20, and the release PR #15. `release.yml` attached
+the universal `.dmg`, the CLI tarball and `checksums.txt`. 341 vitest, 301 Rust
+and 17 Playwright tests, from 114 / 83 / 7 at the branch point.
+
+The manual pass of Task 17 Step 6 is written up in PR #14's body, which checked
+off seven items and named two it did not cover. Both are closed here.
+
+**The run under the real policy.** `pnpm tauri build --debug --bundles app`,
+launched from a terminal with a control planted in `main.tsx`: the four
+violation classes of `csp.spec.ts`, plus a `securitypolicyviolation` listener
+drawing everything it hears into an overlay that stays up for the whole session.
+All four were stopped at `tauri://localhost`, and **zero unexpected violations**
+came in across a full home scan, three deletion batches, the dialog, the
+Activity screen over IPC and the treemap repainting after each patch. That is
+the gap `csp.spec.ts` cannot reach: its origin is `http://localhost:1430` and
+its module graph is Vite's, not the bundle's.
+
+The pass also turned up something the Playwright suite cannot show, because it
+runs on Chromium: **in WebKit a blocked resource does not only report, it
+throws.** `new Worker(blob:…)` raised, the throw left the module body of
+`main.tsx`, and the window came up black with nothing but the probe on it —
+`ReactDOM.render` never ran. The policy is therefore not a safety net that
+degrades: a violation on the boot path is fatal. ADR 0006 now says so.
+
+**The tree patch, measured at last** — the number the plan asked for and PR #14
+left blank rather than guessed. On a home tree of 547,828 directories and
+4,107,680 files:
+
+| touched paths | wall clock |
+|---|---|
+| 47 | 4.04 s |
+| 1 | 3.52 s |
+| 1 | 6.08 s |
+
+Against the 25 s of a full rescan that ADR 0005 weighs it against, the patch
+wins by four to six times. It does **not** win by being small: one path costs
+what forty-seven cost, because the arena is rebuilt whole and the cost is the
+size of the tree, not the size of the deletion. Deleting one folder from a
+4-million-file home therefore holds the dialog busy for seconds, every time.
+
+**One latent flake, found by the release.** The `frontend` job went red on the
+release PR with the phase's own code: three tests clicked Rescan and waited for
+`node-rows`, which the table of the *previous* scan already satisfies —
+`useScan`'s `start` awaits the backend, so the status turns `running` a tick
+later. The wait ended before the rescan began and the assertions were really
+gated by a fixed 20 ms sleep. A probe reading the table's identity found the
+stale element on an idle machine on every run: the test had never waited for
+anything. Fixed in #16 by waiting for the table to be a *different* element.
+
+Follow-ups recorded for later phases:
+
+- **`~/Library` is denied wholesale**, so `~/Library/Caches` is refused along
+  with `Keychains`. Inside a home scan it is the only entry the denylist really
+  decides — everything else is already outside the root — and it would block the
+  xcode module's `DerivedData` in phase 5. Replace it with the paths that matter.
+- **The patch costs seconds and does not scale down.** Rebuilding the arena is
+  what makes the ids move (ADR 0005), so trading it for an in-place edit is a
+  design question, not a tuning one. Worth reopening before the phase 6 polish.
+- The `style` commit type is still not in the allowed list (carried from phase 1).

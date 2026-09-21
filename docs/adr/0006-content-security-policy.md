@@ -109,6 +109,17 @@ own task does the compiling. And an alarm nobody trips is indistinguishable from
 one that cannot fire, so a `test.fail()` spec plants a violation without
 declaring it, and passes only by failing.
 
+**A refusal is not always an event; in WebKit it is a throw.** Measured in a
+`--debug` bundle on 2026-09-21, with the four classes planted in the shipping
+engine rather than in Chromium: `new Worker(blob:…)` _raised_, and the throw left
+the module body of `main.tsx` before `ReactDOM.render` ever ran — the window came
+up black with nothing on it. So this policy is not a net that degrades what it
+catches. A violation anywhere on the boot path takes the whole window, and no
+amount of Playwright can show that, because the e2e control plants its four
+classes inside one `page.evaluate` long after the app has mounted. Whatever
+reaches for a blocked resource while the app is coming up has to be treated as
+fatal, not as a missing font.
+
 Serving the policy also costs the dev server its fast refresh: the React
 plugin's preamble is an inline `<script>`, which `script-src 'self'` blocks, and
 the app then never mounts. That is why the e2e server turns fast refresh off and
