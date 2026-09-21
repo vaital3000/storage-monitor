@@ -147,6 +147,10 @@ const HOME: Spec = dir('demo', [
       dir('Code', [file('CachedData', gb(1.26), 2)]),
       file('Slack.db', mb(640), 1),
     ]),
+    // Small, and here for its verdict rather than its size: the one row of the fixture that
+    // is denied outright inside a shielded folder, which is what tells the two lists apart
+    // on screen. `guard-cases.json` names it, so it has to exist on this side too.
+    dir('Keychains', [file('login.keychain-db', mb(18), 0)]),
   ]),
   dir('Downloads', [
     file('macOS Sequoia 15.6 Installer.dmg', gb(13.87), 9),

@@ -110,13 +110,16 @@ export const DELETION_MODES = ['trash', 'permanent'] as const;
 export type DeletionMode = (typeof DELETION_MODES)[number];
 
 /**
- * Why an entry will not be deleted, mirroring `BlockReason`. All eight of them: the guards
+ * Why an entry will not be deleted, mirroring `BlockReason`. All nine of them: the guards
  * tell `missing` from `unreadable` (grant Full Disk Access, do not go hunting for a ghost)
  * and `malformed` from both, so a screen that folds them together says the wrong thing.
+ * `shielded` is the one that is not a dead end — the folder is refused, what is inside it
+ * is not — so folding it into `denylisted` would cost the user the way forward.
  */
 export const BLOCK_REASONS = [
   'outsideRoots',
   'denylisted',
+  'shielded',
   'malformed',
   'isRoot',
   'nested',

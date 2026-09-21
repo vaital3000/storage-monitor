@@ -55,6 +55,14 @@ pub enum BlockReason {
     OutsideRoots,
     /// Inside a place the app never deletes from.
     Denylisted,
+    /// The entry is a folder that may not be deleted as a whole, though what is inside it
+    /// may. `~/Library` and the three folders of application data under it: losing any of
+    /// them in one tick is expensive, and cleaning them one entry at a time is the point.
+    ///
+    /// The only reason here that leaves the user somewhere to go — the other eight say no,
+    /// this one says *not like this* — which is why it is worth telling apart from
+    /// [`Self::Denylisted`] rather than folding into it.
+    Shielded,
     /// The path does not name an entry at all: `/`, or a path ending in `..`.
     Malformed,
     /// The scan root itself, or one of its ancestors.

@@ -313,7 +313,7 @@ describe('the deletion commands', () => {
         path: `${FIXTURE_ROOT}/Library`,
         kind: 'other',
         size: 0,
-        status: { state: 'blocked', reason: 'denylisted' },
+        status: { state: 'blocked', reason: 'shielded' },
       },
     ]);
     expect(preview.totalBytes).toBe(0);
@@ -379,7 +379,7 @@ describe('the deletion commands', () => {
       expect(preview.mode).toBe('permanent');
       expect(preview.entries.map((entry) => entry.status)).toEqual([
         { state: 'ready' },
-        { state: 'blocked', reason: 'denylisted' },
+        { state: 'blocked', reason: 'shielded' },
       ]);
       expect(preview.totalBytes).toBe(film.size);
     });

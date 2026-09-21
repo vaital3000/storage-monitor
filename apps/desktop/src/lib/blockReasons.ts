@@ -21,6 +21,7 @@ import type { BlockReason } from './ipc';
 const BLOCK_REASON_LABELS: Record<BlockReason, string> = {
   outsideRoots: 'Outside the folder that was scanned',
   denylisted: 'Inside a folder this app never deletes from',
+  shielded: 'Not as a whole — open it and choose what inside',
   malformed: 'Not a path that names an entry',
   isRoot: 'The scanned folder itself, or one above it',
   nested: 'Another entry contains it',

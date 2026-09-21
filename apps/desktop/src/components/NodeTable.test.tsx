@@ -646,7 +646,13 @@ describe('NodeTable selection', () => {
         onSelectionChange={changed}
       />,
     );
-    expect(shownNames()).toEqual(['Developer', 'Containers', 'Caches', 'Application Support']);
+    expect(shownNames()).toEqual([
+      'Developer',
+      'Containers',
+      'Caches',
+      'Application Support',
+      'Keychains',
+    ]);
     expect(changed).not.toHaveBeenCalled();
   });
 
@@ -700,7 +706,13 @@ describe('NodeTable selection', () => {
       ),
     };
     rerender(<Selectable node={renumbered} onSelectionChange={changed} />);
-    expect(shownNames()).toEqual(['Developer', 'Containers', 'Caches', 'Application Support']);
+    expect(shownNames()).toEqual([
+      'Developer',
+      'Containers',
+      'Caches',
+      'Application Support',
+      'Keychains',
+    ]);
     expect(tickedInOrder()).toEqual(['Developer']);
 
     fireEvent.click(boxFor('Caches'), { shiftKey: true });

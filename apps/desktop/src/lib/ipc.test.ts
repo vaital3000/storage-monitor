@@ -24,11 +24,12 @@ describe('the wire vocabularies', () => {
     expect(NODE_KINDS).toEqual(['dir', 'file', 'symlink', 'other']);
     expect(DELETION_MODES).toEqual(['trash', 'permanent']);
     expect(LOG_RESULTS).toEqual(['removed', 'failed', 'skipped']);
-    // All eight of `BlockReason`, in the order `crates/core/src/action/model.rs` declares
+    // All nine of `BlockReason`, in the order `crates/core/src/action/model.rs` declares
     // them. A screen that renders a label per reason reads this list.
     expect(BLOCK_REASONS).toEqual([
       'outsideRoots',
       'denylisted',
+      'shielded',
       'malformed',
       'isRoot',
       'nested',

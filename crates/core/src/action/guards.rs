@@ -12,6 +12,45 @@ use std::path::{Path, PathBuf};
 
 use super::BlockReason;
 
+/// The names under `~/Library` that stay denied outright, contents and all (ADR 0007).
+///
+/// The list is short because everything on it shares one property: it is never a place
+/// anyone goes to reclaim space, so denying it costs no gigabytes. Two of them cost more
+/// than the rest to get wrong. `Mobile Documents` is iCloud Drive and `CloudStorage` is
+/// where Dropbox, OneDrive and Google Drive mount their file providers: they sit on the
+/// data volume like ordinary folders — measured, not assumed — so nothing structural tells
+/// them apart, and the Trash does not undo them. Moving a file-provider item to the Trash
+/// *is* the deletion, on every device signed into that account.
+///
+/// Names absent from a given Mac cost nothing: a denied entry that resolves to nothing
+/// matches nothing (`a_denied_path_nothing_can_resolve_stays_powerless`).
+const HOME_LIBRARY_DENIED: [&str; 16] = [
+    "Accounts",
+    "Application Scripts",
+    "Autosave Information",
+    "Calendars",
+    "CloudStorage",
+    "Contacts",
+    "Cookies",
+    "IdentityServices",
+    "Keychains",
+    "Mail",
+    "Messages",
+    "Mobile Documents",
+    "Photos",
+    "Preferences",
+    "Reminders",
+    "Safari",
+];
+
+/// The folders under `~/Library` that are refused as an entry while their contents are not.
+///
+/// These three hold application data: expensive to lose in one tick, and the ordinary way
+/// to reclaim space from them is one application at a time. `~/Library` itself is shielded
+/// beside them, in [`Limits::with_home`], which is what makes `Caches`, `Developer`,
+/// `Logs` and the rest of it deletable at all.
+const HOME_LIBRARY_SHIELDED: [&str; 3] = ["Application Support", "Containers", "Group Containers"];
+
 /// What [`Limits::check`] decided about one path: the two forms the engine needs.
 ///
 /// They differ in the last component alone, and only when the disk spells it otherwise than
@@ -51,6 +90,11 @@ pub struct Limits {
     root_as_given: PathBuf,
     /// Every denied path in both the spellings `forms` produces.
     denied: Vec<PathBuf>,
+    /// Every shielded path in both those spellings: refused as an entry, and as nothing
+    /// else. Unlike `denied` these are never dropped for containing the root, and they do
+    /// not need to be — rule 4 reaches a shielded path that is the root or above it first,
+    /// and rule 5 reaches one that is outside it.
+    shielded: Vec<PathBuf>,
 }
 
 impl Limits {
@@ -97,7 +141,16 @@ impl Limits {
             root,
             root_as_given,
             denied,
+            shielded: Vec::new(),
         }
+    }
+
+    /// Adds paths that are refused as an entry while everything inside them is judged on
+    /// its own. Rule 7; [`BlockReason::Shielded`] says what that means to a user.
+    #[must_use]
+    pub fn shielding(mut self, shielded: Vec<PathBuf>) -> Self {
+        self.shielded = shielded.iter().flat_map(|s| forms(s)).collect();
+        self
     }
 
     /// The root plus the standard denylist of the design (section 5).
@@ -131,11 +184,15 @@ impl Limits {
             PathBuf::from("/tmp"),
             PathBuf::from("/private"),
         ];
+        let mut shielded = Vec::new();
         if let Some(home) = home {
-            denied.push(home.join("Library"));
+            let library = home.join("Library");
+            denied.extend(HOME_LIBRARY_DENIED.iter().map(|name| library.join(name)));
+            shielded.extend(HOME_LIBRARY_SHIELDED.iter().map(|name| library.join(name)));
+            shielded.push(library);
             denied.push(home);
         }
-        Self::new(root, denied)
+        Self::new(root, denied).shielding(shielded)
     }
 
     /// Normalizes `path` and applies every rule. [`Checked::path`] is what the engine
@@ -179,6 +236,13 @@ impl Limits {
         // 6. The denied entry itself (equality again) and everything below it.
         if self.denied.iter().any(|d| judged.starts_with(d)) {
             return Err(BlockReason::Denylisted);
+        }
+        // 7. A shielded entry, and *only* the entry: equality, never `starts_with`. That one
+        //    operator is the whole difference between this rule and rule 6, and it is why
+        //    rule 6 runs first — `~/Library` is shielded and `~/Library/Keychains` is denied,
+        //    so the denied answer has to win inside a shield it lives in.
+        if self.shielded.contains(&judged) {
+            return Err(BlockReason::Shielded);
         }
         Ok(Checked {
             path: normalized,
@@ -695,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn the_standard_denylist_protects_the_library_folder_of_the_home_it_is_given() {
+    fn the_standard_limits_shield_the_library_folder_and_deny_the_few_names_inside_it() {
         // `for_scan_root` reads the real home folder, so the rule is exercised through the
         // seam it delegates to, with a temp directory standing in for the home.
         let dir = tempfile::tempdir().unwrap();
@@ -703,21 +767,49 @@ mod tests {
         // path, so `<home>/Library` is recorded in the spelling a checked path resolves to
         // whether or not it exists yet. `a_denied_folder_that_appears_later_is_still_denied`
         // is the test for that; this one is about the rule itself.
-        let library = dir.path().join("Library/Caches");
-        fs::create_dir_all(&library).unwrap();
+        let caches = dir.path().join("Library/Caches");
+        fs::create_dir_all(&caches).unwrap();
+        let keychains = dir.path().join("Library/Keychains");
+        fs::create_dir_all(&keychains).unwrap();
+        let support = dir.path().join("Library/Application Support");
+        fs::create_dir_all(support.join("JetBrains")).unwrap();
         let keep = dir.path().join("Downloads/a.bin");
         fs::create_dir_all(keep.parent().unwrap()).unwrap();
         fs::write(&keep, b"x").unwrap();
         let limits = Limits::with_home(dir.path().to_path_buf(), Some(dir.path().to_path_buf()));
+
         assert_eq!(
-            limits.check(&library),
-            Err(BlockReason::Denylisted),
-            "~/Library is denied"
+            limits.check(&dir.path().join("Library")),
+            Err(BlockReason::Shielded),
+            "~/Library is refused as an entry"
         );
         assert_eq!(
-            limits.check(&library.join("app")),
+            limits.check(&support),
+            Err(BlockReason::Shielded),
+            "and so is each folder of application data under it"
+        );
+        // The positive control of the whole rule. A shield that took its contents with it
+        // would be a denylist under another name, and would pass every assertion above.
+        assert_eq!(
+            limits.check(&caches).unwrap().path,
+            fs::canonicalize(&caches).unwrap(),
+            "what is inside a shield is judged on its own"
+        );
+        assert_eq!(
+            limits.check(&support.join("JetBrains")).unwrap().path,
+            fs::canonicalize(support.join("JetBrains")).unwrap(),
+            "one application's data at a time, which is why the folder is shielded and not denied"
+        );
+
+        assert_eq!(
+            limits.check(&keychains),
             Err(BlockReason::Denylisted),
-            "and everything under it"
+            "the few names inside the shield that are denied outright"
+        );
+        assert_eq!(
+            limits.check(&keychains.join("login.keychain-db")),
+            Err(BlockReason::Denylisted),
+            "with everything below them — the one difference between the two lists"
         );
         assert_eq!(
             limits.check(&keep).unwrap().path,
@@ -865,6 +957,50 @@ mod tests {
     }
 
     #[test]
+    fn a_shielded_folder_is_shielded_in_every_spelling_the_volume_accepts() {
+        // The hazard the test above pins for rule 6, which rule 7 does not inherit for free:
+        // it compares by equality where rule 6 compares by containment, and an equality is
+        // the easier of the two to write against the spelling that happened to arrive. A
+        // shield on `Library` that let `library` past would be no shield at all.
+        let dir = tempfile::tempdir().unwrap();
+        let insensitive = case_insensitive(dir.path());
+        let caches = dir.path().join("Library/Caches");
+        fs::create_dir_all(&caches).unwrap();
+        let limits = Limits::new(dir.path().to_path_buf(), vec![])
+            .shielding(vec![dir.path().join("Library")]);
+
+        assert_eq!(
+            limits.check(&dir.path().join("Library")),
+            Err(BlockReason::Shielded),
+            "the spelling on disk, on any volume"
+        );
+        for spelling in ["library", "LIBRARY"] {
+            let verdict = limits.check(&dir.path().join(spelling));
+            if insensitive {
+                assert_eq!(
+                    verdict,
+                    Err(BlockReason::Shielded),
+                    "<root>/{spelling} opens the shielded directory on this volume"
+                );
+            } else {
+                // Case-sensitive: a different name, naming nothing, and shielding it would
+                // be shielding a path that has nothing to do with the shielded one.
+                assert_eq!(
+                    verdict.unwrap().path,
+                    fs::canonicalize(dir.path()).unwrap().join(spelling),
+                    "<root>/{spelling} is its own path on this volume"
+                );
+            }
+        }
+        // The other half of the rule, and the half a `starts_with` would quietly take away.
+        assert_eq!(
+            limits.check(&caches).unwrap().path,
+            fs::canonicalize(&caches).unwrap(),
+            "the shield covers the folder and nothing under it"
+        );
+    }
+
+    #[test]
     fn the_checked_path_keeps_the_last_component_the_caller_wrote() {
         // Judging the resolved form must not turn into returning it. Only the spelling of
         // a name can differ here, and on this volume either spelling opens the same
@@ -991,19 +1127,32 @@ mod tests {
         // Pinned as a decision, not left as an accident: the denylist is there to keep a
         // scan of the home folder from wandering into ~/Library, and a root the user named
         // is a place they meant to go. `Limits::new` documents the same thing.
+        //
+        // What it unlocks is what the *home* entry was covering, and no more. The names of
+        // `HOME_LIBRARY_DENIED` are not a navigation guard that a root can answer — they are
+        // there because losing one is not recoverable — so they stay denied wherever the
+        // root is pointed. Only an entry that contains the root is dropped, and none of them
+        // ever contains it.
         let dir = tempfile::tempdir().unwrap();
         let library = dir.path().join("Library");
+        let caches = library.join("Caches");
         let keychains = library.join("Keychains");
+        fs::create_dir_all(&caches).unwrap();
         fs::create_dir_all(&keychains).unwrap();
         let limits = Limits::with_home(library.clone(), Some(dir.path().to_path_buf()));
         assert_eq!(
-            limits.check(&keychains).unwrap().path,
-            fs::canonicalize(&keychains).unwrap()
+            limits.check(&caches).unwrap().path,
+            fs::canonicalize(&caches).unwrap()
         );
         assert_eq!(
             limits.check(&library),
             Err(BlockReason::IsRoot),
             "the root itself is still refused"
+        );
+        assert_eq!(
+            limits.check(&keychains),
+            Err(BlockReason::Denylisted),
+            "and naming the root is not a way to reach what is denied outright"
         );
     }
 

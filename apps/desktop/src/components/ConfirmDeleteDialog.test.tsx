@@ -216,13 +216,14 @@ describe('ConfirmDeleteDialog', () => {
     expect(keeper).not.toHaveClass('text-muted');
   });
 
-  it('says each of the eight block reasons in its own words', () => {
+  it('says each of the nine block reasons in its own words', () => {
     // Pinned pairwise, and not by a shape a permutation would also satisfy. The pair the
     // backend most insists on is `missing` against `unreadable` (`ipc.ts`): one sends the
     // user hunting for a file that is gone, the other to grant Full Disk Access.
     const words: Record<BlockReason, string> = {
       outsideRoots: 'Outside the folder that was scanned',
       denylisted: 'Inside a folder this app never deletes from',
+      shielded: 'Not as a whole — open it and choose what inside',
       malformed: 'Not a path that names an entry',
       isRoot: 'The scanned folder itself, or one above it',
       nested: 'Another entry contains it',
@@ -230,7 +231,7 @@ describe('ConfirmDeleteDialog', () => {
       unreadable: 'Cannot be read — it may need Full Disk Access',
       kindChanged: 'No longer what the preview saw',
     };
-    // A ninth reason mirrored into `ipc.ts` has to arrive here too, rather than falling
+    // A tenth reason mirrored into `ipc.ts` has to arrive here too, rather than falling
     // through to the unknown-variant line that exists for older builds in the wild.
     expect(Object.keys(words).sort()).toEqual([...BLOCK_REASONS].sort());
 
@@ -244,7 +245,7 @@ describe('ConfirmDeleteDialog', () => {
   });
 
   it('names a reason this build does not know instead of showing nothing', () => {
-    // A ninth `BlockReason`, added in Rust and mirrored in `ipc.ts` after this file was
+    // A tenth `BlockReason`, added in Rust and mirrored in `ipc.ts` after this file was
     // built. An unknown key must not render as a blank line next to a path.
     show(previewOf([blocked(`${ROOT}/thing`, 'quarantined' as BlockReason)]));
     expect(within(itemFor(`${ROOT}/thing`)).getByTestId('block-reason')).toHaveTextContent(

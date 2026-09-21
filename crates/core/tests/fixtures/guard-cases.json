@@ -8,7 +8,7 @@
     "in one and not the other reddens a test here instead of drifting quietly, which is what",
     "every divergence found by hand in this phase looked like beforehand.",
     "",
-    "Scope: the six numbered placement rules, and nothing past them. `expect: \"ready\"` means",
+    "Scope: the seven numbered placement rules, and nothing past them. `expect: \"ready\"` means",
     "the rules let the path through — not that anything is there, which is the next stage's",
     "question, and not that the batch will delete it, which the nesting pass may still refuse.",
     "Both of those have their own tests on both sides.",
@@ -29,7 +29,16 @@
       "root": "",
       "home": "",
       "tree": {
-        "dirs": ["Library", "Library/Caches", "Movies", "Downloads", ".Trash"],
+        "dirs": [
+          "Library",
+          "Library/Caches",
+          "Library/Containers",
+          "Library/Containers/com.docker.docker",
+          "Library/Keychains",
+          "Movies",
+          "Downloads",
+          ".Trash"
+        ],
         "files": ["Movies/family-2025.mov", "Downloads/q3-report.pdf"]
       },
       "cases": [
@@ -78,14 +87,44 @@
         {
           "base": "root",
           "path": "Library",
-          "expect": "denylisted",
-          "why": "`~/Library` is denied while the home folder is the scan root"
+          "expect": "shielded",
+          "why": "`~/Library` is a shield, not a wall: the folder itself is refused, so no single tick can take the whole of it"
         },
         {
           "base": "root",
           "path": "Library/Caches",
+          "expect": "ready",
+          "why": "and what is inside it is judged on its own — this is the folder the shield exists to let through, and the positive control of the whole rule: a shield that refused its contents too would pass every case below"
+        },
+        {
+          "base": "root",
+          "path": "Library/Containers",
+          "expect": "shielded",
+          "why": "shielded in its own right: app data is expensive to lose all at once and cheap to clean one app at a time"
+        },
+        {
+          "base": "root",
+          "path": "Library/Containers/com.docker.docker",
+          "expect": "ready",
+          "why": "the one app inside it, which is the whole point of shielding the folder rather than denying it"
+        },
+        {
+          "base": "root",
+          "path": "Library/Keychains",
           "expect": "denylisted",
-          "why": "and everything below it"
+          "why": "the few names inside the shield that stay denied outright. Nothing need be there: rule 2 resolves `Library`, and the rules judge placement"
+        },
+        {
+          "base": "root",
+          "path": "Library/Keychains/login.keychain-db",
+          "expect": "denylisted",
+          "why": "a denied entry still takes everything below it — that is what tells `denied` from `shielded`"
+        },
+        {
+          "base": "root",
+          "path": "Library/Mobile Documents",
+          "expect": "denylisted",
+          "why": "iCloud Drive, and the one category the Trash cannot undo: moving a file-provider item to the Trash deletes it from the cloud, on every device at once"
         },
         {
           "base": "root",

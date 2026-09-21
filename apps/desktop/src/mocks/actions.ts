@@ -25,16 +25,39 @@ import {
 } from './fixtures';
 import { appendToLog, resetActionLog } from './actionLog';
 
+/** `HOME_LIBRARY_DENIED` of `guards.rs`: denied outright, contents and all (ADR 0007). */
+const HOME_LIBRARY_DENIED = [
+  'Accounts',
+  'Application Scripts',
+  'Autosave Information',
+  'Calendars',
+  'CloudStorage',
+  'Contacts',
+  'Cookies',
+  'IdentityServices',
+  'Keychains',
+  'Mail',
+  'Messages',
+  'Mobile Documents',
+  'Photos',
+  'Preferences',
+  'Reminders',
+  'Safari',
+];
+
 /**
  * The standard denylist of `Limits::with_home` for a machine whose home folder is `home`.
  *
  * Two axes, as in the Rust: this one is the machine's, and `limitsFor` narrows it by the
  * root of the scan. The mock's home is the fixture root — `default_root` returns it exactly
- * as the app returns `$HOME` — so the fixture's whole `Library` subtree is undeletable here,
- * as `~/Library` is in the app until a module declares a path inside it.
+ * as the app returns `$HOME` — so what is denied here is denied in the app.
+ *
+ * `~/Library` is not on this list: it is shielded instead, and the few names under it that
+ * are denied are. See `shieldedFor` and ADR 0007.
  */
 export function deniedFor(home: string): string[] {
   return [
+    ...HOME_LIBRARY_DENIED.map((name) => `${home}/Library/${name}`),
     '/',
     '/System',
     '/usr',
@@ -50,8 +73,21 @@ export function deniedFor(home: string): string[] {
     '/var',
     '/tmp',
     '/private',
-    `${home}/Library`,
     home,
+  ];
+}
+
+/**
+ * `HOME_LIBRARY_SHIELDED` of `guards.rs`, plus `~/Library` itself: refused as an entry
+ * while everything inside them is judged on its own (ADR 0007).
+ */
+export function shieldedFor(home: string): string[] {
+  const library = `${home}/Library`;
+  return [
+    `${library}/Application Support`,
+    `${library}/Containers`,
+    `${library}/Group Containers`,
+    library,
   ];
 }
 
@@ -61,6 +97,11 @@ export interface Limits {
   root: string;
   /** The denied paths that do not contain the root. */
   denied: readonly string[];
+  /**
+   * The shielded paths, kept whole: rule 7 compares by equality, so an entry that contains
+   * the root can never match one inside it and there is nothing to drop.
+   */
+  shielded: readonly string[];
 }
 
 /**
@@ -72,7 +113,11 @@ export interface Limits {
  * every entry of every batch.
  */
 export function limitsFor(root: string, home: string = FIXTURE_ROOT): Limits {
-  return { root, denied: deniedFor(home).filter((denied) => !isAtOrUnder(root, denied)) };
+  return {
+    root,
+    denied: deniedFor(home).filter((denied) => !isAtOrUnder(root, denied)),
+    shielded: shieldedFor(home),
+  };
 }
 
 /** `a.starts_with(b)` for paths: component by component, so `/h/ab` is not inside `/h/a`. */
@@ -121,6 +166,12 @@ export function checkPath(
   //    entries that contain the root.
   if (limits.denied.some((denied) => isAtOrUnder(judged, denied))) {
     return { reason: 'denylisted' };
+  }
+  // 7. A shielded entry, and only the entry: equality where rule 6 uses containment. That
+  //    one difference is the rule, and it is why rule 6 runs first — `~/Library` is shielded
+  //    and `~/Library/Keychains` is denied, so the denied answer wins inside the shield.
+  if (limits.shielded.some((shielded) => judged === shielded)) {
+    return { reason: 'shielded' };
   }
   return { judged };
 }

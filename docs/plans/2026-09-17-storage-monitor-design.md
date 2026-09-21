@@ -309,8 +309,14 @@ Safety guards, enforced in the core regardless of module:
 
 - Paths are canonicalized; anything outside the allowed roots (home folder
   and user-added roots) or inside a denylist (`/`, `/System`, `/usr`,
-  `/Library`, `~/Library` except paths a module declares as managed) is
-  refused.
+  `/Library`, and the sixteen names under `~/Library` that hold secrets,
+  cloud mirrors or irreplaceable local data) is refused.
+- `~/Library` itself, and the three folders of application data under it, are
+  *shielded* rather than denied: the folder is refused as an entry while
+  everything inside it is judged on its own. That is what makes `Caches`,
+  `Developer` and the rest of `~/Library` deletable at all. See ADR 0007,
+  which supersedes the earlier rule of "`~/Library` except paths a module
+  declares as managed".
 - No shell: commands are argv arrays.
 - Symlinks are never followed when deleting.
 - The permanent mode is a per-run choice and a setting; the default is
