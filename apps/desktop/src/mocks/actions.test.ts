@@ -113,12 +113,22 @@ describe('mockActionPreview', () => {
     ]);
   });
 
-  it('blocks the Library folder of the scanned home, and everything under it', () => {
+  it('shields the Library folder of the scanned home and lets what is inside it through', () => {
     const library = fixtureNode('Library');
     const derived = fixtureNode('Library/Developer/Xcode/DerivedData');
-    const result = preview([library.path, derived.path]);
-    expect(statuses(result.entries)).toEqual([blocked('denylisted'), blocked('denylisted')]);
-    expect(result.totalBytes).toBe(0);
+    const keychains = fixtureNode('Library/Keychains');
+    const result = preview([library.path, derived.path, keychains.path]);
+    // The three verdicts of ADR 0007 in one batch: the shield, what it lets past, and the
+    // one name under it that is denied outright. The middle one is the positive control —
+    // a shield that took its contents with it would still pass the other two.
+    expect(statuses(result.entries)).toEqual([
+      blocked('shielded'),
+      { state: 'ready' },
+      blocked('denylisted'),
+    ]);
+    // Ready entries only, so the shielded folder does not promise the bytes of a deletion
+    // that will not happen — and the one entry that will is counted in full.
+    expect(result.totalBytes).toBe(derived.size);
   });
 
   it('blocks a path the tree does not have as missing, with the plan empty', () => {
@@ -147,7 +157,7 @@ describe('mockActionPreview', () => {
       path: under('Library/../Library'),
       kind: 'other',
       size: 0,
-      status: blocked('denylisted'),
+      status: blocked('shielded'),
     });
   });
 
@@ -218,7 +228,7 @@ describe('mockActionPreview', () => {
     // be had, and a dialog in this state names no bytes it cannot account for.
     expect(result.entries).toEqual([
       { path: movies.path, kind: 'dir', size: 0, status: { state: 'ready' } },
-      { path: fixtureNode('Library').path, kind: 'other', size: 0, status: blocked('denylisted') },
+      { path: fixtureNode('Library').path, kind: 'other', size: 0, status: blocked('shielded') },
       { path: under('nope'), kind: 'other', size: 0, status: blocked('missing') },
     ]);
     expect(result.totalBytes).toBe(0);
@@ -338,7 +348,7 @@ describe('mockActionRun', () => {
     const report = fixtureNode('Downloads/q3-report.pdf');
     const result = run([library.path, under('nope'), report.path, FIXTURE_ROOT]);
     expect(result.outcome.entries).toEqual([
-      { path: library.path, kind: 'dir', result: { result: 'skipped', reason: 'denylisted' } },
+      { path: library.path, kind: 'dir', result: { result: 'skipped', reason: 'shielded' } },
       { path: under('nope'), kind: 'other', result: { result: 'skipped', reason: 'missing' } },
       { path: report.path, kind: 'file', result: { result: 'removed', bytes: report.size } },
       { path: FIXTURE_ROOT, kind: 'dir', result: { result: 'skipped', reason: 'isRoot' } },

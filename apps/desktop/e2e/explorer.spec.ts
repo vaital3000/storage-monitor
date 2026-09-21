@@ -113,6 +113,7 @@ test('drills down by click and by keyboard, and comes back', async ({ page }) =>
     'Containers',
     'Caches',
     'Application Support',
+    'Keychains',
   ]);
 
   await page
@@ -239,7 +240,7 @@ test('moves two ticked rows to the Trash, and shrinks the header by what it prom
     .toBeCloseTo(before - Number.parseFloat(promised), 0);
 });
 
-test('deletes what it can when the batch holds a folder this app never deletes from', async ({
+test('deletes what it can when the batch holds a folder that is refused as a whole', async ({
   page,
 }) => {
   await scan(page);
@@ -251,7 +252,7 @@ test('deletes what it can when the batch holds a folder this app never deletes f
   const total = dialog.getByTestId('delete-total');
   await expect(total).toHaveText(/· 1 blocked$/);
   await expect(dialog.getByTestId('block-reason')).toHaveText(
-    'Inside a folder this app never deletes from',
+    'Not as a whole — open it and choose what inside',
   );
   // The one entry that is going, and its size is the whole of what the batch may free.
   const promised = await printedSize(total);

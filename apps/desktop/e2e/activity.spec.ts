@@ -8,7 +8,7 @@
 import { expect, test, type Locator, type Page } from './fixtures';
 
 const ROOT = '/Users/demo';
-const DENIED = 'Inside a folder this app never deletes from';
+const SHIELDED = 'Not as a whole — open it and choose what inside';
 
 // Tall enough for the whole table, like the Explorer's own screenshots.
 test.use({ viewport: { width: 1280, height: 900 } });
@@ -35,7 +35,7 @@ function open(page: Page, section: string): Promise<void> {
 }
 
 /**
- * Scans, ticks three rows of the root and moves them to the Trash. `Library` is denied, so
+ * Scans, ticks three rows of the root and moves them to the Trash. `Library` is shielded, so
  * the batch is the interesting one: two entries leave and the third is refused.
  */
 async function deleteThree(page: Page): Promise<void> {
@@ -96,7 +96,7 @@ test('records what the batch did, newest first, and says why the third was refus
   await expect(cells(page, 2).nth(3)).toHaveText('Skipped');
   await expect(cells(page, 2).nth(4)).toHaveText('—');
   const reason = rows(page).nth(2).getByTestId('activity-detail');
-  await expect(reason).toHaveText(DENIED);
+  await expect(reason).toHaveText(SHIELDED);
   await expect(reason).toHaveAttribute('data-detail', 'reason');
   await expect(page.getByTestId('activity-damaged')).toBeHidden();
 

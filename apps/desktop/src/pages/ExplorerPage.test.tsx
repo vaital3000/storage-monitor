@@ -711,7 +711,7 @@ describe('ExplorerPage deleting the selection', () => {
     );
     const skipped = within(dialog).getByTestId('result-skipped');
     expect(skipped).toHaveTextContent(`${FIXTURE_ROOT}/Library`);
-    expect(skipped).toHaveTextContent('Inside a folder this app never deletes from');
+    expect(skipped).toHaveTextContent('Not as a whole — open it and choose what inside');
 
     await waitFor(() => expect(names()).not.toContain('Downloads'));
     expect(names()).toContain('Library');
