@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/vaital3000/storage-monitor/compare/v0.3.0...v0.4.0) (2026-09-21)
+
+
+### Features
+
+* **core:** shield ~/Library instead of denying it ([#18](https://github.com/vaital3000/storage-monitor/issues/18)) ([2d79b67](https://github.com/vaital3000/storage-monitor/commit/2d79b675bd8bbb902c4242155622b34f0bb56158))
+
 ## [0.3.0](https://github.com/vaital3000/storage-monitor/compare/v0.2.0...v0.3.0) (2026-09-20)
 
 
