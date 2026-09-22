@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 
 pub use real::RealSystem;
 #[cfg(any(test, feature = "testing"))]
-pub use test::TestSystem;
+pub use test::{Reply, TestSystem};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SystemError {
