@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use tempfile::TempDir;
 
-use super::{RealSystem, System, SystemError, check_path};
+use super::{Invocation, Output, RealSystem, System, SystemError, check_path};
 
 /// What an injected failure reports.
 const INJECTED: &str = "the test system was told to fail";
@@ -185,6 +185,17 @@ impl System for TestSystem {
 
     fn now(&self) -> DateTime<Utc> {
         *self.clock.lock().expect("an unpoisoned clock")
+    }
+
+    fn locate(&self, _tool: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+        panic!(
+            "TestSystem runs nothing it was not told to: {}",
+            invocation.program.display()
+        )
     }
 }
 

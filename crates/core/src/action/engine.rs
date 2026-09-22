@@ -306,7 +306,7 @@ fn run_entry(entry: &PreviewEntry, mode: Mode, limits: &Limits, sys: &dyn System
 mod tests {
     use super::*;
     use crate::scan::NodeKind;
-    use crate::system::TestSystem;
+    use crate::system::{Invocation, Output, TestSystem};
     use chrono::{DateTime, TimeDelta, Utc};
     use std::fs::{self, Metadata};
     use std::path::{Path, PathBuf};
@@ -384,6 +384,17 @@ mod tests {
 
         fn now(&self) -> DateTime<Utc> {
             Utc::now()
+        }
+
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            unreachable!("this port runs nothing, and was asked where {tool} is");
+        }
+
+        fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+            unreachable!(
+                "this port runs nothing, and was asked to run {}",
+                invocation.program.display()
+            );
         }
     }
 
@@ -477,6 +488,14 @@ mod tests {
         fn now(&self) -> DateTime<Utc> {
             self.inner.now()
         }
+
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            self.inner.locate(tool)
+        }
+
+        fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+            self.inner.run(invocation)
+        }
     }
 
     /// A [`TestSystem`] in which one entry disappears in the syscall between the last look
@@ -518,6 +537,14 @@ mod tests {
 
         fn now(&self) -> DateTime<Utc> {
             self.inner.now()
+        }
+
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            self.inner.locate(tool)
+        }
+
+        fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+            self.inner.run(invocation)
         }
     }
 

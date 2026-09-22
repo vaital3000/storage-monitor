@@ -19,7 +19,7 @@ thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 postcard = { version = "1", features = ["alloc"] }
 lz4_flex = "0.14"
-nix = { version = "0.31", features = ["fs"] }
+nix = { version = "0.31", features = ["fs", "signal"] }
 dirs = "7"
 tempfile = "3"
 trash = "5.2.9"

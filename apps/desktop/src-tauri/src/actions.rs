@@ -337,7 +337,7 @@ mod tests {
         ActionLog, BlockReason, EntryResult, Limits, LogResult, Mode,
     };
     use storage_monitor_core::scan::{NodeKind, Tree};
-    use storage_monitor_core::system::{System, TestSystem};
+    use storage_monitor_core::system::{Invocation, Output, System, TestSystem};
 
     use super::*;
     use crate::running_as_root;
@@ -1044,6 +1044,14 @@ mod tests {
 
         fn now(&self) -> DateTime<Utc> {
             self.inner.now()
+        }
+
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            self.inner.locate(tool)
+        }
+
+        fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+            self.inner.run(invocation)
         }
     }
 

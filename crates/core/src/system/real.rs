@@ -1,12 +1,13 @@
 use std::fs::{self, Metadata};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use trash::TrashContext;
 #[cfg(target_os = "macos")]
 use trash::macos::{DeleteMethod, TrashContextExtMacos};
 
-use super::{System, SystemError, check_path};
+use super::process::{self, KNOWN_DIRS, OUTPUT_CAP};
+use super::{Invocation, Output, System, SystemError, check_path};
 
 /// The real machine.
 #[derive(Debug, Clone, Default)]
@@ -61,6 +62,21 @@ impl System for RealSystem {
 
     fn now(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+
+    fn locate(&self, tool: &str) -> Option<PathBuf> {
+        process::locate_in(tool, std::env::var_os("PATH").as_deref(), &KNOWN_DIRS)
+    }
+
+    fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+        // The program and the working directory, by the rule every other path of the port
+        // keeps: a relative program would be looked up against the working directory, and a
+        // relative directory would resolve against whatever the app's happens to be.
+        check_path(&invocation.program)?;
+        if let Some(cwd) = &invocation.cwd {
+            check_path(cwd)?;
+        }
+        process::run_capped(invocation, OUTPUT_CAP)
     }
 }
 
