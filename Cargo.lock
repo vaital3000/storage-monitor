@@ -3381,6 +3381,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storage-monitor-core",
+ "storage-monitor-modules",
  "tempfile",
 ]
 
