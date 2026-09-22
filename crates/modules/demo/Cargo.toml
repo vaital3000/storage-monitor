@@ -1,0 +1,17 @@
+[package]
+name = "storage-monitor-module-demo"
+version = "0.4.0"
+description = "Demo cleanup module of Storage Monitor: sample files in the app's data folder"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+storage-monitor-core = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+# `TestSystem`: a temporary tree, scripted tools and a clock the tests move.
+storage-monitor-core = { workspace = true, features = ["testing"] }

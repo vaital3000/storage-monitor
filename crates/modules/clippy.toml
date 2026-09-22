@@ -1,0 +1,13 @@
+# Modules describe; the core acts (ADR 0008). Every crate under this folder is a cleanup
+# module or the registry of them, and none of them deletes anything or starts a process by
+# itself: a module plans steps, and the `System` port behind the cleanup engine is the only
+# door. Clippy reads the nearest `clippy.toml` walking up from a crate's manifest, so this file
+# covers every crate here and nothing outside — `RealSystem`, where these calls are meant to
+# live, is in `crates/core`.
+disallowed-methods = [
+  { path = "std::process::Command::new", reason = "run tools through Context::run, or plan a Step::Run" },
+  { path = "std::fs::remove_file", reason = "plan a Step::Delete; the core deletes, through the guards" },
+  { path = "std::fs::remove_dir", reason = "plan a Step::Delete; the core deletes, through the guards" },
+  { path = "std::fs::remove_dir_all", reason = "plan a Step::Delete; the core deletes, through the guards" },
+  { path = "std::fs::rename", reason = "a move can carry a file out of a guarded folder; plan a Step instead" },
+]
