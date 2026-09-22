@@ -3410,6 +3410,8 @@ dependencies = [
  "serde",
  "serde_json",
  "storage-monitor-core",
+ "storage-monitor-module-demo",
+ "storage-monitor-modules",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

@@ -37,14 +37,14 @@ pub struct BatchLock(Mutex<()>);
 impl BatchLock {
     /// Waits for the batch in front, if there is one. Poisoning is not a reason to refuse a
     /// deletion the user asked for: the guard protects an order, not data.
-    fn enter(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn enter(&self) -> MutexGuard<'_, ()> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether a batch is running right now. Tests assert through it that the queue is held
     /// for the whole of [`run_batch`], which is the part no observer can see from outside.
     #[cfg(test)]
-    fn is_held(&self) -> bool {
+    pub(crate) fn is_held(&self) -> bool {
         self.0.try_lock().is_err()
     }
 }
@@ -137,7 +137,7 @@ pub fn run_batch(
 /// out of [`run_batch`] would cost the command its result — and the dialog would say the
 /// batch did not finish about a batch that deleted everything it was asked to. Caught, it
 /// costs the tree its accuracy instead, which is what this reports and what a scan repairs.
-fn stale_after(patched: Result<TreeState, Box<dyn Any + Send>>) -> bool {
+pub(crate) fn stale_after(patched: Result<TreeState, Box<dyn Any + Send>>) -> bool {
     match patched {
         Ok(state) => state == TreeState::Stale,
         Err(payload) => {

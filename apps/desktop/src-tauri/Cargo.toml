@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 storage-monitor-core = { workspace = true }
+storage-monitor-modules = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { workspace = true }
@@ -30,3 +31,5 @@ tauri = { version = "2", features = ["test"] }
 tempfile = { workspace = true }
 # `TestSystem`: deletion tests run against a temporary filesystem, never the real one.
 storage-monitor-core = { workspace = true, features = ["testing"] }
+# The demo module, driven end to end through the cleanup commands over a `TestSystem`.
+storage-monitor-module-demo = { workspace = true }

@@ -7,6 +7,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use storage_monitor_core::action::Outcome;
+use storage_monitor_core::cleanup::{CleanupOutcome, CleanupPreview};
+use storage_monitor_core::module::Item;
 use storage_monitor_core::scan::{NodeId, NodeKind, Tree};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +170,41 @@ pub struct BatchResult {
     /// Every entry of the batch reached the action log.
     pub recorded: bool,
     /// The tree still describes something the batch deleted.
+    pub tree_stale: bool,
+}
+
+/// One page of what the modules found: at most the limit, largest first, and how many
+/// there are in all.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemsPage {
+    pub items: Vec<Item>,
+    pub total: usize,
+}
+
+/// A cleanup batch checked in both modes at once, the entries of the two aligned by index.
+///
+/// Both, because a module's steps depend on the mode — a worktree goes to the Trash and is
+/// pruned, or is removed by `git` — and a dialog that fetched the other mode on a toggle
+/// could show one mode's steps above a button armed for the other while the answer was on
+/// its way. With both in hand that is a property of the data, not of timing.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPreviews {
+    pub trash: CleanupPreview,
+    pub permanent: CleanupPreview,
+}
+
+/// What a cleanup batch did, and what the window has to say about it: [`BatchResult`]'s
+/// twin, with the same two admissions and the same rule — an `Err` from `cleanup_run` means
+/// the batch did not run, and everything that went wrong after it did is a field here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupResult {
+    pub outcome: CleanupOutcome,
+    /// Every entry of the batch reached the action log.
+    pub recorded: bool,
+    /// The Explorer still describes something the batch deleted.
     pub tree_stale: bool,
 }
 

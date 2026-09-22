@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use storage_monitor_core::action::{ActionLog, LogTail, Mode, Preview};
+use storage_monitor_core::cleanup::Request;
 use storage_monitor_core::disk::{self, DiskUsage};
 use storage_monitor_core::paths;
 use storage_monitor_core::scan::{NodeId, Tree};
@@ -13,8 +14,12 @@ use storage_monitor_core::system::RealSystem;
 use tauri::{AppHandle, Runtime, State};
 
 use crate::actions::{self, BatchLock};
+use crate::cleanup::{self, DEFAULT_ITEMS_LIMIT};
+use crate::module_manager::{ModuleEmitter, ModuleManager};
 use crate::scan_manager::ScanManager;
-use crate::views::{BatchResult, NodeView, ScanStatus};
+use crate::views::{
+    BatchResult, CleanupPreviews, CleanupResult, ItemsPage, ModuleView, NodeView, ScanStatus,
+};
 
 const DEFAULT_CHILDREN_LIMIT: usize = 500;
 const DEFAULT_GROWERS_LIMIT: usize = 10;
@@ -145,6 +150,75 @@ pub async fn action_run(
 #[tauri::command]
 pub fn activity_log(log: State<'_, ActionLog>, limit: Option<usize>) -> Result<LogTail, String> {
     actions::activity_tail(log.inner(), limit)
+}
+
+/// The cleanup modules of this build, where each stands and what it holds.
+#[tauri::command]
+pub fn modules_list(modules: State<'_, ModuleManager>) -> Vec<ModuleView> {
+    modules.list()
+}
+
+/// Starts a discovery of the modules named in `ids` (every module when there are none); each
+/// change of state arrives as a `modules:state` event. Answers the views once all of them are
+/// `discovering`.
+#[tauri::command]
+pub fn modules_refresh<R: Runtime>(
+    app: AppHandle<R>,
+    modules: State<'_, ModuleManager>,
+    ids: Option<Vec<String>>,
+) -> Vec<ModuleView> {
+    modules.refresh(Arc::new(app), &ids.unwrap_or_default())
+}
+
+/// What the modules hold, largest first: at most `limit` items (default: 2000), and how many
+/// there are in all.
+#[tauri::command]
+pub fn cleanup_items(modules: State<'_, ModuleManager>, limit: Option<usize>) -> ItemsPage {
+    let (items, total) = modules.items(limit.unwrap_or(DEFAULT_ITEMS_LIMIT));
+    ItemsPage { items, total }
+}
+
+/// What cleaning `requests` would do in each mode, with nothing touched.
+#[tauri::command]
+pub async fn cleanup_preview(
+    modules: State<'_, ModuleManager>,
+    requests: Vec<Request>,
+) -> Result<CleanupPreviews, String> {
+    let modules = modules.inner().clone();
+    off_the_event_loop(move || cleanup::preview_cleanup(&modules, &requests)).await?
+}
+
+/// Cleans `requests` in `mode`: plans them again, runs them with `cleanup:progress` events,
+/// records the batch, patches the Explorer's tree and starts a rediscovery of the modules
+/// involved. An `Err` means the batch did not run; what it could not finish afterwards comes
+/// back in the result.
+///
+/// Takes the requests, never a preview: a preview carries commands, and the only commands that
+/// run are the ones a module plans in this call.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn cleanup_run<R: Runtime>(
+    app: AppHandle<R>,
+    modules: State<'_, ModuleManager>,
+    manager: State<'_, ScanManager>,
+    log: State<'_, ActionLog>,
+    batches: State<'_, Arc<BatchLock>>,
+    requests: Vec<Request>,
+    mode: Mode,
+) -> Result<CleanupResult, String> {
+    let (modules, manager, log, batches) = (
+        modules.inner().clone(),
+        manager.inner().clone(),
+        log.inner().clone(),
+        Arc::clone(batches.inner()),
+    );
+    off_the_event_loop(move || {
+        let states: Arc<dyn ModuleEmitter> = Arc::new(app.clone());
+        cleanup::run_cleanup(
+            &modules, &manager, &log, &batches, states, &app, requests, mode,
+        )
+    })
+    .await?
 }
 
 fn to_paths(paths: Vec<String>) -> Vec<PathBuf> {

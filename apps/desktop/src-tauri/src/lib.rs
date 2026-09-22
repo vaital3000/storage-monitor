@@ -1,6 +1,7 @@
 //! Tauri shell of Storage Monitor: app state, commands and events over the core library.
 
 mod actions;
+mod cleanup;
 mod commands;
 pub mod module_manager;
 pub mod scan_manager;
@@ -11,9 +12,11 @@ use std::sync::Arc;
 use storage_monitor_core::action::ActionLog;
 use storage_monitor_core::system::RealSystem;
 use storage_monitor_core::{AppInfo, app_info, paths};
+use storage_monitor_modules::registry;
 use tauri::Runtime;
 
 use crate::actions::BatchLock;
+use crate::module_manager::ModuleManager;
 use crate::scan_manager::ScanManager;
 
 /// Returns product name and version to the UI.
@@ -41,6 +44,11 @@ macro_rules! every_command {
             commands::action_preview,
             commands::action_run,
             commands::activity_log,
+            commands::modules_list,
+            commands::modules_refresh,
+            commands::cleanup_items,
+            commands::cleanup_preview,
+            commands::cleanup_run,
         ]
     };
 }
@@ -56,18 +64,21 @@ macro_rules! every_command {
 /// the middle of a deletion. Because the handler and the test expand one macro, that test
 /// also refuses to pass while any command has no expectation of its own.
 ///
-/// The scan manager and the action log are parameters so that a test can put the snapshots
-/// and the record in a temp directory. That is **not** a sandbox: [`RealSystem`] is built
-/// here, so a command given a real path in a test deletes a real file. What keeps the test
-/// safe is what it passes in, and it says so where it passes it.
+/// The scan manager, the action log and the module manager are parameters so that a test
+/// can put the snapshots and the record in a temp directory and hand over a registry of its
+/// own. That is **not** a sandbox: [`RealSystem`] is built here for the Explorer's batches,
+/// so a command given a real path in a test deletes a real file. What keeps the test safe is
+/// what it passes in, and it says so where it passes it.
 fn configure<R: Runtime>(
     builder: tauri::Builder<R>,
     manager: ScanManager,
     log: ActionLog,
+    modules: ModuleManager,
 ) -> tauri::Builder<R> {
     builder
         .plugin(tauri_plugin_opener::init())
         .manage(manager)
+        .manage(modules)
         // The one door to deleting, the record of everything that went through it, and the
         // queue that keeps two batches from racing for the tree.
         .manage(RealSystem)
@@ -81,6 +92,12 @@ pub fn run() {
         tauri::Builder::default(),
         ScanManager::default(),
         ActionLog::new(paths::actions_log()),
+        ModuleManager::new(
+            registry(),
+            Arc::new(RealSystem),
+            paths::home_dir(),
+            paths::data_dir(),
+        ),
     )
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -230,10 +247,19 @@ mod tests {
         })
         .expect("the log is written");
 
+        // An empty registry: the commands over it are registered and resolve their state,
+        // and there is nothing a batch could clean.
+        let modules = ModuleManager::new(
+            Vec::new(),
+            Arc::new(RealSystem),
+            Some(dir.path().to_path_buf()),
+            dir.path().join("data"),
+        );
         let app = configure(
             mock_builder(),
             ScanManager::with_snapshots_dir(dir.path().join("snapshots")),
             log,
+            modules,
         )
         .build(mock_context(noop_assets()))
         .expect("the app builds");
@@ -298,6 +324,27 @@ mod tests {
              down, where a batch with entries in it is written and read back"
         );
         assert_eq!(tail["damaged"], json!(0), "{tail}");
+
+        // The cleanup commands, over a registry with nothing in it: the same smallest true
+        // answers, and a batch of no requests, which runs nothing and records nothing.
+        assert_eq!(ipc.ok("modules_list", json!({})), json!([]));
+        assert_eq!(ipc.ok("modules_refresh", json!({})), json!([]));
+        assert_eq!(
+            ipc.ok("cleanup_items", json!({})),
+            json!({ "items": [], "total": 0 })
+        );
+        let previews = ipc.ok("cleanup_preview", json!({ "requests": [] }));
+        assert_eq!(previews["trash"]["mode"], json!("trash"), "{previews}");
+        assert_eq!(
+            previews["permanent"]["mode"],
+            json!("permanent"),
+            "{previews}"
+        );
+        assert_eq!(previews["trash"]["entries"], json!([]), "{previews}");
+        let cleaned = ipc.ok("cleanup_run", json!({ "requests": [], "mode": "trash" }));
+        assert_eq!(cleaned["outcome"]["entries"], json!([]), "{cleaned}");
+        assert_eq!(cleaned["recorded"], json!(true), "{cleaned}");
+        assert_eq!(cleaned["treeStale"], json!(false), "{cleaned}");
 
         // Last, because it is the only one that leaves the app busy: a scan of the temp
         // directory, which also runs `AppHandle<MockRuntime>` as a `StatusEmitter` — the
