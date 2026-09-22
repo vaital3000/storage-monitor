@@ -2,6 +2,7 @@
 
 mod actions;
 mod commands;
+pub mod module_manager;
 pub mod scan_manager;
 pub mod views;
 

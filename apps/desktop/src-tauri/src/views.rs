@@ -171,6 +171,42 @@ pub struct BatchResult {
     pub tree_stale: bool,
 }
 
+/// Where a cleanup module stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModuleStatus {
+    /// Never discovered in this session.
+    Idle,
+    Discovering,
+    Ready,
+    /// Cannot work on this machine; `reason` says why.
+    Unavailable,
+    /// The last discovery did not finish; `reason` says why. The items of the one before are
+    /// still held.
+    Failed,
+}
+
+/// A cleanup module as the Cleanup screen shows it: who it is, where it stands, and the
+/// totals of the items it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub status: ModuleStatus,
+    /// Why the module is unavailable, or what made its last discovery fail.
+    pub reason: Option<String>,
+    pub item_count: usize,
+    /// Over every item it holds — which, after a failed refresh, are the items of the last
+    /// discovery that succeeded.
+    pub total_bytes: u64,
+    /// Over the items whose verdict is Safe: what the module is confident can go.
+    pub safe_bytes: u64,
+    /// When the held items were found.
+    pub discovered_at: Option<DateTime<Utc>>,
+}
+
 /// The root node holds its absolute path; only its last component is shown (the whole
 /// path when there is none, as for `/`).
 fn display_name(tree: &Tree, id: NodeId) -> String {
