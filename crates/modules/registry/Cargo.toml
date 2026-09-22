@@ -1,0 +1,13 @@
+[package]
+name = "storage-monitor-modules"
+version = "0.4.0"
+description = "The cleanup modules compiled into Storage Monitor"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+storage-monitor-core = { workspace = true }
+storage-monitor-module-demo = { workspace = true }

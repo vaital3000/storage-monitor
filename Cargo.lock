@@ -3424,6 +3424,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage-monitor-modules"
+version = "0.4.0"
+dependencies = [
+ "storage-monitor-core",
+ "storage-monitor-module-demo",
+]
+
+[[package]]
 name = "string_cache"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
