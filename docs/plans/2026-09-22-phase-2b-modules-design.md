@@ -328,7 +328,12 @@ module planned in the same call.
 4. The module plans the steps. An empty plan is a bug in the module and blocks the entry
    as `malformed`.
 5. Every `Delete` and `Removes` target passes `Limits::check`, and its kind is the kind
-   on the disk — every reason of 2a, unchanged.
+   on the disk — every reason of 2a, unchanged. A `Removes` target must also be spelled
+   the way the guards resolve it, its parent canonicalized: the port deletes the resolved
+   form of a `Delete` whatever the module wrote, but a command is handed the module's
+   spelling and resolves it itself, later — through a symlinked folder that may point
+   elsewhere by then. A target spelled otherwise is a module's bug, refused as
+   `malformed`.
 6. Across the batch, an entry with a target inside another ready entry's target is
    `nested`: `drop_nested` over the judged forms, as in 2a.
 

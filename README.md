@@ -11,7 +11,8 @@ free right now, and why", with a preview and a confirmation before anything is
 touched. Deletion goes to the Trash by default.
 
 > Status: pre-alpha. The scanner, snapshots with growth deltas, the Explorer and
-> deletion from it are done; cleanup modules are next. See the
+> deletion from it are done, and so is the framework the cleanup modules plug
+> into; the first real module, git worktrees, is next. See the
 > [roadmap](docs/plans/2026-09-17-storage-monitor-design.md#14-roadmap).
 
 ## What it does today
@@ -41,6 +42,14 @@ touched. Deletion goes to the Trash by default.
 - Activity screen: what the app deleted, newest first — when, path, mode, result
   and size — from an append-only record that nothing prunes.
 - A snapshot per scan, so the next scan shows what grew.
+- Cleanup screen: what the cleanup modules found, with a verdict and its
+  reasons for every item, filters by verdict and module, a detail panel with the
+  facts, and batches through the same dialog — which lists the exact paths and
+  commands, and asks for an acknowledgement for anything the Trash cannot undo,
+  in either mode. Modules never delete anything themselves: they plan the steps,
+  and the app runs them through the same guards as the Explorer
+  ([ADR 0008](docs/adr/0008-modules-describe-the-core-acts.md)). A release build
+  ships no module yet; a debug build ships a demo module to try the flow on.
 - A CLI with the same scanner and JSON output for scripts.
 
 ## Screenshots
@@ -60,6 +69,10 @@ report; `--json` makes it machine-readable and `--save` stores a snapshot and
 lists the folders that grew since the previous one. `--depth` (default 2) and
 `--top` (default 20) bound the reported tree; `--threshold` (default 10 MiB) is
 the smallest file kept in the snapshot.
+
+`modules list` names the cleanup modules of the build and whether each can run
+here; `modules run <id>` prints what one of them finds, with its verdicts. Both
+only look, and both take `--json`.
 
 ## Install
 
@@ -89,7 +102,8 @@ just ci      # lint, unit tests, frontend build and e2e; CI adds a macOS build s
 ```
 
 Layout, conventions and the module contract are described in
-[CLAUDE.md](CLAUDE.md) and [docs/](docs/). Design decisions live in
+[CLAUDE.md](CLAUDE.md) and [docs/](docs/); writing a cleanup module, in
+[docs/modules](docs/modules/README.md). Design decisions live in
 [docs/adr](docs/adr).
 
 ## Contributing
