@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod action;
+pub mod cleanup;
 pub mod disk;
 pub mod module;
 pub mod paths;

@@ -158,6 +158,17 @@ impl Limits {
         Self::with_home(root, crate::paths::home_dir())
     }
 
+    /// The home folder as the only root, with the denylist and the shield built from that
+    /// same folder: where a cleanup module may delete (phase 2b design, section 8).
+    ///
+    /// [`Self::for_scan_root`] of the home, with the home a caller hands over rather than
+    /// the one `paths::` reports — so that a test passes a temporary one, and the denylist
+    /// it gets is the one of that folder. Settings replaces the single root with a list of
+    /// them in phase 2c.
+    pub fn for_home(home: PathBuf) -> Self {
+        Self::with_home(home.clone(), Some(home))
+    }
+
     /// The seam of [`Self::for_scan_root`]: tests pass a temporary directory as the home
     /// folder instead of the one the machine running them happens to have.
     fn with_home(root: PathBuf, home: Option<PathBuf>) -> Self {
@@ -408,6 +419,32 @@ mod tests {
     /// The cases the desktop mock answers too, so that a rule cannot change on one side
     /// alone. The mock is the oracle every UI test of the deletion is written against, and
     /// nothing else compares the two.
+    #[test]
+    fn for_home_judges_by_the_home_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let caches = home.join("Library/Caches/app");
+        fs::create_dir_all(&caches).unwrap();
+        let keychains = home.join("Library/Keychains/login.keychain-db");
+        fs::create_dir_all(keychains.parent().unwrap()).unwrap();
+        fs::write(&keychains, b"x").unwrap();
+        let limits = Limits::for_home(home.clone());
+
+        assert_eq!(limits.check(&home), Err(BlockReason::IsRoot));
+        assert_eq!(
+            limits.check(&home.join("Library")),
+            Err(BlockReason::Shielded)
+        );
+        // The denylist of the folder it was handed, not of the machine's own home.
+        assert_eq!(limits.check(&keychains), Err(BlockReason::Denylisted));
+        assert_eq!(limits.check(&caches).unwrap().path, caches);
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            limits.check(&outside.path().join("x")),
+            Err(BlockReason::OutsideRoots)
+        );
+    }
+
     #[test]
     fn the_shared_guard_cases_hold() {
         let text = fs::read_to_string(concat!(
