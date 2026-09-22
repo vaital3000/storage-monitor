@@ -1450,6 +1450,130 @@ mod tests {
         assert_eq!(outcome.at, at);
     }
 
+    // --- The shared cases ----------------------------------------------------------------
+
+    #[derive(serde::Deserialize)]
+    struct CleanupCases {
+        items: Vec<CaseItem>,
+        screen: Vec<ScreenCase>,
+        reversible: Vec<ReversibleCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CaseItem {
+        id: String,
+        level: Level,
+        options: Vec<CaseOption>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CaseOption {
+        id: String,
+        force: bool,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ScreenCase {
+        name: String,
+        request: Request,
+        expect: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ReversibleCase {
+        name: String,
+        steps: Vec<String>,
+        trash: bool,
+        permanent: bool,
+    }
+
+    /// An item of the cases: one action, `go`, with the options the case lists.
+    fn case_item(case: &CaseItem) -> Item {
+        Item {
+            id: case.id.clone(),
+            module: "test".to_owned(),
+            kind: "thing".to_owned(),
+            title: case.id.clone(),
+            subtitle: None,
+            path: None,
+            size: Size::exact(0),
+            last_used: None,
+            verdict: Verdict::new(case.level, Vec::new()),
+            facts: Vec::new(),
+            actions: vec![ActionSpec {
+                id: "go".to_owned(),
+                label: "Go".to_owned(),
+                estimated_free: 0,
+                options: case
+                    .options
+                    .iter()
+                    .map(|option| ActionOption {
+                        id: option.id.clone(),
+                        label: option.id.clone(),
+                        default: false,
+                        force: option.force,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// A step of the kind a case names. The paths are never looked at: `reversible` reads the
+    /// kinds of the steps and nothing else, which is why these cases need no disk.
+    fn case_step(kind: &str) -> Step {
+        let target = Target::new("/h/thing", NodeKind::Dir);
+        match kind {
+            "delete" => Step::Delete(target),
+            "housekeeping" => run_step("git", &["worktree", "prune"], Effect::Housekeeping),
+            "destroys" => run_step("docker", &["image", "rm", "x"], Effect::Destroys),
+            "removes" => run_step("rm", &["/h/thing"], Effect::Removes(target)),
+            other => panic!("unknown step kind {other} in the shared cases"),
+        }
+    }
+
+    #[test]
+    fn the_shared_cleanup_cases_hold() {
+        let text = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cleanup-cases.json"
+        ))
+        .expect("the shared cleanup cases are next to this crate");
+        let cases: CleanupCases = serde_json::from_str(&text).expect("the shared cases parse");
+        assert!(!cases.screen.is_empty() && !cases.reversible.is_empty());
+
+        let module = Scripted {
+            items: cases.items.iter().map(case_item).collect(),
+            ..Scripted::default()
+        };
+        let held = Held::new([(&module as &dyn Module, module.items.as_slice())]);
+        for case in &cases.screen {
+            let answer = match screen(&case.request, &held) {
+                Ok(_) => "ok".to_owned(),
+                Err(reason) => serde_json::to_value(reason)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            };
+            assert_eq!(answer, case.expect, "{}", case.name);
+        }
+        for case in &cases.reversible {
+            let steps: Vec<Step> = case.steps.iter().map(|kind| case_step(kind)).collect();
+            assert_eq!(
+                reversible(&steps, Mode::Trash),
+                case.trash,
+                "{} (trash)",
+                case.name
+            );
+            assert_eq!(
+                reversible(&steps, Mode::Permanent),
+                case.permanent,
+                "{} (permanent)",
+                case.name
+            );
+        }
+    }
+
     /// A [`TestSystem`] that runs `then` right after the port was asked to delete `when`:
     /// the only way to make something change between two steps of one entry.
     struct Meddle<'a, F: Fn() + Send + Sync> {

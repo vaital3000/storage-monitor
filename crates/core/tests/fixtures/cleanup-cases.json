@@ -1,0 +1,166 @@
+{
+  "about": [
+    "The rules the cleanup engine decides without a disk, as cases both implementations answer.",
+    "",
+    "`crates/core/src/cleanup/engine.rs` runs them through `screen` and `reversible`, and",
+    "`apps/desktop/src/mocks/cleanup.test.ts` runs the same cases through the mock's own two",
+    "functions. A rule that changes in one and not the other reddens a test here instead of",
+    "drifting quietly: the mock is the oracle every UI test of the Cleanup screen is written",
+    "against, and a mock that said yes to everything would make those tests prove nothing.",
+    "",
+    "`items` are held by one module whose id is `test`. Each has one action, `go`, with the",
+    "options it lists; an option with `force: true` lifts a Keep verdict and no other does.",
+    "A `screen` case gives a request and expects `ok`, or the wire name of the `BlockReason`",
+    "that refuses it — rules 1 to 3 of the phase 2b design, section 8, in that order, the",
+    "first that applies deciding. A `reversible` case gives a plan as the kinds of its steps",
+    "(`delete`, `housekeeping`, `destroys`, `removes`) and says whether the Trash can undo it",
+    "in each mode.",
+    "",
+    "Scope stops where a disk would be needed: the guards of a target, its kind, nesting across",
+    "a batch. Those are the guard cases' business and each side's own tests'."
+  ],
+  "items": [
+    {
+      "id": "test:safe",
+      "level": "safe",
+      "options": [
+        { "id": "force", "force": true },
+        { "id": "extra", "force": false }
+      ]
+    },
+    { "id": "test:review", "level": "review", "options": [] },
+    {
+      "id": "test:keep",
+      "level": "keep",
+      "options": [
+        { "id": "force", "force": true },
+        { "id": "extra", "force": false }
+      ]
+    },
+    {
+      "id": "test:keep-unforceable",
+      "level": "keep",
+      "options": [{ "id": "extra", "force": false }]
+    }
+  ],
+  "screen": [
+    {
+      "name": "a safe item with no options passes",
+      "request": { "item": "test:safe", "action": "go", "options": [] },
+      "expect": "ok"
+    },
+    {
+      "name": "a review item passes: the confirmation is the glance a human was asked for",
+      "request": { "item": "test:review", "action": "go", "options": [] },
+      "expect": "ok"
+    },
+    {
+      "name": "an item that is not held is missing",
+      "request": { "item": "test:gone", "action": "go", "options": [] },
+      "expect": "missing"
+    },
+    {
+      "name": "an item of a module nobody holds is missing too",
+      "request": { "item": "other:safe", "action": "go", "options": [] },
+      "expect": "missing"
+    },
+    {
+      "name": "an action the item does not offer: the item is not what the screen showed",
+      "request": { "item": "test:safe", "action": "remove", "options": [] },
+      "expect": "kindChanged"
+    },
+    {
+      "name": "an option the action does not have",
+      "request": { "item": "test:safe", "action": "go", "options": ["branch"] },
+      "expect": "kindChanged"
+    },
+    {
+      "name": "one unknown option among known ones is enough",
+      "request": { "item": "test:safe", "action": "go", "options": ["extra", "branch"] },
+      "expect": "kindChanged"
+    },
+    {
+      "name": "a keep item asked for with no options is kept",
+      "request": { "item": "test:keep", "action": "go", "options": [] },
+      "expect": "kept"
+    },
+    {
+      "name": "an option that is on but does not force leaves it kept",
+      "request": { "item": "test:keep", "action": "go", "options": ["extra"] },
+      "expect": "kept"
+    },
+    {
+      "name": "its force option lifts it",
+      "request": { "item": "test:keep", "action": "go", "options": ["force"] },
+      "expect": "ok"
+    },
+    {
+      "name": "force beside another option lifts it just the same",
+      "request": { "item": "test:keep", "action": "go", "options": ["extra", "force"] },
+      "expect": "ok"
+    },
+    {
+      "name": "an action with no force option cannot remove a keep item at all",
+      "request": { "item": "test:keep-unforceable", "action": "go", "options": ["extra"] },
+      "expect": "kept"
+    },
+    {
+      "name": "force on an item that is not kept changes nothing",
+      "request": { "item": "test:safe", "action": "go", "options": ["force"] },
+      "expect": "ok"
+    },
+    {
+      "name": "the first rule that applies decides: a missing item is missing, whatever it asks",
+      "request": { "item": "test:gone", "action": "remove", "options": ["branch"] },
+      "expect": "missing"
+    },
+    {
+      "name": "an unknown action comes before the keep rule",
+      "request": { "item": "test:keep", "action": "remove", "options": [] },
+      "expect": "kindChanged"
+    },
+    {
+      "name": "an unknown option comes before the keep rule, even beside force",
+      "request": { "item": "test:keep", "action": "go", "options": ["force", "branch"] },
+      "expect": "kindChanged"
+    }
+  ],
+  "reversible": [
+    {
+      "name": "a folder to the Trash",
+      "steps": ["delete"],
+      "trash": true,
+      "permanent": false
+    },
+    {
+      "name": "a folder to the Trash, then bookkeeping, the way a worktree goes",
+      "steps": ["delete", "housekeeping"],
+      "trash": true,
+      "permanent": false
+    },
+    {
+      "name": "bookkeeping alone changes nothing a user could miss",
+      "steps": ["housekeeping"],
+      "trash": true,
+      "permanent": false
+    },
+    {
+      "name": "a command that destroys: nothing about it goes to the Trash",
+      "steps": ["destroys"],
+      "trash": false,
+      "permanent": false
+    },
+    {
+      "name": "a command that removes a path",
+      "steps": ["removes"],
+      "trash": false,
+      "permanent": false
+    },
+    {
+      "name": "one step the Trash cannot undo makes the whole entry so",
+      "steps": ["delete", "housekeeping", "destroys"],
+      "trash": false,
+      "permanent": false
+    }
+  ]
+}
