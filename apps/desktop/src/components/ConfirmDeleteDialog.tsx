@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { describeBlock } from '../lib/blockReasons';
+import type {
+  BatchQuestions,
+  BatchReport,
+  BatchRow,
+  BatchWording,
+  ReportRow,
+} from '../lib/batchQuestion';
+import { describeBlock, type GuardScope } from '../lib/blockReasons';
 import { tabStops } from '../lib/focusTrap';
 import { countLabel, formatBytes } from '../lib/format';
-import {
-  DELETION_MODES,
-  type BatchResult,
-  type DeletionMode,
-  type EntryOutcome,
-  type Preview,
-} from '../lib/ipc';
+import { DELETION_MODES, type CleanupProgress, type DeletionMode, type StepView } from '../lib/ipc';
 import Button from './Button';
 
 /**
@@ -16,30 +17,33 @@ import Button from './Button';
  *
  * One union rather than a `busy` flag beside an optional outcome, because the four states
  * are exclusive and two of them must never be confused: `failed` is a rejected
- * `action_run`, which means **nothing was touched**, while `done` carries a batch that ran
- * and may still admit that it was not recorded or that the tree is stale. Flat props would
- * let a caller hand over both at once and leave the dialog to guess which one to believe.
+ * `action_run` or `cleanup_run`, which means **nothing was touched**, while `done` carries a
+ * batch that ran and may still admit that it was not recorded or that the tree is stale.
+ * Flat props would let a caller hand over both at once and leave the dialog to guess which
+ * one to believe.
+ *
+ * A cleanup batch reports how far it has got while it runs; an Explorer batch is a handful of
+ * paths and says nothing until it is done.
  */
 export type BatchStatus =
   | { phase: 'asking' }
-  | { phase: 'running' }
-  | { phase: 'done'; result: BatchResult }
+  | { phase: 'running'; progress?: CleanupProgress }
+  | { phase: 'done'; report: BatchReport }
   | { phase: 'failed'; message: string };
 
 interface ConfirmDeleteDialogProps {
   /**
-   * What the guards said, minus the mode it was checked in — deliberately, and enforced by
-   * the type rather than by a rule someone has to remember.
+   * The batch in both modes, the rows of the two aligned by index (`lib/batchQuestion.ts`).
    *
-   * The guards never look at the mode: `crates/core/src/action/guards.rs` does not mention
-   * it, and in `engine.rs` it is copied into the preview and read again only to choose
-   * between `move_to_trash` and `remove`. So every verdict, size and `totalBytes` here
-   * holds for both modes, the toggle below needs no fresh preview — and the mode the
-   * preview was computed with can disagree with the one the user has now selected. A
-   * dialog that read it would explain the Trash over a button armed to delete for good,
-   * which is the worst thing this component could do; `Omit` makes that a type error.
+   * Both, and never "the preview", because the mode a preview was computed with can disagree
+   * with the one the user has now selected. A dialog that read it would explain the Trash
+   * over a button armed to delete for good, which is the worst thing this component could
+   * do. Here the only mode there is to read is the toggle's own: the rows, the total and
+   * the acknowledgement all come from `questions[mode]`, so a toggle needs no fresh preview
+   * and cannot race one. For the Explorer the two are the same rows — the guards never look
+   * at the mode — and for Cleanup they are not, because a module plans each mode apart.
    */
-  preview: Omit<Preview, 'mode'>;
+  questions: BatchQuestions;
   status: BatchStatus;
   /**
    * Which mode the dialog opens on; the Trash unless the caller says otherwise. The action
@@ -63,9 +67,15 @@ const MODE_LABELS: Record<DeletionMode, string> = {
   permanent: 'Permanent',
 };
 
-const MODE_EXPLANATIONS: Record<DeletionMode, string> = {
-  trash: 'Items move to the Trash. Space is freed when you empty it.',
-  permanent: 'Items are deleted immediately. This cannot be undone.',
+const MODE_EXPLANATIONS: Record<BatchWording, Record<DeletionMode, string>> = {
+  delete: {
+    trash: 'Items move to the Trash. Space is freed when you empty it.',
+    permanent: 'Items are deleted immediately. This cannot be undone.',
+  },
+  clean: {
+    trash: 'What can go to the Trash goes there. Space is freed when you empty it.',
+    permanent: 'Everything is deleted immediately. This cannot be undone.',
+  },
 };
 
 /**
@@ -83,19 +93,49 @@ const MODE_EXPLANATIONS: Record<DeletionMode, string> = {
  * it ("Delete 2 items permanently?"), which the Trash label does; that is worth paying to
  * keep the two red buttons apart.
  */
-const CONFIRM_LABELS: Record<DeletionMode, string> = {
-  trash: 'Move to the Trash',
-  permanent: 'Delete for good',
+const CONFIRM_LABELS: Record<BatchWording, Record<DeletionMode, string>> = {
+  delete: { trash: 'Move to the Trash', permanent: 'Delete for good' },
+  // "Clean", not "Move to the Trash": a cleanup batch in Trash mode can still run commands
+  // that destroy, and the button must not promise what the steps above it contradict.
+  clean: { trash: 'Clean', permanent: 'Clean for good' },
 };
 
-const RUNNING_LABELS: Record<DeletionMode, string> = {
-  trash: 'Moving to the Trash…',
-  permanent: 'Deleting…',
+const RUNNING_LABELS: Record<BatchWording, Record<DeletionMode, string>> = {
+  delete: { trash: 'Moving to the Trash…', permanent: 'Deleting…' },
+  clean: { trash: 'Cleaning…', permanent: 'Cleaning…' },
 };
 
-function askTitle(mode: DeletionMode, count: number): string {
+function askTitle(wording: BatchWording, mode: DeletionMode, count: number): string {
   const items = countLabel(count, 'item');
+  if (wording === 'clean') {
+    return mode === 'trash' ? `Clean ${items}?` : `Clean ${items} permanently?`;
+  }
   return mode === 'trash' ? `Move ${items} to the Trash?` : `Delete ${items} permanently?`;
+}
+
+/** What a running batch says: how far it has got, when it reports that at all. */
+function runningLabel(wording: BatchWording, mode: DeletionMode, progress?: CleanupProgress) {
+  if (progress === undefined) {
+    return RUNNING_LABELS[wording][mode];
+  }
+  if (progress.current === null) {
+    return 'Finishing…';
+  }
+  return `Cleaning ${progress.done + 1} of ${progress.total} · ${progress.current}`;
+}
+
+/** What each kind of step is called on its line. */
+function stepLine(step: StepView): { verb: string; what: string; quiet: boolean } {
+  switch (step.step) {
+    case 'trash':
+      return { verb: 'Move to the Trash', what: step.path, quiet: false };
+    case 'delete':
+      return { verb: 'Delete', what: step.path, quiet: false };
+    case 'run':
+      // Housekeeping is drawn quieter than the rest: it is what the other steps leave
+      // behind to tidy up, not a thing that goes.
+      return { verb: 'Run', what: step.command, quiet: step.effect === 'housekeeping' };
+  }
 }
 
 /** One line of the result view: a path and what became of it, in words. */
@@ -104,9 +144,9 @@ interface ResultLine {
   detail: string;
 }
 
-function failedLines(entries: readonly EntryOutcome[]): ResultLine[] {
-  return entries.flatMap((entry) =>
-    entry.result.result === 'failed' ? [{ path: entry.path, detail: entry.result.message }] : [],
+function failedLines(rows: readonly ReportRow[]): ResultLine[] {
+  return rows.flatMap((row) =>
+    row.result.result === 'failed' ? [{ path: row.title, detail: row.result.message }] : [],
   );
 }
 
@@ -115,19 +155,36 @@ function failedLines(entries: readonly EntryOutcome[]): ResultLine[] {
  * and `kindChanged` are decided between the preview and the syscall, so these appear in no
  * preview — and a result view that listed failures alone would count them as deleted.
  */
-function skippedLines(entries: readonly EntryOutcome[]): ResultLine[] {
-  return entries.flatMap((entry) =>
-    entry.result.result === 'skipped'
-      ? [{ path: entry.path, detail: describeBlock(entry.result.reason) }]
+function skippedLines(rows: readonly ReportRow[], scope: GuardScope): ResultLine[] {
+  return rows.flatMap((row) =>
+    row.result.result === 'skipped'
+      ? [{ path: row.title, detail: describeBlock(row.result.reason, scope) }]
       : [],
   );
 }
 
-function removedCount(entries: readonly EntryOutcome[]): number {
-  return entries.reduce(
-    (count, entry) => (entry.result.result === 'removed' ? count + 1 : count),
-    0,
-  );
+/**
+ * The headline of a report: what left, by how it left. Only the removed rows, and the bytes
+ * the batch reported: a count over every row would claim the failed and skipped ones left
+ * the disk, in the same sentence that reports the bytes of the ones that did.
+ *
+ * Counted by each row's own mode, because a cleanup batch can do both — a folder to the
+ * Trash, an object removed for good. An Explorer batch has every row in its own mode, so its
+ * sentence is the one it always was; a batch that removed nothing speaks in the mode it was
+ * asked to run in.
+ */
+function headline(report: BatchReport): string {
+  const removed = report.rows.filter((row) => row.result.result === 'removed');
+  const moved = removed.filter((row) => row.mode === 'trash').length;
+  const deleted = removed.length - moved;
+  const freed = formatBytes(report.freedBytes);
+  if (deleted === 0 && (moved > 0 || report.mode === 'trash')) {
+    return `Moved ${countLabel(moved, 'item')} to the Trash · ${freed}`;
+  }
+  if (moved === 0) {
+    return `Deleted ${countLabel(deleted, 'item')} · ${freed}`;
+  }
+  return `Deleted ${countLabel(deleted, 'item')} and moved ${moved} to the Trash · ${freed}`;
 }
 
 const PATH_CLASS = 'truncate font-mono text-xs';
@@ -184,7 +241,7 @@ function EntryLines({
  * acknowledged a permanent deletion.
  */
 export default function ConfirmDeleteDialog({
-  preview,
+  questions,
   status,
   initialMode = 'trash',
   onConfirm,
@@ -292,8 +349,18 @@ export default function ConfirmDeleteDialog({
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [running, onClose]);
 
-  const ready = preview.entries.filter((entry) => entry.status.state === 'ready');
-  const blocked = preview.entries.length - ready.length;
+  const { wording, scope } = questions;
+  const question = questions[mode];
+  const ready = question.rows.filter((row) => row.status.state === 'ready');
+  const blocked = question.rows.length - ready.length;
+  // The acknowledgement follows the rows, not the mode: it is asked for whenever a row that
+  // will run cannot be undone in the mode now selected. For the Explorer that is exactly
+  // "Permanent"; for Cleanup it is also any command that destroys, whatever the mode.
+  const irreversible = ready.filter((row) => row.irreversible).length;
+  const needsAck = irreversible > 0;
+  // Marked row by row only when the rows disagree; when all of them are irreversible, the
+  // sentence of the acknowledgement already says so about every one of them.
+  const markRows = needsAck && irreversible < ready.length;
 
   const chooseMode = (next: DeletionMode) => {
     setMode(next);
@@ -319,13 +386,18 @@ export default function ConfirmDeleteDialog({
         className="flex max-h-full w-full max-w-lg flex-col gap-4 overflow-hidden rounded-xl border border-neutral-200 bg-white p-5 shadow-xl outline-none dark:border-neutral-800 dark:bg-neutral-900"
       >
         {status.phase === 'done' ? (
-          <Report result={status.result} titleId={titleId} onClose={onClose} />
+          <Report report={status.report} titleId={titleId} onClose={onClose} />
         ) : status.phase === 'failed' ? (
-          <RunError message={status.message} titleId={titleId} onClose={onClose} />
+          <RunError
+            message={status.message}
+            wording={wording}
+            titleId={titleId}
+            onClose={onClose}
+          />
         ) : (
           <>
             <h2 id={titleId} className="text-lg font-semibold">
-              {askTitle(mode, ready.length)}
+              {askTitle(wording, mode, ready.length)}
             </h2>
 
             {/* A tab stop of its own, so that a user confirming two hundred entries can
@@ -334,45 +406,27 @@ export default function ConfirmDeleteDialog({
             <ul
               data-testid="delete-entries"
               tabIndex={0}
-              aria-label="Entries to delete"
+              aria-label={wording === 'clean' ? 'Items to clean' : 'Entries to delete'}
               className={`flex flex-col gap-1 text-sm ${SCROLLER_CLASS} focus-visible:outline-2 focus-visible:outline-blue-500`}
             >
-              {preview.entries.map((entry, index) => (
+              {question.rows.map((row, index) => (
                 // By index, which is right here and wrong almost everywhere else. A path is
                 // not unique in this list — an exact duplicate comes back from the guards
                 // as a second entry blocked as `nested` (`engine.rs`) — so a path key would
                 // make React drop one of the two rows of the batch the user is confirming.
                 //
                 // An index key is safe because of what a row is, not because of the order
-                // it arrives in: every `<li>` is text derived from its entry, with no local
+                // it arrives in: every `<li>` is text derived from its row, with no local
                 // state, no ref and nothing focusable in it. Reusing one position for a
-                // different entry is then indistinguishable from keying it, even under a
+                // different row is then indistinguishable from keying it, even under a
                 // reorder. Give a row state — a per-row checkbox, say — and this has to
-                // become a key that identifies the entry, which the path cannot.
-                <li
-                  key={index}
-                  data-state={entry.status.state}
-                  className={`flex min-w-0 flex-col ${
-                    entry.status.state === 'blocked' ? 'text-muted' : ''
-                  }`}
-                >
-                  <span className="flex min-w-0 items-baseline gap-2">
-                    <span className={PATH_CLASS} title={entry.path}>
-                      {entry.path}
-                    </span>
-                    <span className="ml-auto shrink-0 tabular-nums">{formatBytes(entry.size)}</span>
-                  </span>
-                  {entry.status.state === 'blocked' && (
-                    <span data-testid="block-reason" className="text-xs">
-                      {describeBlock(entry.status.reason)}
-                    </span>
-                  )}
-                </li>
+                // become a key that identifies the row, which the path cannot.
+                <Row key={index} row={row} scope={scope} mark={markRows && row.irreversible} />
               ))}
             </ul>
 
             <p data-testid="delete-total" className="text-sm font-medium tabular-nums">
-              {countLabel(ready.length, 'item')} · {formatBytes(preview.totalBytes)}
+              {countLabel(ready.length, 'item')} · {formatBytes(question.totalBytes)}
               {blocked > 0 && ` · ${blocked} blocked`}
             </p>
 
@@ -395,11 +449,11 @@ export default function ConfirmDeleteDialog({
                 ))}
               </div>
               <p data-testid="mode-explanation" className="text-sm text-muted">
-                {MODE_EXPLANATIONS[mode]}
+                {MODE_EXPLANATIONS[wording][mode]}
               </p>
             </fieldset>
 
-            {mode === 'permanent' && (
+            {needsAck && (
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
@@ -408,7 +462,9 @@ export default function ConfirmDeleteDialog({
                   onChange={(event) => setUnderstood(event.target.checked)}
                   className="size-4 accent-blue-600"
                 />
-                I understand that this cannot be undone.
+                {irreversible === ready.length
+                  ? 'I understand that this cannot be undone.'
+                  : `I understand that ${countLabel(irreversible, 'item')} cannot be undone.`}
               </label>
             )}
 
@@ -416,7 +472,11 @@ export default function ConfirmDeleteDialog({
               // The mode cannot change under a running batch — the radios are disabled —
               // so this is the mode the batch was confirmed with.
               <p role="status" className="text-sm text-muted">
-                {RUNNING_LABELS[mode]}
+                {runningLabel(
+                  wording,
+                  mode,
+                  status.phase === 'running' ? status.progress : undefined,
+                )}
               </p>
             )}
 
@@ -431,11 +491,11 @@ export default function ConfirmDeleteDialog({
                 // before a `danger` style existed; leaving it there would put the blue
                 // "this is the way on" on the most dangerous control in the app, under a
                 // red button that only opened a dialog.
-                variant={mode === 'permanent' ? 'danger' : 'primary'}
-                disabled={running || ready.length === 0 || (mode === 'permanent' && !understood)}
+                variant={needsAck ? 'danger' : 'primary'}
+                disabled={running || ready.length === 0 || (needsAck && !understood)}
                 onClick={() => onConfirm(mode)}
               >
-                {CONFIRM_LABELS[mode]}
+                {CONFIRM_LABELS[wording][mode]}
               </Button>
             </div>
           </>
@@ -445,29 +505,78 @@ export default function ConfirmDeleteDialog({
   );
 }
 
+/**
+ * One row of the question: its title, what it is and what will run, its size, and whatever
+ * stands in its way.
+ *
+ * The title keeps the `title` attribute it has always carried, first in the row, so that a
+ * long path can still be read in full; the step lines below it carry none, being the
+ * details of the row rather than its name.
+ */
+function Row({ row, scope, mark }: { row: BatchRow; scope: GuardScope; mark: boolean }) {
+  return (
+    <li
+      data-state={row.status.state}
+      className={`flex min-w-0 flex-col ${row.status.state === 'blocked' ? 'text-muted' : ''}`}
+    >
+      <span className="flex min-w-0 items-baseline gap-2">
+        <span className={PATH_CLASS} title={row.title}>
+          {row.title}
+        </span>
+        <span className="ml-auto shrink-0 tabular-nums">{formatBytes(row.size)}</span>
+      </span>
+      {row.context !== undefined && (
+        <span data-testid="row-context" className="text-xs text-muted">
+          {row.context}
+        </span>
+      )}
+      {row.steps !== undefined && row.steps.length > 0 && (
+        <ol data-testid="row-steps" className="flex flex-col text-xs">
+          {row.steps.map((step, index) => {
+            const { verb, what, quiet } = stepLine(step);
+            return (
+              <li
+                // By index: a step is text derived from its row, like the row itself.
+                key={index}
+                data-quiet={quiet ? '' : undefined}
+                className={`flex min-w-0 gap-1 ${quiet ? 'text-muted' : ''}`}
+              >
+                <span className="shrink-0">{verb}</span>
+                <span className="truncate font-mono">{what}</span>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+      {mark && (
+        <span data-testid="irreversible" className="text-xs text-red-700 dark:text-red-400">
+          Cannot be undone
+        </span>
+      )}
+      {row.status.state === 'blocked' && (
+        <span data-testid="block-reason" className="text-xs">
+          {describeBlock(row.status.reason, scope)}
+        </span>
+      )}
+    </li>
+  );
+}
+
 interface ReportProps {
-  result: BatchResult;
+  report: BatchReport;
   titleId: string;
   onClose: () => void;
 }
 
 /** What a batch that ran did — including the two things it may have to admit afterwards. */
-function Report({ result, titleId, onClose }: ReportProps) {
-  const { outcome, recorded, treeStale } = result;
-  const failed = failedLines(outcome.entries);
-  const skipped = skippedLines(outcome.entries);
-  // The mode the batch ran in — the one place a mode is read from anything but the toggle,
-  // because this sentence is about what happened and not about what is being asked.
-  const moved = outcome.mode === 'trash';
-  // Only the removed entries, and the bytes the batch reported: a count over every entry
-  // would claim the failed and skipped ones left the disk, in the same sentence that
-  // reports the bytes of the ones that did.
-  const items = countLabel(removedCount(outcome.entries), 'item');
-  const freed = formatBytes(outcome.freedBytes);
+function Report({ report, titleId, onClose }: ReportProps) {
+  const { rows, recorded, treeStale, wording, scope } = report;
+  const failed = failedLines(rows);
+  const skipped = skippedLines(rows, scope);
   return (
     <>
       <h2 id={titleId} data-testid="result-summary" className="text-lg font-semibold">
-        {moved ? `Moved ${items} to the Trash · ${freed}` : `Deleted ${items} · ${freed}`}
+        {headline(report)}
       </h2>
 
       <div
@@ -478,7 +587,7 @@ function Report({ result, titleId, onClose }: ReportProps) {
       >
         <EntryLines
           lines={failed}
-          title="Could not be deleted"
+          title={wording === 'clean' ? 'Could not be cleaned' : 'Could not be deleted'}
           testId="result-failed"
           tone="text-red-700 dark:text-red-400"
         />
@@ -487,7 +596,8 @@ function Report({ result, titleId, onClose }: ReportProps) {
 
       {!recorded && (
         <p data-testid="not-recorded" className="text-sm text-amber-700 dark:text-amber-400">
-          Deleted, but not recorded: the Activity log has no line for this batch.
+          {wording === 'clean' ? 'Cleaned' : 'Deleted'}, but not recorded: the Activity log has no
+          line for this batch.
         </p>
       )}
       {treeStale && (
@@ -511,22 +621,26 @@ function Report({ result, titleId, onClose }: ReportProps) {
  */
 function RunError({
   message,
+  wording,
   titleId,
   onClose,
 }: {
   message: string;
+  wording: BatchWording;
   titleId: string;
   onClose: () => void;
 }) {
   return (
     <>
       <h2 id={titleId} className="text-lg font-semibold text-red-700 dark:text-red-400">
-        The deletion did not run
+        {wording === 'clean' ? 'The cleanup did not run' : 'The deletion did not run'}
       </h2>
       <p data-testid="run-error" className="font-mono text-sm break-words">
         {message}
       </p>
-      <p className="text-sm text-muted">Nothing was deleted.</p>
+      <p className="text-sm text-muted">
+        {wording === 'clean' ? 'Nothing was cleaned.' : 'Nothing was deleted.'}
+      </p>
       <div className="flex justify-end">
         <Button data-initial-focus="" variant="primary" onClick={onClose}>
           Close
