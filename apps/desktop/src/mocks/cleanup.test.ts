@@ -17,7 +17,8 @@ import {
 } from '../lib/ipc';
 import sharedCases from '../../../../crates/core/tests/fixtures/cleanup-cases.json';
 import { mockActionLog, mockActivityTail } from './actionLog';
-import { commandLine, reversible, screen } from './cleanup';
+import { commandLine } from '../lib/commandLine';
+import { reversible, screen } from './cleanup';
 import { installIpcMock } from './ipc';
 import { DEMO_SANDBOX } from './modules';
 

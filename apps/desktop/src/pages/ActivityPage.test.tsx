@@ -95,7 +95,7 @@ describe('ActivityPage', () => {
     expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Activity');
     expect(screen.getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual([
       'When',
-      'Path',
+      'What',
       'Mode',
       'Result',
       'Size',
@@ -362,5 +362,61 @@ describe('ActivityPage', () => {
     await shown();
     expect(screen.getByTestId('activity-summary')).toHaveTextContent('2 entries');
     expect(screen.getByTestId('activity-summary')).not.toHaveTextContent('most recent');
+  });
+
+  describe('a cleanup line', () => {
+    const SANDBOX = `${FIXTURE_ROOT}/Library/Application Support/storage-monitor/demo`;
+    const source = {
+      module: 'demo',
+      item: 'demo:old.object',
+      title: 'old.object',
+      action: 'Remove object',
+    };
+
+    it('shows the item, the module and the action, the path and the command that ran', async () => {
+      record({
+        path: `${SANDBOX}/old.object`,
+        mode: 'permanent',
+        bytes: 1_003_520,
+        source,
+        commands: [['rm', `${SANDBOX}/old.object`]],
+      });
+      show();
+      const row = await screen.findByTitle('old.object');
+      const cell = row.closest('td') as HTMLElement;
+      // The module's name once the list of modules has answered, and its id before.
+      await waitFor(() =>
+        expect(within(cell).getByTestId('activity-source')).toHaveTextContent(
+          'Demo · Remove object',
+        ),
+      );
+      expect(within(cell).getByTitle(`${SANDBOX}/old.object`)).toBeInTheDocument();
+      expect(within(cell).getByTestId('activity-command')).toHaveTextContent(
+        `$ rm '${SANDBOX}/old.object'`,
+      );
+    });
+
+    it('stands on its title when it has no path', async () => {
+      mockActionLog.push(
+        JSON.stringify({
+          at: AT,
+          mode: 'trash',
+          result: 'skipped',
+          detail: 'missing',
+          bytes: 0,
+          source: { ...source, item: 'demo:gone', title: 'demo:gone' },
+        }),
+      );
+      show();
+      const title = await screen.findByTitle('demo:gone');
+      expect(title.closest('tr')).toHaveTextContent('Nothing is there any more');
+    });
+
+    it('names the home folder where a line of the Explorer names the scanned folder', async () => {
+      record({ result: 'skipped', detail: 'outsideRoots', bytes: 0, source });
+      show();
+      await screen.findByTitle('old.object');
+      expect(screen.getByTestId('activity-detail')).toHaveTextContent('Outside the home folder');
+    });
   });
 });

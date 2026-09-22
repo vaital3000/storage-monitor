@@ -1,6 +1,8 @@
 // The sections of the app shell (design section 10). The Explorer and Activity exist —
 // phase 2a ships the deletion and the record of it together, because a screen that deletes
-// with nothing that says what it deleted is half a feature. The rest open a placeholder.
+// with nothing that says what it deleted is half a feature. Cleanup exists from phase 2b,
+// and opens only in a build that ships a module (`App` decides, from `modules_list`): a
+// release build of 2b has none. The rest open a placeholder.
 
 import {
   Activity,
@@ -17,7 +19,10 @@ export interface PageEntry {
   id: PageId;
   label: string;
   icon: LucideIcon;
-  /** False for sections that arrive in a later phase. */
+  /**
+   * False for sections that arrive in a later phase. Cleanup's is the default the shell
+   * starts from, and replaces once it knows whether the build ships a module.
+   */
   available: boolean;
 }
 

@@ -26,6 +26,7 @@ import {
   type StepEffect,
   type StepView,
 } from '../lib/ipc';
+import { commandLine } from '../lib/commandLine';
 import { appendCleanupToLog } from './actionLog';
 import { checkPath, limitsFor } from './actions';
 import { FIXTURE_ROOT, fixtureEntry, patchTree, type FixtureNode } from './fixtures';
@@ -119,20 +120,6 @@ function planDemo(item: Item, action: ActionSpec, mode: DeletionMode): MockStep[
     ];
   }
   return [];
-}
-
-/**
- * `command_line`: the argv joined, a word quoted unless it could not be misread. For
- * reading only, as in Rust.
- */
-export function commandLine(words: readonly string[]): string {
-  return words
-    .map((word) =>
-      word !== '' && /^[A-Za-z0-9_./:=@%+,-]+$/.test(word)
-        ? word
-        : `'${word.split("'").join("'\\''")}'`,
-    )
-    .join(' ');
 }
 
 /** The targets a plan deletes. */
