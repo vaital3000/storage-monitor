@@ -56,6 +56,8 @@ touched. Deletion goes to the Trash by default.
 
 ![The Explorer: treemap and table of a home folder with growth since the previous scan](docs/images/explorer.png)
 
+![The Cleanup screen: the demo module's items with verdicts, two ticked, and the detail panel of one](docs/images/cleanup.png)
+
 ![The Activity screen: what was deleted, newest first, with mode, result and size](docs/images/activity.png)
 
 ## CLI
