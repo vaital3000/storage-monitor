@@ -216,7 +216,7 @@ describe('ConfirmDeleteDialog', () => {
     expect(keeper).not.toHaveClass('text-muted');
   });
 
-  it('says each of the nine block reasons in its own words', () => {
+  it('says each of the ten block reasons in its own words', () => {
     // Pinned pairwise, and not by a shape a permutation would also satisfy. The pair the
     // backend most insists on is `missing` against `unreadable` (`ipc.ts`): one sends the
     // user hunting for a file that is gone, the other to grant Full Disk Access.
@@ -230,8 +230,9 @@ describe('ConfirmDeleteDialog', () => {
       missing: 'Nothing is there any more',
       unreadable: 'Cannot be read — it may need Full Disk Access',
       kindChanged: 'No longer what the preview saw',
+      kept: 'Marked keep — turn on its force option to clean it anyway',
     };
-    // A tenth reason mirrored into `ipc.ts` has to arrive here too, rather than falling
+    // An eleventh reason mirrored into `ipc.ts` has to arrive here too, rather than falling
     // through to the unknown-variant line that exists for older builds in the wild.
     expect(Object.keys(words).sort()).toEqual([...BLOCK_REASONS].sort());
 

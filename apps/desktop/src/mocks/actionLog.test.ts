@@ -143,15 +143,21 @@ describe('mockActivityTail', () => {
       detail: null,
       bytes: 12,
     };
-    const withoutPath: Record<string, unknown> = { ...entry };
-    delete withoutPath.path;
     // Every line below is that entry with a single field spoiled: a reader that stopped
     // checking any one of them would take that line for an entry of the user's history.
-    // The three at the end are the ones a `u64` and a `DateTime<Utc>` refuse.
+    // The three at the end are the ones a `u64` and a `DateTime<Utc>` refuse. A line with
+    // no `path` at all is not among them: a cleanup line whose item was already gone has
+    // none, and serde reads it (the next test).
     const spoiled = [
       { ...entry, at: 12 },
-      withoutPath,
+      { ...entry, path: 7 },
       { ...entry, kind: 'folder' },
+      // A `Source` is four strings, every one required.
+      { ...entry, source: { module: 'demo', item: 'demo:a', title: 'a' } },
+      { ...entry, source: 'demo' },
+      // A `Vec` takes absence, not `null`.
+      { ...entry, commands: null },
+      { ...entry, commands: ['rm', '/x'] },
       { ...entry, mode: 'bin' },
       { ...entry, result: 'deleted' },
       { ...entry, detail: 7 },
@@ -182,6 +188,40 @@ describe('mockActivityTail', () => {
     const tail = mockActivityTail(20);
     expect(tail.entries).toEqual([entry]);
     expect(tail.damaged).toBe(4 + spoiled.length);
+  });
+
+  it('reads a cleanup line with its source and commands, and one with no path at all', () => {
+    const cleaned = {
+      at: '2026-09-18T09:30:00Z',
+      path: under('Library/Application Support/storage-monitor/demo/old.object'),
+      kind: 'file',
+      mode: 'permanent',
+      result: 'removed',
+      detail: null,
+      bytes: 1_003_520,
+      source: {
+        module: 'demo',
+        item: 'demo:old.object',
+        title: 'old.object',
+        action: 'Remove object',
+      },
+      commands: [['rm', '/Users/demo/x']],
+    };
+    const gone = {
+      at: '2026-09-18T09:30:00Z',
+      mode: 'trash',
+      result: 'skipped',
+      detail: 'missing',
+      bytes: 0,
+      source: { module: 'demo', item: 'demo:gone', title: 'demo:gone', action: 'delete' },
+    };
+    // `null` where serde takes `null` for an `Option`: the same entry as an absent field.
+    const nulls = { ...gone, path: null, kind: null };
+    mockActionLog.push(JSON.stringify(cleaned), JSON.stringify(gone), JSON.stringify(nulls));
+    const tail = mockActivityTail(10);
+    expect(tail.damaged).toBe(0);
+    expect(tail.entries).toEqual([gone, gone, cleaned]);
+    expect(tail.entries[0]).not.toHaveProperty('path');
   });
 
   it('reads every timestamp chrono reads, and only those', () => {

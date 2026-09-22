@@ -28,6 +28,21 @@ const BLOCK_REASON_LABELS: Record<BlockReason, string> = {
   missing: 'Nothing is there any more',
   unreadable: 'Cannot be read — it may need Full Disk Access',
   kindChanged: 'No longer what the preview saw',
+  kept: 'Marked keep — turn on its force option to clean it anyway',
+};
+
+/**
+ * Where a batch's guards were built from, which two of the reasons name: the scanned folder
+ * for a batch of the Explorer, and the home folder for a batch of Cleanup, whose modules may
+ * delete anywhere in it (phase 2b design, section 8). Settings replaces the one root with a
+ * list in phase 2c, and these words with it.
+ */
+export type GuardScope = 'scan' | 'home';
+
+/** The two reasons that name the root, as a batch of Cleanup says them. */
+const HOME_LABELS: Partial<Record<BlockReason, string>> = {
+  outsideRoots: 'Outside the home folder',
+  isRoot: 'The home folder itself, or one above it',
 };
 
 /**
@@ -38,7 +53,8 @@ const BLOCK_REASON_LABELS: Record<BlockReason, string> = {
  */
 export const UNKNOWN_BLOCK_REASON = 'Blocked for a reason this version does not know';
 
-/** What a verdict says on screen. */
-export function describeBlock(reason: BlockReason): string {
-  return BLOCK_REASON_LABELS[reason] ?? UNKNOWN_BLOCK_REASON;
+/** What a verdict says on screen, for a batch whose guards were built from `scope`. */
+export function describeBlock(reason: BlockReason, scope: GuardScope = 'scan'): string {
+  const home = scope === 'home' ? HOME_LABELS[reason] : undefined;
+  return home ?? BLOCK_REASON_LABELS[reason] ?? UNKNOWN_BLOCK_REASON;
 }

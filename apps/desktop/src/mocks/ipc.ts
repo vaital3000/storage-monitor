@@ -9,6 +9,7 @@ import {
   SCAN_PROGRESS_EVENT,
   type AppInfo,
   type BatchResult,
+  type CleanupRequest,
   type DeletionMode,
   type ScanStatus,
 } from '../lib/ipc';
@@ -22,6 +23,22 @@ import {
 } from './fixtures';
 import { type HeldScan, mockActionPreview, mockActionRun, resetMockActions } from './actions';
 import { mockActivityTail } from './actionLog';
+import {
+  mockCleanupPreview,
+  mockCleanupRun,
+  resetMockCleanup,
+  setMockCleanupFailure,
+} from './cleanup';
+import {
+  mockCleanupItems,
+  mockModulesList,
+  mockModulesRefresh,
+  resetMockModules,
+  setMockDiscoveryDelay,
+  setMockModuleFailure,
+  setMockModuleUnavailable,
+  setMockModules,
+} from './modules';
 
 export const MOCK_APP_INFO: AppInfo = { name: 'Storage Monitor', version: '0.0.0-mock' };
 
@@ -49,6 +66,7 @@ const PROGRESS_TICKS = 6;
 const DEFAULT_CHILDREN_LIMIT = 500;
 const DEFAULT_GROWERS_LIMIT = 10;
 const DEFAULT_ACTIVITY_LIMIT = 100;
+const DEFAULT_ITEMS_LIMIT = 2000;
 
 /** Directories the simulated scan claims to be reading, one per tick, shallow to deep. */
 const PROGRESS_PATHS: readonly string[] = (() => {
@@ -119,6 +137,41 @@ function batchArguments(args: IpcArgs, cmd: string): { paths: string[]; mode: De
     commandError(`invalid args \`mode\` for command \`${cmd}\`: expected trash or permanent`);
   }
   return { paths: paths as string[], mode };
+}
+
+/**
+ * The requests of both cleanup commands, refused the way Tauri refuses a body it cannot
+ * deserialize into `Vec<Request>`: every request an object with a string `item`, a string
+ * `action` and, when present, a list of strings `options` — `#[serde(default)]` in Rust.
+ */
+function cleanupRequests(args: IpcArgs, cmd: string): CleanupRequest[] {
+  const requests = argument(args, 'requests');
+  const valid =
+    Array.isArray(requests) &&
+    requests.every((request: unknown) => {
+      if (typeof request !== 'object' || request === null) return false;
+      const { item, action, options } = request as Record<string, unknown>;
+      return (
+        typeof item === 'string' &&
+        typeof action === 'string' &&
+        (options === undefined ||
+          (Array.isArray(options) && options.every((option) => typeof option === 'string')))
+      );
+    });
+  if (!valid) {
+    commandError(`invalid args \`requests\` for command \`${cmd}\`: expected a list of requests`);
+  }
+  return (requests as Array<{ item: string; action: string; options?: string[] }>).map(
+    ({ item, action, options }) => ({ item, action, options: options ?? [] }),
+  );
+}
+
+function modeArgument(args: IpcArgs, cmd: string): DeletionMode {
+  const mode = argument(args, 'mode');
+  if (mode !== 'trash' && mode !== 'permanent') {
+    commandError(`invalid args \`mode\` for command \`${cmd}\`: expected trash or permanent`);
+  }
+  return mode;
 }
 
 /** A command's `Err(String)`: Tauri rejects with the string itself, not with an `Error`. */
@@ -306,6 +359,21 @@ const handle: IpcHandler = (cmd, args) => {
     }
     case 'activity_log':
       return mockActivityTail(numberArgument(args, 'limit') ?? DEFAULT_ACTIVITY_LIMIT);
+    case 'modules_list':
+      return mockModulesList();
+    case 'modules_refresh': {
+      const ids = argument(args, 'ids');
+      if (ids !== undefined && ids !== null && !Array.isArray(ids)) {
+        commandError('invalid args `ids` for command `modules_refresh`: expected a list of ids');
+      }
+      return mockModulesRefresh(Array.isArray(ids) ? ids.map(String) : []);
+    }
+    case 'cleanup_items':
+      return mockCleanupItems(numberArgument(args, 'limit') ?? DEFAULT_ITEMS_LIMIT);
+    case 'cleanup_preview':
+      return mockCleanupPreview(cleanupRequests(args, cmd));
+    case 'cleanup_run':
+      return mockCleanupRun(cleanupRequests(args, cmd), modeArgument(args, cmd));
     case 'plugin:opener|reveal_item_in_dir': {
       // `revealItemInDir(path)` sends `{ paths: [path] }`.
       const paths = argument(args, 'paths');
@@ -330,6 +398,8 @@ export function resetIpcMock(): void {
   scanFailure = null;
   revealed.length = 0;
   resetMockActions();
+  resetMockModules();
+  resetMockCleanup();
 }
 
 declare global {
@@ -339,6 +409,11 @@ declare global {
       revealed: string[];
       setMockScanDelay: (ms: number) => void;
       setMockScanFailure: (message: string | null) => void;
+      setMockModules: (present: boolean) => void;
+      setMockModuleFailure: (id: string, message: string | null) => void;
+      setMockModuleUnavailable: (id: string, reason: string | null) => void;
+      setMockCleanupFailure: (itemId: string, message: string | null) => void;
+      setMockDiscoveryDelay: (ms: number) => void;
     };
   }
 }
@@ -373,5 +448,14 @@ export function installIpcMock(): void {
   resetIpcMock();
   mockIPC(handle, { shouldMockEvents: true });
   fixUnlisten();
-  window.__STORAGE_MONITOR_MOCK__ = { revealed, setMockScanDelay, setMockScanFailure };
+  window.__STORAGE_MONITOR_MOCK__ = {
+    revealed,
+    setMockScanDelay,
+    setMockScanFailure,
+    setMockModules,
+    setMockModuleFailure,
+    setMockModuleUnavailable,
+    setMockCleanupFailure,
+    setMockDiscoveryDelay,
+  };
 }

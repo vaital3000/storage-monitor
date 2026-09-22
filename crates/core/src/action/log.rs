@@ -568,6 +568,30 @@ mod tests {
         assert!(read.entries[0].source.is_some() && read.entries[2].source.is_none());
     }
 
+    /// What the mock's reader (`apps/desktop/src/mocks/actionLog.ts`) says serde does with the
+    /// fields this phase added, measured here rather than assumed there: `null` is an absent
+    /// `Option`, a `Vec` takes no `null`, and a `Source` needs all four of its strings.
+    #[test]
+    fn serde_reads_the_new_fields_the_way_the_mock_says() {
+        let base = r#""at":"2026-09-18T09:30:00Z","mode":"trash","result":"skipped","detail":"missing","bytes":0"#;
+        let read = |extra: &str| serde_json::from_str::<LogEntry>(&format!("{{{base}{extra}}}"));
+
+        let nulls = read(r#","path":null,"kind":null,"source":null"#).unwrap();
+        assert_eq!((nulls.path, nulls.kind, nulls.source), (None, None, None));
+        assert!(read("").unwrap().commands.is_empty(), "absent is empty");
+        assert!(read(r#","commands":null"#).is_err(), "a Vec takes no null");
+        assert!(
+            read(r#","commands":["rm","/x"]"#).is_err(),
+            "a list of lists"
+        );
+        assert!(
+            read(r#","source":{"module":"demo","item":"demo:a","title":"a"}"#).is_err(),
+            "every field of a source"
+        );
+        assert!(read(r#","source":"demo""#).is_err());
+        assert!(read(r#","path":7"#).is_err());
+    }
+
     #[test]
     fn an_empty_cleanup_batch_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();

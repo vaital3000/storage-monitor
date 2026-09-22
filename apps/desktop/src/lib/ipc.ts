@@ -1,7 +1,7 @@
 // The only module that talks to the backend. Types mirror `src-tauri/src/views.rs`,
-// `crates/core/src/disk.rs`, `crates/core/src/snapshot/delta.rs` and
-// `crates/core/src/action/` field by field in camelCase; command and argument names match
-// `src-tauri/src/commands.rs`.
+// `crates/core/src/disk.rs`, `crates/core/src/snapshot/delta.rs`,
+// `crates/core/src/action/`, `crates/core/src/module/` and `crates/core/src/cleanup/` field
+// by field in camelCase; command and argument names match `src-tauri/src/commands.rs`.
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -110,11 +110,13 @@ export const DELETION_MODES = ['trash', 'permanent'] as const;
 export type DeletionMode = (typeof DELETION_MODES)[number];
 
 /**
- * Why an entry will not be deleted, mirroring `BlockReason`. All nine of them: the guards
+ * Why an entry will not be deleted, mirroring `BlockReason`. All ten of them: the guards
  * tell `missing` from `unreadable` (grant Full Disk Access, do not go hunting for a ghost)
  * and `malformed` from both, so a screen that folds them together says the wrong thing.
  * `shielded` is the one that is not a dead end — the folder is refused, what is inside it
- * is not — so folding it into `denylisted` would cost the user the way forward.
+ * is not — so folding it into `denylisted` would cost the user the way forward. `kept` is
+ * a cleanup item's alone: a Keep verdict asked for without its force option, which the user
+ * can lift from the same screen.
  */
 export const BLOCK_REASONS = [
   'outsideRoots',
@@ -126,6 +128,7 @@ export const BLOCK_REASONS = [
   'missing',
   'unreadable',
   'kindChanged',
+  'kept',
 ] as const;
 
 export type BlockReason = (typeof BLOCK_REASONS)[number];
@@ -201,6 +204,17 @@ export const LOG_RESULTS = ['removed', 'failed', 'skipped'] as const;
 
 export type LogResult = (typeof LOG_RESULTS)[number];
 
+/** Where a cleanup line came from, as the module, the item and the action were named then. */
+export interface LogSource {
+  /** The module's id. */
+  module: string;
+  /** The item's id. */
+  item: string;
+  title: string;
+  /** The action's label. */
+  action: string;
+}
+
 /** One line of the action log, readable on its own long after the dialog that wrote it. */
 export interface ActivityEntry {
   /** When the batch began; every line of one batch carries the same instant. */
@@ -208,9 +222,16 @@ export interface ActivityEntry {
   /**
    * What was deleted, as the guards normalized it — which under a symlinked scan root is
    * not the spelling the Explorer showed, so do not match an entry back to a row by string.
+   * A line of the Explorer always has one; a cleanup line has the item's path, and none at
+   * all when the item named no path or was already gone. Absent then, not null.
    */
-  path: string;
-  kind: NodeKind;
+  path?: string;
+  /** Absent exactly when `path` is, and for a cleanup item whose plan had no target there. */
+  kind?: NodeKind;
+  /**
+   * How the entry left. A cleanup line says the mode the entry really left in, which is
+   * `permanent` for anything the Trash cannot undo, whatever the batch was asked.
+   */
   mode: DeletionMode;
   result: LogResult;
   /**
@@ -222,6 +243,10 @@ export interface ActivityEntry {
   detail: string | null;
   /** Bytes this entry freed; 0 for anything that was not removed. */
   bytes: number;
+  /** Present on a cleanup line and absent on a line of the Explorer: how to tell them apart. */
+  source?: LogSource;
+  /** The argv of every command a cleanup entry started, in order; absent when none did. */
+  commands?: string[][];
 }
 
 /**
@@ -263,6 +288,192 @@ export interface LogTail {
    */
   damaged: number;
 }
+
+/** A module's confidence that an item can go, mirroring `Level`. */
+export const VERDICT_LEVELS = ['safe', 'review', 'keep'] as const;
+
+export type VerdictLevel = (typeof VERDICT_LEVELS)[number];
+
+/** Why a verdict is what it is: a code for tests, a sentence for the screen. */
+export interface Reason {
+  code: string;
+  text: string;
+}
+
+export interface Verdict {
+  level: VerdictLevel;
+  reasons: Reason[];
+}
+
+/** A value the detail panel draws by its type; dates are RFC 3339. */
+export type FactValue =
+  | { type: 'text'; value: string }
+  | { type: 'bytes'; value: number }
+  | { type: 'count'; value: number }
+  | { type: 'date'; value: string }
+  | { type: 'flag'; value: boolean }
+  | { type: 'path'; value: string };
+
+export interface Fact {
+  key: string;
+  label: string;
+  value: FactValue;
+}
+
+/** A switch on an action; one marked `force` lets the action remove an item marked Keep. */
+export interface ActionOption {
+  id: string;
+  label: string;
+  /** Whether it starts turned on. */
+  default: boolean;
+  force: boolean;
+}
+
+/** Something that can be done with an item. What it does is planned per mode, in the preview. */
+export interface ActionSpec {
+  id: string;
+  label: string;
+  /** What the dialog promises and the record says was freed. */
+  estimatedFree: number;
+  options: ActionOption[];
+}
+
+/** One thing a module found. */
+export interface Item {
+  /** `<module>:<native id>`, stable across discoveries: what a selection is keyed by. */
+  id: string;
+  module: string;
+  /** The module's own word for it: `folder`, `object`, `worktree`, `image`. */
+  kind: string;
+  title: string;
+  subtitle: string | null;
+  path: string | null;
+  size: { bytes: number; estimated: boolean };
+  /** RFC 3339. */
+  lastUsed: string | null;
+  verdict: Verdict;
+  facts: Fact[];
+  /** The first is what a batch does unless the detail panel says otherwise. */
+  actions: ActionSpec[];
+}
+
+/** At most the limit of what the modules hold, largest first, and how many there are. */
+export interface ItemsPage {
+  items: Item[];
+  total: number;
+}
+
+/** Where a module stands, mirroring `ModuleStatus`. */
+export const MODULE_STATUSES = ['idle', 'discovering', 'ready', 'unavailable', 'failed'] as const;
+
+export type ModuleStatus = (typeof MODULE_STATUSES)[number];
+
+export interface ModuleView {
+  id: string;
+  name: string;
+  description: string;
+  status: ModuleStatus;
+  /** Why it is unavailable, or what made its last discovery fail. */
+  reason: string | null;
+  itemCount: number;
+  /** Over the items it holds — after a failed refresh, those of the last one that worked. */
+  totalBytes: number;
+  safeBytes: number;
+  /** RFC 3339: when the held items were found. */
+  discoveredAt: string | null;
+}
+
+/** One item to clean, with the action and the options chosen for it. */
+export interface CleanupRequest {
+  item: string;
+  action: string;
+  options: string[];
+}
+
+/** What a `run` step changes, as its module declared it. */
+export type StepEffect = 'housekeeping' | 'destroys' | 'removes';
+
+/** One step as the dialog shows it. A command line is for reading; nothing parses it back. */
+export type StepView =
+  | { step: 'trash'; path: string }
+  | { step: 'delete'; path: string }
+  | { step: 'run'; command: string; effect: StepEffect; path: string | null };
+
+/** One request, checked in one mode. */
+export interface CleanupEntry {
+  item: string;
+  /** Empty for an item that is not held any more. */
+  module: string;
+  /** The item's title, or its id when it is not held any more. */
+  title: string;
+  /** The action's label, or its id when the item does not offer it. */
+  action: string;
+  /** What would run, in order; empty when the entry was refused before it was planned. */
+  steps: readonly StepView[];
+  size: number;
+  status: EntryStatus;
+  /** Whether the Trash can undo it in this preview's mode. */
+  reversible: boolean;
+}
+
+/** A checked cleanup batch in one mode: nothing was touched. */
+export interface CleanupPreview {
+  /** One per request, in the order they came, refused ones included. */
+  entries: readonly CleanupEntry[];
+  totalBytes: number;
+  mode: DeletionMode;
+}
+
+/** A cleanup batch checked in both modes, entries aligned by index. */
+export interface CleanupPreviews {
+  trash: CleanupPreview;
+  permanent: CleanupPreview;
+}
+
+export interface CleanupEntryOutcome {
+  item: string;
+  module: string;
+  title: string;
+  action: string;
+  path: string | null;
+  kind: NodeKind | null;
+  /** Every target a step tried to delete, normalized. */
+  targets: string[];
+  /** How this entry left: `permanent` for anything the Trash cannot undo. */
+  mode: DeletionMode;
+  /** The argv of every command that started, in order. */
+  commands: string[][];
+  result: EntryResult;
+}
+
+export interface CleanupOutcome {
+  entries: CleanupEntryOutcome[];
+  freedBytes: number;
+  /** RFC 3339 timestamp of the batch, shared by every entry of it. */
+  at: string;
+  /** The mode the batch was asked to run in; each entry says the mode it really left in. */
+  mode: DeletionMode;
+}
+
+/** A cleanup batch that ran, with the two things the window has to admit about it. */
+export interface CleanupResult {
+  outcome: CleanupOutcome;
+  /** False when the entries are cleaned and the action log does not have them. */
+  recorded: boolean;
+  /** True when the Explorer still shows a row for something this batch deleted. */
+  treeStale: boolean;
+}
+
+/** How far a cleanup batch has got: sent before every entry and once at the end. */
+export interface CleanupProgress {
+  done: number;
+  total: number;
+  /** The title of the entry starting now; null once the batch is over. */
+  current: string | null;
+}
+
+export const MODULES_STATE_EVENT = 'modules:state';
+export const CLEANUP_PROGRESS_EVENT = 'cleanup:progress';
 
 export const SCAN_PROGRESS_EVENT = 'scan:progress';
 export const SCAN_DONE_EVENT = 'scan:done';
@@ -328,6 +539,51 @@ export function actionRun(paths: string[], mode: DeletionMode): Promise<BatchRes
  */
 export function activityLog(limit?: number): Promise<LogTail> {
   return invoke<LogTail>('activity_log', { limit });
+}
+
+/** The cleanup modules of this build, where each stands and what it holds. */
+export function modulesList(): Promise<ModuleView[]> {
+  return invoke<ModuleView[]>('modules_list');
+}
+
+/**
+ * Starts a discovery of the modules named in `ids` (every module when there are none).
+ * Answers once all of them are `discovering`; each change of state arrives as `modules:state`.
+ */
+export function modulesRefresh(ids?: string[]): Promise<ModuleView[]> {
+  return invoke<ModuleView[]>('modules_refresh', { ids });
+}
+
+/** What the modules hold, largest first: at most `limit` items (default: 2000). */
+export function cleanupItems(limit?: number): Promise<ItemsPage> {
+  return invoke<ItemsPage>('cleanup_items', { limit });
+}
+
+/** What cleaning `requests` would do in each mode, with nothing touched. */
+export function cleanupPreview(requests: CleanupRequest[]): Promise<CleanupPreviews> {
+  return invoke<CleanupPreviews>('cleanup_preview', { requests });
+}
+
+/**
+ * Cleans `requests` in `mode`, with `cleanup:progress` events on the way.
+ *
+ * A rejection means the batch did **not** run. A batch that ran always resolves, and says
+ * through `recorded` and `treeStale` what it could not finish afterwards.
+ */
+export function cleanupRun(requests: CleanupRequest[], mode: DeletionMode): Promise<CleanupResult> {
+  return invoke<CleanupResult>('cleanup_run', { requests, mode });
+}
+
+/** A module whose state changed: discovering, ready, unavailable or failed. */
+export function onModulesState(callback: (view: ModuleView) => void): Promise<UnlistenFn> {
+  return listen<ModuleView>(MODULES_STATE_EVENT, (event) => callback(event.payload));
+}
+
+/** Before every entry of a cleanup batch, and once at its end. */
+export function onCleanupProgress(
+  callback: (progress: CleanupProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<CleanupProgress>(CLEANUP_PROGRESS_EVENT, (event) => callback(event.payload));
 }
 
 /** Status updates every 250 ms while a scan runs. */

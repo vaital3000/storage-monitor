@@ -4,11 +4,14 @@ import { cleanup } from '@testing-library/react';
 import { clearMocks } from '@tauri-apps/api/mocks';
 import { resetMockActions } from '../mocks/actions';
 import { resetIpcMock, setMockScanDelay } from '../mocks/ipc';
+import { setMockDiscoveryDelay } from '../mocks/modules';
 
 beforeEach(() => {
   // A simulated scan at the browser pace (150 ms per tick) outlasts Testing Library's
   // 1 s `findBy*` timeout; tests that want to watch the progress set their own delay.
   setMockScanDelay(0);
+  // The same for a module's discovery, which the mock also answers after a delay.
+  setMockDiscoveryDelay(0);
 });
 
 afterEach(() => {

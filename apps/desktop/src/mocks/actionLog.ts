@@ -7,8 +7,12 @@
 
 import type {
   ActivityEntry,
+  CleanupEntryOutcome,
+  CleanupOutcome,
   DeletionMode,
   EntryOutcome,
+  EntryResult,
+  LogSource,
   LogTail,
   NodeKind,
   Outcome,
@@ -25,17 +29,52 @@ export function appendToLog(outcome: Outcome): void {
   }
 }
 
+/** `verdict` of `log.rs`: an entry's result as the log says it. */
+function verdict(result: EntryResult): Pick<ActivityEntry, 'result' | 'detail' | 'bytes'> {
+  switch (result.result) {
+    case 'removed':
+      return { result: 'removed', detail: null, bytes: result.bytes };
+    case 'failed':
+      return { result: 'failed', detail: result.message, bytes: 0 };
+    case 'skipped':
+      return { result: 'skipped', detail: result.reason, bytes: 0 };
+  }
+}
+
 /** `LogEntry::of`: the verdict alone, with what it carried split into `detail` and `bytes`. */
 function logEntry(entry: EntryOutcome, outcome: Outcome): ActivityEntry {
-  const line = { at: outcome.at, path: entry.path, kind: entry.kind, mode: outcome.mode };
-  switch (entry.result.result) {
-    case 'removed':
-      return { ...line, result: 'removed', detail: null, bytes: entry.result.bytes };
-    case 'failed':
-      return { ...line, result: 'failed', detail: entry.result.message, bytes: 0 };
-    case 'skipped':
-      return { ...line, result: 'skipped', detail: entry.result.reason, bytes: 0 };
+  return {
+    at: outcome.at,
+    path: entry.path,
+    kind: entry.kind,
+    mode: outcome.mode,
+    ...verdict(entry.result),
+  };
+}
+
+/**
+ * `ActionLog::append_cleanup`: one line per entry, in the order of the batch, each in the
+ * mode its entry really left in, with its source and the commands that started. The keys go
+ * in the order serde writes them, and an empty field is left out as serde leaves it out, so
+ * the mock's file reads line for line like the app's.
+ */
+export function appendCleanupToLog(outcome: CleanupOutcome): void {
+  for (const entry of outcome.entries) {
+    mockActionLog.push(JSON.stringify(cleanupLine(entry, outcome.at)));
   }
+}
+
+/** `LogEntry::of_cleanup`. */
+function cleanupLine(entry: CleanupEntryOutcome, at: string): ActivityEntry {
+  return {
+    at,
+    ...(entry.path === null ? {} : { path: entry.path }),
+    ...(entry.kind === null ? {} : { kind: entry.kind }),
+    mode: entry.mode,
+    ...verdict(entry.result),
+    source: { module: entry.module, item: entry.item, title: entry.title, action: entry.action },
+    ...(entry.commands.length === 0 ? {} : { commands: entry.commands }),
+  };
 }
 
 /**
@@ -91,9 +130,10 @@ function isTimestamp(value: string): boolean {
  * One line of the log, or `null` when it is not an entry — as far as possible the line serde
  * refuses, measured against the real `LogEntry` rather than guessed:
  *
- * - a **missing `detail`** is an entry with `detail: null`. Every other field is required,
- *   but `Option<String>` is one serde fills in, and a line written by hand for a test — the
- *   natural way to get a `failed` row on screen — does not have to carry it;
+ * - a **missing `detail`** is an entry with `detail: null`, and a missing `path`, `kind` or
+ *   `source` an entry without one: `Option` fields serde fills in, `null` or absent alike. A
+ *   line written by hand for a test — the natural way to get a `failed` row on screen —
+ *   does not have to carry them; `commands` is a `Vec`, which takes absence and not `null`;
  * - an unknown field is ignored, so a line from a later version still reads;
  * - `at` has to be a timestamp in `chrono`'s grammar (see [`isTimestamp`], which is where
  *   that grammar is written down); `bytes` a whole number that is not negative, because the
@@ -111,30 +151,55 @@ function parseLogLine(line: string): ActivityEntry | null {
   }
   const entry = value as Record<string, unknown>;
   const detail = entry.detail ?? null;
+  // `Option` fields take `null` as well as absence; `Vec` fields take absence only.
+  const path = entry.path ?? undefined;
+  const kind = entry.kind ?? undefined;
+  const source = entry.source ?? undefined;
   const complete =
     typeof entry.at === 'string' &&
     isTimestamp(entry.at) &&
-    typeof entry.path === 'string' &&
-    oneOf(entry.kind, NODE_KINDS) &&
+    (path === undefined || typeof path === 'string') &&
+    (kind === undefined || oneOf(kind, NODE_KINDS)) &&
     oneOf(entry.mode, DELETION_MODES) &&
     oneOf(entry.result, LOG_RESULTS) &&
     (detail === null || typeof detail === 'string') &&
     typeof entry.bytes === 'number' &&
     Number.isInteger(entry.bytes) &&
-    entry.bytes >= 0;
+    entry.bytes >= 0 &&
+    (source === undefined || isSource(source)) &&
+    (entry.commands === undefined || isCommands(entry.commands));
   if (!complete) {
     return null;
   }
   // Field by field, so that an unknown one is dropped the way serde drops it.
   return {
     at: entry.at as string,
-    path: entry.path as string,
-    kind: entry.kind as NodeKind,
+    ...(path === undefined ? {} : { path: path as string }),
+    ...(kind === undefined ? {} : { kind: kind as NodeKind }),
     mode: entry.mode as DeletionMode,
     result: entry.result as LogResult,
     detail: detail as string | null,
     bytes: entry.bytes as number,
+    ...(source === undefined ? {} : { source: source as LogSource }),
+    ...(entry.commands === undefined ? {} : { commands: entry.commands as string[][] }),
   };
+}
+
+/** A `Source`: four strings, every one of them required. */
+function isSource(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const source = value as Record<string, unknown>;
+  return ['module', 'item', 'title', 'action'].every((key) => typeof source[key] === 'string');
+}
+
+/** A `Vec<Vec<String>>`. */
+function isCommands(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every((argv) => Array.isArray(argv) && argv.every((word) => typeof word === 'string'))
+  );
 }
 
 /**
