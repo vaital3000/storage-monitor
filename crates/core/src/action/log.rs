@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::cleanup::{CleanupEntryOutcome, CleanupOutcome};
 use crate::scan::NodeKind;
 
 use super::model::{BlockReason, EntryOutcome, EntryResult, Mode, Outcome};
@@ -66,13 +67,22 @@ pub enum LogResult {
 pub struct LogEntry {
     /// When the batch began; shared by every line of it (see [`Outcome::at`]).
     pub at: DateTime<Utc>,
-    pub path: String,
+    /// What was deleted. A line of the Explorer always has one: the path as the guards
+    /// normalized it. A cleanup line has the item's path, and none when the item named no
+    /// path or was already gone when the batch reached it — which is why the field is
+    /// optional, and absent from the line rather than `null` when it is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// What the entry was. For a removed one this is the kind the disk confirmed moments
     /// before the deletion; for a skipped one it can be the plan's unverified claim, as
-    /// [`super::PreviewEntry::kind`] explains.
-    pub kind: NodeKind,
+    /// [`super::PreviewEntry::kind`] explains. A cleanup line has the kind of the target at
+    /// the item's path, when the plan had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<NodeKind>,
     /// How the entry left, which is what makes `removed` readable: *moved, recoverable*
-    /// under [`Mode::Trash`], *gone* under [`Mode::Permanent`].
+    /// under [`Mode::Trash`], *gone* under [`Mode::Permanent`]. A cleanup line has the mode
+    /// the entry really left in, which is `permanent` for anything the Trash cannot undo,
+    /// whatever the batch was asked.
     pub mode: Mode,
     pub result: LogResult,
     /// Whatever there is to add to [`LogEntry::result`], and meaningless without it: the
@@ -91,27 +101,80 @@ pub struct LogEntry {
     /// Deliberate, and not a measure of the row's worth: a skipped row is a row the user
     /// asked for and did not get, and the Activity screen must not draw it as an empty one.
     pub bytes: u64,
+    /// Where a cleanup line came from. Absent from a line of the Explorer, which is how a
+    /// reader tells the two apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+    /// The argv of every command a cleanup entry started, in order. Absent when none did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<Vec<String>>,
+}
+
+/// The module, the item and the action a cleanup line is about, as they were named when the
+/// batch ran — so the line still reads after the module has changed its wording, or gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Source {
+    /// The module's id.
+    pub module: String,
+    /// The item's id.
+    pub item: String,
+    /// The item's title.
+    pub title: String,
+    /// The action's label.
+    pub action: String,
 }
 
 impl LogEntry {
     /// The line for one entry of a batch that began at `at` and ran in `mode`.
     fn of(entry: &EntryOutcome, at: DateTime<Utc>, mode: Mode) -> Self {
-        let (result, detail, bytes) = match &entry.result {
-            EntryResult::Removed { bytes } => (LogResult::Removed, None, *bytes),
-            EntryResult::Failed { message } => (LogResult::Failed, Some(message.clone()), 0),
-            EntryResult::Skipped { reason } => (LogResult::Skipped, wire_name(*reason), 0),
-        };
+        let (result, detail, bytes) = verdict(&entry.result);
         Self {
             at,
             // Lossy, and lossless in fact: a path that is not valid UTF-8 never reaches a
             // deletion at all, for the reason the module docs of [`super::model`] give.
-            path: entry.path.to_string_lossy().into_owned(),
-            kind: entry.kind,
+            path: Some(entry.path.to_string_lossy().into_owned()),
+            kind: Some(entry.kind),
             mode,
             result,
             detail,
             bytes,
+            source: None,
+            commands: Vec::new(),
         }
+    }
+
+    /// The line for one entry of a cleanup batch that began at `at`.
+    fn of_cleanup(entry: &CleanupEntryOutcome, at: DateTime<Utc>) -> Self {
+        let (result, detail, bytes) = verdict(&entry.result);
+        Self {
+            at,
+            path: entry
+                .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            kind: entry.kind,
+            mode: entry.mode,
+            result,
+            detail,
+            bytes,
+            source: Some(Source {
+                module: entry.module.clone(),
+                item: entry.item.clone(),
+                title: entry.title.clone(),
+                action: entry.action.clone(),
+            }),
+            commands: entry.commands.clone(),
+        }
+    }
+}
+
+/// An entry's result as the log says it: the verdict, what to add to it, and the bytes.
+fn verdict(result: &EntryResult) -> (LogResult, Option<String>, u64) {
+    match result {
+        EntryResult::Removed { bytes } => (LogResult::Removed, None, *bytes),
+        EntryResult::Failed { message } => (LogResult::Failed, Some(message.clone()), 0),
+        EntryResult::Skipped { reason } => (LogResult::Skipped, wire_name(*reason), 0),
     }
 }
 
@@ -196,16 +259,37 @@ impl ActionLog {
     /// of the batch may be in the file already — what a later reader loses is the torn line
     /// — and that the caller has deleted something it has not recorded.
     pub fn append(&self, outcome: &Outcome) -> io::Result<()> {
-        if outcome.entries.is_empty() {
-            return Ok(());
-        }
+        self.write_lines(
+            outcome
+                .entries
+                .iter()
+                .map(|entry| LogEntry::of(entry, outcome.at, outcome.mode)),
+        )
+    }
+
+    /// Appends one line per entry of a cleanup batch, under every promise [`Self::append`]
+    /// makes: one write for the whole batch, nothing at all for an empty one, and `Ok` only
+    /// once the lines are on the volume.
+    pub fn append_cleanup(&self, outcome: &CleanupOutcome) -> io::Result<()> {
+        self.write_lines(
+            outcome
+                .entries
+                .iter()
+                .map(|entry| LogEntry::of_cleanup(entry, outcome.at)),
+        )
+    }
+
+    /// The body of both appends.
+    fn write_lines(&self, entries: impl Iterator<Item = LogEntry>) -> io::Result<()> {
         let mut lines = String::new();
-        for entry in &outcome.entries {
-            let line = LogEntry::of(entry, outcome.at, outcome.mode);
+        for line in entries {
             // Unreachable for these fields, and deliberately not an `unwrap`: a line that
             // cannot be serialized must not take the process down right after a deletion.
             lines.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
             lines.push('\n');
+        }
+        if lines.is_empty() {
+            return Ok(());
         }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -356,6 +440,144 @@ mod tests {
             .unwrap();
     }
 
+    /// One entry of a cleanup batch, as `cleanup::execute` reports it.
+    fn cleanup_entry(path: Option<&str>, result: EntryResult) -> CleanupEntryOutcome {
+        CleanupEntryOutcome {
+            item: "demo:old.object".to_owned(),
+            module: "demo".to_owned(),
+            title: "old.object".to_owned(),
+            action: "Remove object".to_owned(),
+            path: path.map(PathBuf::from),
+            kind: path.map(|_| NodeKind::File),
+            targets: path.map(PathBuf::from).into_iter().collect(),
+            mode: Mode::Permanent,
+            commands: vec![vec!["rm".to_owned(), "/h/demo/old.object".to_owned()]],
+            result,
+        }
+    }
+
+    fn cleanup_batch(entries: Vec<CleanupEntryOutcome>) -> CleanupOutcome {
+        CleanupOutcome {
+            entries,
+            freed_bytes: 0,
+            at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            mode: Mode::Trash,
+        }
+    }
+
+    #[test]
+    fn an_explorer_line_keeps_its_exact_bytes() {
+        // The shape phase 2a wrote, byte for byte: the fields added since are absent from it,
+        // not `null` or empty, so a file of old and new lines reads as one record.
+        let line = LogEntry::of(
+            &outcome("/h/a", 10),
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            Mode::Trash,
+        );
+        assert_eq!(
+            serde_json::to_string(&line).unwrap(),
+            r#"{"at":"2023-11-14T22:13:20Z","path":"/h/a","kind":"dir","mode":"trash","result":"removed","detail":null,"bytes":10}"#
+        );
+    }
+
+    #[test]
+    fn a_line_written_by_phase_2a_still_reads() {
+        let written = r#"{"at":"2026-09-20T10:00:00Z","path":"/Users/me/a.bin","kind":"file","mode":"permanent","result":"failed","detail":"cannot delete /Users/me/a.bin: denied","bytes":0}"#;
+        let entry: LogEntry = serde_json::from_str(written).unwrap();
+        assert_eq!(entry.path.as_deref(), Some("/Users/me/a.bin"));
+        assert_eq!(entry.kind, Some(NodeKind::File));
+        assert_eq!(entry.source, None);
+        assert!(entry.commands.is_empty());
+    }
+
+    #[test]
+    fn a_cleanup_line_carries_its_source_and_commands() {
+        let line = LogEntry::of_cleanup(
+            &cleanup_entry(
+                Some("/h/demo/old.object"),
+                EntryResult::Removed { bytes: 3 },
+            ),
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(&line).unwrap(),
+            serde_json::json!({
+                "at": "2023-11-14T22:13:20Z",
+                "path": "/h/demo/old.object",
+                "kind": "file",
+                // The entry's own mode: nothing about it went to the Trash.
+                "mode": "permanent",
+                "result": "removed",
+                "detail": null,
+                "bytes": 3,
+                "source": {
+                    "module": "demo",
+                    "item": "demo:old.object",
+                    "title": "old.object",
+                    "action": "Remove object",
+                },
+                "commands": [["rm", "/h/demo/old.object"]],
+            })
+        );
+    }
+
+    #[test]
+    fn a_cleanup_line_without_a_path_leaves_it_out() {
+        let line = LogEntry::of_cleanup(
+            &cleanup_entry(
+                None,
+                EntryResult::Skipped {
+                    reason: BlockReason::Missing,
+                },
+            ),
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        let json = serde_json::to_value(&line).unwrap();
+        assert!(json.get("path").is_none(), "{json}");
+        assert!(json.get("kind").is_none(), "{json}");
+        let read: LogEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(read.path, None);
+        assert_eq!(read.detail.as_deref(), Some("missing"));
+    }
+
+    #[test]
+    fn a_cleanup_batch_is_one_append_after_a_torn_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions.jsonl");
+        let log = ActionLog::new(path.clone());
+        log.append(&batch(Mode::Trash, Utc::now(), vec![outcome("/h/a", 1)]))
+            .unwrap();
+        append_raw(&path, br#"{"at":"2026-09-2"#);
+        log.append_cleanup(&cleanup_batch(vec![
+            cleanup_entry(Some("/h/demo/one"), EntryResult::Removed { bytes: 1 }),
+            cleanup_entry(Some("/h/demo/two"), EntryResult::Removed { bytes: 2 }),
+        ]))
+        .unwrap();
+        let read = log.tail(10).unwrap();
+        assert_eq!(
+            read.damaged, 1,
+            "the torn line costs itself and nothing more"
+        );
+        assert_eq!(
+            read.entries
+                .iter()
+                .map(|entry| entry.path.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["/h/demo/two", "/h/demo/one", "/h/a"]
+        );
+        assert!(read.entries[0].source.is_some() && read.entries[2].source.is_none());
+    }
+
+    #[test]
+    fn an_empty_cleanup_batch_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions.jsonl");
+        ActionLog::new(path.clone())
+            .append_cleanup(&cleanup_batch(Vec::new()))
+            .unwrap();
+        assert!(!path.exists(), "nothing happened, so nothing is created");
+    }
+
     #[test]
     fn entries_are_appended_and_read_newest_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -371,9 +593,9 @@ mod tests {
         .unwrap();
         let entries = log.tail(10).unwrap().entries;
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].path, "/h/c");
+        assert_eq!(entries[0].path.as_deref(), Some("/h/c"));
         assert_eq!(entries[0].mode, Mode::Permanent);
-        assert_eq!(entries[2].path, "/h/a");
+        assert_eq!(entries[2].path.as_deref(), Some("/h/a"));
         assert_eq!(entries[2].mode, Mode::Trash);
     }
 
@@ -391,7 +613,7 @@ mod tests {
         }
         let entries = log.tail(2).unwrap().entries;
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].path, "/h/4");
+        assert_eq!(entries[0].path.as_deref(), Some("/h/4"));
     }
 
     #[test]
@@ -489,12 +711,14 @@ mod tests {
         // assertions below have to hold, not just the count.
         let forged = serde_json::to_string(&LogEntry {
             at: chrono::Utc::now(),
-            path: "/h/forged".to_owned(),
-            kind: NodeKind::Dir,
+            path: Some("/h/forged".to_owned()),
+            kind: Some(NodeKind::Dir),
             mode: Mode::Permanent,
             result: LogResult::Removed,
             detail: None,
             bytes: 9000,
+            source: None,
+            commands: Vec::new(),
         })
         .unwrap();
         let named_like_a_line = format!("/h/evil\n{forged}");
@@ -509,7 +733,8 @@ mod tests {
         let read = log.tail(10).unwrap();
         assert_eq!(read.entries.len(), 1, "and no forged second one");
         assert_eq!(
-            read.entries[0].path, named_like_a_line,
+            read.entries[0].path.as_deref(),
+            Some(named_like_a_line.as_str()),
             "and it comes back whole"
         );
         assert_eq!(read.entries[0].bytes, 1);
@@ -547,15 +772,15 @@ mod tests {
         assert_eq!(read.len(), 3);
 
         let removed = &read[2];
-        assert_eq!(removed.path, "/h/gone");
-        assert_eq!(removed.kind, NodeKind::Dir);
+        assert_eq!(removed.path.as_deref(), Some("/h/gone"));
+        assert_eq!(removed.kind, Some(NodeKind::Dir));
         assert_eq!(removed.result, LogResult::Removed);
         assert_eq!(removed.bytes, 4_096);
         assert_eq!(removed.detail, None);
 
         let failed = &read[1];
-        assert_eq!(failed.path, "/h/stuck");
-        assert_eq!(failed.kind, NodeKind::File);
+        assert_eq!(failed.path.as_deref(), Some("/h/stuck"));
+        assert_eq!(failed.kind, Some(NodeKind::File));
         assert_eq!(failed.result, LogResult::Failed);
         assert_eq!(failed.bytes, 0, "nothing was freed");
         assert_eq!(
@@ -564,8 +789,8 @@ mod tests {
         );
 
         let skipped = &read[0];
-        assert_eq!(skipped.path, "/h/link");
-        assert_eq!(skipped.kind, NodeKind::Symlink);
+        assert_eq!(skipped.path.as_deref(), Some("/h/link"));
+        assert_eq!(skipped.kind, Some(NodeKind::Symlink));
         assert_eq!(skipped.result, LogResult::Skipped);
         assert_eq!(skipped.bytes, 0, "nothing was freed");
         assert_eq!(
@@ -607,7 +832,11 @@ mod tests {
         read.reverse();
         assert_eq!(read.len(), reasons.len());
         for (entry, (_, name)) in read.iter().zip(reasons) {
-            assert_eq!(entry.path, format!("/h/{name}"), "in the order written");
+            assert_eq!(
+                entry.path.as_deref(),
+                Some(format!("/h/{name}").as_str()),
+                "in the order written"
+            );
             assert_eq!(
                 entry.detail.as_deref(),
                 Some(name),
@@ -638,13 +867,14 @@ mod tests {
 
         let read = log.tail(10).unwrap().entries;
         assert_eq!(
-            read[0].path, "/h/written-second",
+            read[0].path.as_deref(),
+            Some("/h/written-second"),
             "newest is the last line written, not the largest `at`"
         );
-        assert_eq!(read[1].path, "/h/written-first");
+        assert_eq!(read[1].path.as_deref(), Some("/h/written-first"));
         assert_eq!(
-            log.tail(1).unwrap().entries[0].path,
-            "/h/written-second",
+            log.tail(1).unwrap().entries[0].path.as_deref(),
+            Some("/h/written-second"),
             "and the limit keeps the end of the file, not the latest `at`"
         );
         // A choice, not an accident: prefixing the separator unconditionally on a non-empty
@@ -692,7 +922,9 @@ mod tests {
         );
         let read = log.tail(10).unwrap().entries;
         assert_eq!(
-            read.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            read.iter()
+                .map(|e| e.path.as_deref().unwrap())
+                .collect::<Vec<_>>(),
             ["/h/3", "/h/2", "/h/1", "/h/0"]
         );
         assert!(
@@ -727,7 +959,7 @@ mod tests {
         assert_eq!(
             read.entries
                 .iter()
-                .map(|e| e.path.as_str())
+                .map(|e| e.path.as_deref().unwrap())
                 .collect::<Vec<_>>(),
             ["/h/c", "/h/b", "/h/a"],
             "three entries, not two and a hole"
@@ -758,7 +990,7 @@ mod tests {
             1,
             "the finished line survives the torn one"
         );
-        assert_eq!(read.entries[0].path, "/h/café");
+        assert_eq!(read.entries[0].path.as_deref(), Some("/h/café"));
         assert_eq!(read.damaged, 1);
 
         // And the batch that comes next is not dragged down with it: the torn bytes have
@@ -773,7 +1005,7 @@ mod tests {
         assert_eq!(
             read.entries
                 .iter()
-                .map(|e| e.path.as_str())
+                .map(|e| e.path.as_deref().unwrap())
                 .collect::<Vec<_>>(),
             ["/h/after-2", "/h/after-1", "/h/café"],
             "every entry of the new batch, and the one from before the tear"
@@ -807,7 +1039,7 @@ mod tests {
         assert_eq!(
             read.entries
                 .iter()
-                .map(|e| e.path.as_str())
+                .map(|e| e.path.as_deref().unwrap())
                 .collect::<Vec<_>>(),
             ["/h/c", "/h/b", "/h/a"]
         );
@@ -841,7 +1073,7 @@ mod tests {
         assert_eq!(
             read.entries
                 .iter()
-                .map(|e| e.path.as_str())
+                .map(|e| e.path.as_deref().unwrap())
                 .collect::<Vec<_>>(),
             ["/h/c", "/h/b", "/h/a", "/h/before"],
             "the torn line is the only loss"
@@ -916,7 +1148,7 @@ mod tests {
         assert_eq!(
             read.entries
                 .iter()
-                .map(|e| e.path.as_str())
+                .map(|e| e.path.as_deref().unwrap())
                 .collect::<Vec<_>>(),
             ["/h/b", "/h/a", "/h/before"],
             "both new entries, and the torn line took nothing with it"
@@ -1014,7 +1246,15 @@ mod tests {
             .entries
             .iter()
             .rev()
-            .map(|entry| entry.path.rsplit_once("/entry-").unwrap().0)
+            .map(|entry| {
+                entry
+                    .path
+                    .as_deref()
+                    .unwrap()
+                    .rsplit_once("/entry-")
+                    .unwrap()
+                    .0
+            })
             .collect();
         tags.dedup();
         assert_eq!(

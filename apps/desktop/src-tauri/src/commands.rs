@@ -240,7 +240,11 @@ mod tests {
             1,
             "the limit reaches the read: {tail:?}"
         );
-        assert_eq!(tail.entries[0].path, "/h/newer", "newest first");
+        assert_eq!(
+            tail.entries[0].path.as_deref(),
+            Some("/h/newer"),
+            "newest first"
+        );
 
         // The same log, now impossible to read: a directory in its place.
         std::fs::remove_file(&path).unwrap();

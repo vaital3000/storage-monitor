@@ -640,14 +640,14 @@ mod tests {
         let line = |path: &Path| {
             tail.entries
                 .iter()
-                .find(|entry| entry.path == path.to_string_lossy())
+                .find(|entry| entry.path.as_deref() == Some(&*path.to_string_lossy()))
                 .unwrap_or_else(|| panic!("no line for {}: {tail:?}", path.display()))
                 .clone()
         };
         let removed = line(&root.join("cache"));
         assert_eq!(removed.result, LogResult::Removed);
         assert_eq!(removed.bytes, cache_size);
-        assert_eq!(removed.kind, NodeKind::Dir);
+        assert_eq!(removed.kind, Some(NodeKind::Dir));
         assert_eq!(removed.detail, None);
         let blocked = line(&precious);
         assert_eq!(blocked.result, LogResult::Skipped);
@@ -686,7 +686,7 @@ mod tests {
     fn paths_of(tail: &LogTail) -> Vec<&str> {
         tail.entries
             .iter()
-            .map(|entry| entry.path.as_str())
+            .map(|entry| entry.path.as_deref().unwrap())
             .collect()
     }
 
@@ -700,11 +700,11 @@ mod tests {
         let tail = activity_tail(&log, Some(1)).expect("the log reads");
         assert_eq!(tail.entries.len(), 1, "the limit is a limit: {tail:?}");
         let newest = &tail.entries[0];
-        assert_eq!(newest.path, "/h/third");
+        assert_eq!(newest.path.as_deref(), Some("/h/third"));
         assert_eq!(newest.mode, Mode::Permanent);
         assert_eq!(newest.result, LogResult::Removed);
         assert_eq!(newest.bytes, 1_024);
-        assert_eq!(newest.kind, NodeKind::File);
+        assert_eq!(newest.kind, Some(NodeKind::File));
         assert_eq!(tail.damaged, 0);
 
         let whole = activity_tail(&log, Some(10)).expect("the log reads");
@@ -775,8 +775,16 @@ mod tests {
 
         let tail = activity_tail(&log, None).expect("the log reads");
         assert_eq!(tail.entries.len(), 100);
-        assert_eq!(tail.entries[0].path, "/h/100", "last line first");
-        assert_eq!(tail.entries[99].path, "/h/001", "a hundred back");
+        assert_eq!(
+            tail.entries[0].path.as_deref(),
+            Some("/h/100"),
+            "last line first"
+        );
+        assert_eq!(
+            tail.entries[99].path.as_deref(),
+            Some("/h/001"),
+            "a hundred back"
+        );
         assert!(
             !paths_of(&tail).contains(&"/h/000"),
             "and the hundred and first is over the edge"
@@ -801,7 +809,10 @@ mod tests {
 
         let tail = activity_tail(&log, None).expect("the log reads");
         assert_eq!(tail.entries.len(), 1, "{tail:?}");
-        assert_eq!(tail.entries[0].path, cache.to_string_lossy());
+        assert_eq!(
+            tail.entries[0].path.as_deref(),
+            Some(&*cache.to_string_lossy())
+        );
         assert_eq!(tail.entries[0].result, LogResult::Removed);
         assert_eq!(tail.entries[0].bytes, cache_size);
         assert_eq!(tail.entries[0].at, batch.outcome.at);
