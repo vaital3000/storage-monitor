@@ -189,6 +189,9 @@ function headline(report: BatchReport): string {
 
 const PATH_CLASS = 'truncate font-mono text-xs';
 
+/** A row that is an item rather than a path: its title is a name, set as one. */
+const TITLE_CLASS = 'truncate font-medium';
+
 /** The height at which a list starts scrolling, and so needs a key to scroll it. */
 const SCROLLER_CLASS = 'max-h-60 overflow-y-auto';
 
@@ -520,7 +523,7 @@ function Row({ row, scope, mark }: { row: BatchRow; scope: GuardScope; mark: boo
       className={`flex min-w-0 flex-col ${row.status.state === 'blocked' ? 'text-muted' : ''}`}
     >
       <span className="flex min-w-0 items-baseline gap-2">
-        <span className={PATH_CLASS} title={row.title}>
+        <span className={row.context === undefined ? PATH_CLASS : TITLE_CLASS} title={row.title}>
           {row.title}
         </span>
         <span className="ml-auto shrink-0 tabular-nums">{formatBytes(row.size)}</span>
