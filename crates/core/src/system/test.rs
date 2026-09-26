@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,14 +8,103 @@ use std::sync::Mutex;
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use tempfile::TempDir;
 
-use super::{RealSystem, System, SystemError, check_path};
+use super::{Invocation, Output, RealSystem, System, SystemError, check_path};
 
 /// What an injected failure reports.
 const INJECTED: &str = "the test system was told to fail";
 
+/// What a scripted run answers, and what it does to the temporary tree when it happens.
+///
+/// A reply is used once. The effect is how a test gives a scripted `rm` the consequence the
+/// real one has — without it the file is still there after a run that answered success, and
+/// the next discovery finds an item the batch reported removed.
+pub struct Reply {
+    outcome: Scripted,
+    effect: Option<Box<dyn FnOnce() + Send>>,
+}
+
+enum Scripted {
+    Output(Output),
+    TimedOut,
+}
+
+impl Reply {
+    /// Exit 0, nothing written.
+    pub fn ok() -> Self {
+        Self::exit(0)
+    }
+
+    /// Exit `code`, nothing written.
+    pub fn exit(code: i32) -> Self {
+        Self::output(Some(code))
+    }
+
+    /// Ended by a signal: an `Output` whose status is `None`.
+    pub fn killed() -> Self {
+        Self::output(None)
+    }
+
+    fn output(status: Option<i32>) -> Self {
+        Self {
+            outcome: Scripted::Output(Output {
+                status,
+                ..Output::default()
+            }),
+            effect: None,
+        }
+    }
+
+    /// The port's own failure: the program ran past its deadline.
+    pub fn timeout() -> Self {
+        Self {
+            outcome: Scripted::TimedOut,
+            effect: None,
+        }
+    }
+
+    pub fn stdout(mut self, text: impl Into<Vec<u8>>) -> Self {
+        if let Scripted::Output(output) = &mut self.outcome {
+            output.stdout = text.into();
+        }
+        self
+    }
+
+    pub fn stderr(mut self, text: impl Into<Vec<u8>>) -> Self {
+        if let Scripted::Output(output) = &mut self.outcome {
+            output.stderr = text.into();
+        }
+        self
+    }
+
+    /// Runs `effect` when the scripted run happens — not when it is scripted.
+    pub fn then(mut self, effect: impl FnOnce() + Send + 'static) -> Self {
+        self.effect = Some(Box::new(effect));
+        self
+    }
+}
+
+/// One run recorded from a real machine: what `TestSystem::replay` reads.
+#[derive(serde::Deserialize)]
+struct Fixture {
+    tool: String,
+    args: Vec<String>,
+    /// `null` when a signal ended the process.
+    status: Option<i32>,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+}
+
+/// A script is found by the program's file name and the arguments: where the tool was
+/// installed is the machine's business, and a fixture recorded on one Mac has to replay on
+/// another and on Linux.
+type ScriptKey = (OsString, Vec<OsString>);
+
 /// A [`System`] confined to a temporary directory: the real filesystem for metadata and
-/// deletion, a Trash that is just another folder, and a clock that moves only when a test
-/// moves it. Everything it touches disappears when it is dropped.
+/// deletion, a Trash that is just another folder, a clock that moves only when a test moves
+/// it, and programs that never run — a test says which tools exist and what each run
+/// answers. Everything it touches disappears when it is dropped.
 ///
 /// Deleting outside that directory panics rather than fails, so a test of a broken guard
 /// cannot quietly wipe the developer's `$HOME`. One instance per test thread: the search
@@ -32,6 +121,14 @@ pub struct TestSystem {
     clock: Mutex<DateTime<Utc>>,
     /// Paths whose next deletion fails; see [`TestSystem::fail_next`].
     failures: Mutex<HashSet<PathBuf>>,
+    /// Where [`System::locate`] says the installed tools are. Never created: nothing runs.
+    bin: PathBuf,
+    /// The tools [`TestSystem::install`] made locatable.
+    tools: Mutex<HashSet<String>>,
+    /// Replies by program name and arguments, used in order.
+    scripts: Mutex<HashMap<ScriptKey, VecDeque<Reply>>>,
+    /// Every run, oldest first, as its program's file name and the arguments.
+    ran: Mutex<Vec<Vec<String>>>,
 }
 
 impl TestSystem {
@@ -44,6 +141,7 @@ impl TestSystem {
             .expect("canonicalize the temporary directory");
         let root = base.join("root");
         let trash = base.join("trash");
+        let bin = base.join("bin");
         fs::create_dir(&root).expect("create the root directory");
         fs::create_dir(&trash).expect("create the trash directory");
         Self {
@@ -57,6 +155,10 @@ impl TestSystem {
                     .expect("a valid start instant"),
             ),
             failures: Mutex::new(HashSet::new()),
+            bin,
+            tools: Mutex::new(HashSet::new()),
+            scripts: Mutex::new(HashMap::new()),
+            ran: Mutex::new(Vec::new()),
         }
     }
 
@@ -83,6 +185,48 @@ impl TestSystem {
             .lock()
             .expect("an unpoisoned failure list")
             .insert(path.to_path_buf());
+    }
+
+    /// Makes `tool` locatable, at `<base>/bin/<tool>`. Nothing is created there: a run is
+    /// answered by its script, never by a file.
+    pub fn install(&self, tool: &str) {
+        self.tools
+            .lock()
+            .expect("an unpoisoned tool list")
+            .insert(tool.to_owned());
+    }
+
+    /// The next run of `tool` with exactly these arguments answers `reply`. Scripts for one
+    /// argv are used in the order they were given, each once.
+    pub fn script<S: AsRef<OsStr>>(&self, tool: &str, args: &[S], reply: Reply) {
+        let key = (
+            OsString::from(tool),
+            args.iter().map(|arg| arg.as_ref().to_owned()).collect(),
+        );
+        self.scripts
+            .lock()
+            .expect("an unpoisoned script")
+            .entry(key)
+            .or_default()
+            .push_back(reply);
+    }
+
+    /// Scripts the run recorded in `fixture`: `{ "tool", "args", "status", "stdout",
+    /// "stderr" }`, with `status` null for a process a signal ended.
+    pub fn replay(&self, fixture: &Path) {
+        let text = fs::read_to_string(fixture)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", fixture.display()));
+        let recorded: Fixture = serde_json::from_str(&text)
+            .unwrap_or_else(|err| panic!("{} is not a fixture: {err}", fixture.display()));
+        let reply = Reply::output(recorded.status)
+            .stdout(recorded.stdout)
+            .stderr(recorded.stderr);
+        self.script(&recorded.tool, &recorded.args, reply);
+    }
+
+    /// Every run so far, oldest first: the program's file name, then the arguments.
+    pub fn ran(&self) -> Vec<Vec<String>> {
+        self.ran.lock().expect("an unpoisoned record").clone()
     }
 
     /// Panics unless the path is inside the temporary directory. A panic, not an error:
@@ -186,12 +330,69 @@ impl System for TestSystem {
     fn now(&self) -> DateTime<Utc> {
         *self.clock.lock().expect("an unpoisoned clock")
     }
+
+    fn locate(&self, tool: &str) -> Option<PathBuf> {
+        self.tools
+            .lock()
+            .expect("an unpoisoned tool list")
+            .contains(tool)
+            .then(|| self.bin.join(tool))
+    }
+
+    /// Answers the script for this argv, and panics when there is none — a panic and not an
+    /// error for the reason [`TestSystem::assert_confined`] gives: a test of a module whose
+    /// plan went wrong must stop, not record an expected failure. Nothing is ever started.
+    fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+        check_path(&invocation.program)?;
+        if let Some(cwd) = &invocation.cwd {
+            check_path(cwd)?;
+        }
+        let name = invocation
+            .program
+            .file_name()
+            .map(OsStr::to_owned)
+            .unwrap_or_default();
+        let argv: Vec<String> = std::iter::once(name.to_string_lossy().into_owned())
+            .chain(
+                invocation
+                    .args
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned()),
+            )
+            .collect();
+        self.ran
+            .lock()
+            .expect("an unpoisoned record")
+            .push(argv.clone());
+        let key = (name, invocation.args.clone());
+        // Taken out before the effect runs, so that an effect may script or run again.
+        let reply = self
+            .scripts
+            .lock()
+            .expect("an unpoisoned script")
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front);
+        let Some(reply) = reply else {
+            panic!("TestSystem has no script for `{}`", argv.join(" "));
+        };
+        if let Some(effect) = reply.effect {
+            effect();
+        }
+        match reply.outcome {
+            Scripted::Output(output) => Ok(output),
+            Scripted::TimedOut => Err(SystemError::TimedOut {
+                program: invocation.program.clone(),
+                after: invocation.timeout,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Duration;
 
     /// A symlink inside `root` pointing at a directory outside the temporary tree, with a
     /// file in it. The shape in which a path that looks confined deletes something else.
@@ -433,6 +634,149 @@ mod tests {
             .unwrap_or("<not a string>");
         assert!(message.contains("refuses to touch"), "got {message:?}");
         assert_eq!(fs::read(&precious).unwrap(), b"keep");
+    }
+
+    /// A run of `tool` from the fake bin, as a module's step would hand it over.
+    fn invocation(sys: &TestSystem, tool: &str, args: &[&str]) -> Invocation {
+        Invocation::new(sys.bin.join(tool), Duration::from_secs(1)).args(args.iter().copied())
+    }
+
+    #[test]
+    fn an_installed_tool_is_located_in_the_fake_bin() {
+        let sys = TestSystem::new();
+        sys.install("rm");
+        assert_eq!(sys.locate("rm"), Some(sys.bin.join("rm")));
+        assert_eq!(sys.locate("git"), None);
+    }
+
+    #[test]
+    fn a_scripted_run_answers_its_reply() {
+        let sys = TestSystem::new();
+        sys.script(
+            "git",
+            &["status"],
+            Reply::exit(1).stdout("out").stderr("err"),
+        );
+        let output = sys.run(&invocation(&sys, "git", &["status"])).unwrap();
+        assert_eq!(output.status, Some(1));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[test]
+    #[should_panic(expected = "no script for `rm /x`")]
+    fn a_reply_is_used_once() {
+        let sys = TestSystem::new();
+        sys.script("rm", &["/x"], Reply::ok());
+        sys.run(&invocation(&sys, "rm", &["/x"])).unwrap();
+        let _ = sys.run(&invocation(&sys, "rm", &["/x"]));
+    }
+
+    #[test]
+    fn scripts_match_on_the_file_name_and_the_arguments() {
+        let sys = TestSystem::new();
+        sys.script("rm", &["/x"], Reply::exit(7));
+        // Wherever the tool was found, the script is about the tool.
+        let elsewhere = Invocation::new("/opt/homebrew/bin/rm", Duration::from_secs(1)).arg("/x");
+        assert_eq!(sys.run(&elsewhere).unwrap().status, Some(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "no script for `rm /y`")]
+    fn different_arguments_do_not_match() {
+        let sys = TestSystem::new();
+        sys.script("rm", &["/x"], Reply::ok());
+        let _ = sys.run(&invocation(&sys, "rm", &["/y"]));
+    }
+
+    #[test]
+    fn replies_for_one_argv_are_used_in_order() {
+        let sys = TestSystem::new();
+        sys.script("docker", &["ps"], Reply::exit(1));
+        sys.script("docker", &["ps"], Reply::exit(2));
+        let first = sys.run(&invocation(&sys, "docker", &["ps"])).unwrap();
+        let second = sys.run(&invocation(&sys, "docker", &["ps"])).unwrap();
+        assert_eq!((first.status, second.status), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn a_reply_acts_on_the_tree_when_the_run_happens() {
+        let sys = TestSystem::new();
+        let file = sys.root().join("old.object");
+        fs::write(&file, b"x").unwrap();
+        let target = file.clone();
+        sys.script(
+            "rm",
+            &[file.as_os_str()],
+            Reply::ok().then(move || fs::remove_file(target).unwrap()),
+        );
+        assert!(file.exists(), "scripting a reply changes nothing yet");
+        sys.run(&invocation(&sys, "rm", &[file.to_str().unwrap()]))
+            .unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_reply_can_fail_like_the_port() {
+        let sys = TestSystem::new();
+        sys.script("gh", &["pr", "list"], Reply::timeout());
+        let err = sys
+            .run(&invocation(&sys, "gh", &["pr", "list"]))
+            .unwrap_err();
+        assert!(matches!(err, SystemError::TimedOut { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_killed_process_has_no_status() {
+        let sys = TestSystem::new();
+        sys.script("xcrun", &["simctl"], Reply::killed());
+        let output = sys.run(&invocation(&sys, "xcrun", &["simctl"])).unwrap();
+        assert_eq!(output.status, None);
+    }
+
+    #[test]
+    fn every_run_is_recorded() {
+        let sys = TestSystem::new();
+        sys.script("git", &["status"], Reply::ok());
+        sys.script("rm", &["/x"], Reply::ok());
+        sys.run(&invocation(&sys, "git", &["status"])).unwrap();
+        sys.run(&invocation(&sys, "rm", &["/x"])).unwrap();
+        assert_eq!(
+            sys.ran(),
+            vec![
+                vec!["git".to_owned(), "status".to_owned()],
+                vec!["rm".to_owned(), "/x".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fixture_file_scripts_a_run() {
+        let sys = TestSystem::new();
+        let fixture = sys.root().join("docker-ps.json");
+        fs::write(
+            &fixture,
+            r#"{ "tool": "docker", "args": ["ps", "--format", "json"], "status": 0, "stdout": "[]\n" }"#,
+        )
+        .unwrap();
+        sys.replay(&fixture);
+        let output = sys
+            .run(&invocation(&sys, "docker", &["ps", "--format", "json"]))
+            .unwrap();
+        assert!(output.success());
+        assert_eq!(output.stdout, b"[]\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn run_still_refuses_a_relative_program() {
+        let sys = TestSystem::new();
+        sys.script("rm", &["/x"], Reply::ok());
+        let err = sys
+            .run(&Invocation::new("rm", Duration::from_secs(1)).arg("/x"))
+            .unwrap_err();
+        assert!(matches!(err, SystemError::Rejected { .. }), "got {err:?}");
+        assert!(sys.ran().is_empty(), "a refused run is not a run");
     }
 
     #[test]

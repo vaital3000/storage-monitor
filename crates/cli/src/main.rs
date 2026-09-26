@@ -7,6 +7,7 @@ use storage_monitor_core::app_info;
 
 use crate::scan_cmd::ScanArgs;
 
+mod modules_cmd;
 mod report;
 mod scan_cmd;
 
@@ -49,6 +50,29 @@ enum Command {
         #[arg(long, default_value_t = storage_monitor_core::snapshot::DEFAULT_FILE_THRESHOLD)]
         threshold: u64,
     },
+    /// The cleanup modules of this build
+    Modules {
+        #[command(subcommand)]
+        command: ModulesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModulesCommand {
+    /// List the modules and whether each can run on this machine
+    List {
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what a module finds, with its verdicts; nothing is cleaned
+    Run {
+        /// The module's id, as `modules list` shows it
+        id: String,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -70,6 +94,10 @@ fn main() -> ExitCode {
             save,
             threshold,
         }),
+        Command::Modules { command } => match command {
+            ModulesCommand::List { json } => modules_cmd::list(json),
+            ModulesCommand::Run { id, json } => modules_cmd::run(&id, json),
+        },
     };
     match result {
         Ok(code) => code,

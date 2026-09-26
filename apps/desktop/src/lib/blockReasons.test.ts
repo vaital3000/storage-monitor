@@ -9,7 +9,7 @@ import { BLOCK_REASONS, type BlockReason } from './ipc';
  * would go on rendering whatever was left.
  */
 describe('describeBlock', () => {
-  it('says each of the nine reasons in its own words', () => {
+  it('says each of the ten reasons in its own words', () => {
     // Pinned pairwise, and not by a shape a permutation would also satisfy. The pair the
     // backend most insists on is `missing` against `unreadable` (`ipc.ts`): one sends the
     // user hunting for a file that is gone, the other to grant Full Disk Access.
@@ -23,8 +23,9 @@ describe('describeBlock', () => {
       missing: 'Nothing is there any more',
       unreadable: 'Cannot be read — it may need Full Disk Access',
       kindChanged: 'No longer what the preview saw',
+      kept: 'Marked keep — turn on its force option to clean it anyway',
     };
-    // A tenth reason mirrored into `ipc.ts` has to arrive here too, rather than falling
+    // An eleventh reason mirrored into `ipc.ts` has to arrive here too, rather than falling
     // through to the unknown-variant line that exists for older builds in the wild.
     expect(Object.keys(words).sort()).toEqual([...BLOCK_REASONS].sort());
 
@@ -33,8 +34,21 @@ describe('describeBlock', () => {
     }
   });
 
+  it('names the home folder for a batch of Cleanup, and only the two reasons that name a root', () => {
+    expect(describeBlock('outsideRoots', 'home')).toBe('Outside the home folder');
+    expect(describeBlock('isRoot', 'home')).toBe('The home folder itself, or one above it');
+    // The Explorer's words stay the Explorer's, and the default.
+    expect(describeBlock('outsideRoots')).toBe('Outside the folder that was scanned');
+    expect(describeBlock('outsideRoots', 'scan')).toBe('Outside the folder that was scanned');
+    for (const reason of BLOCK_REASONS) {
+      if (reason !== 'outsideRoots' && reason !== 'isRoot') {
+        expect(describeBlock(reason, 'home')).toBe(describeBlock(reason, 'scan'));
+      }
+    }
+  });
+
   it('names a reason this build does not know instead of answering nothing', () => {
-    // A tenth `BlockReason`, added in Rust and mirrored in `ipc.ts` after this build was
+    // An eleventh `BlockReason`, added in Rust and mirrored in `ipc.ts` after this build was
     // made. Both screens put this string in front of a user, so it is a sentence and not
     // a wire name — and never the empty string, which is what the lookup alone gives.
     expect(describeBlock('quarantined' as BlockReason)).toBe(UNKNOWN_BLOCK_REASON);

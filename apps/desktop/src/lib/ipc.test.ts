@@ -3,7 +3,9 @@ import {
   BLOCK_REASONS,
   DELETION_MODES,
   LOG_RESULTS,
+  MODULE_STATUSES,
   NODE_KINDS,
+  VERDICT_LEVELS,
   logDetail,
   type ActivityEntry,
 } from './ipc';
@@ -24,7 +26,7 @@ describe('the wire vocabularies', () => {
     expect(NODE_KINDS).toEqual(['dir', 'file', 'symlink', 'other']);
     expect(DELETION_MODES).toEqual(['trash', 'permanent']);
     expect(LOG_RESULTS).toEqual(['removed', 'failed', 'skipped']);
-    // All nine of `BlockReason`, in the order `crates/core/src/action/model.rs` declares
+    // All ten of `BlockReason`, in the order `crates/core/src/action/model.rs` declares
     // them. A screen that renders a label per reason reads this list.
     expect(BLOCK_REASONS).toEqual([
       'outsideRoots',
@@ -36,7 +38,10 @@ describe('the wire vocabularies', () => {
       'missing',
       'unreadable',
       'kindChanged',
+      'kept',
     ]);
+    expect(VERDICT_LEVELS).toEqual(['safe', 'review', 'keep']);
+    expect(MODULE_STATUSES).toEqual(['idle', 'discovering', 'ready', 'unavailable', 'failed']);
   });
 });
 

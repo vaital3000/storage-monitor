@@ -5,6 +5,9 @@ import {
   BLOCK_REASONS,
   type BatchResult,
   type BlockReason,
+  type CleanupEntry,
+  type CleanupPreviews,
+  type CleanupResult,
   type DeletionMode,
   type EntryOutcome,
   type EntryResult,
@@ -12,6 +15,13 @@ import {
   type Preview,
   type PreviewEntry,
 } from '../lib/ipc';
+import {
+  questionsFromCleanup,
+  questionsFromPreview,
+  reportFromBatch,
+  reportFromCleanup,
+  type BatchReport,
+} from '../lib/batchQuestion';
 import { tabStops } from '../lib/focusTrap';
 import ConfirmDeleteDialog, { type BatchStatus } from './ConfirmDeleteDialog';
 
@@ -62,7 +72,15 @@ interface BatchOptions {
   treeStale?: boolean;
 }
 
-function batch(entries: EntryOutcome[], options: BatchOptions = {}): BatchResult {
+/**
+ * What an Explorer batch reports, as the Explorer hands it to the dialog: the `BatchResult`
+ * the backend answers, through the same adapter the page uses.
+ */
+function batch(entries: EntryOutcome[], options: BatchOptions = {}): BatchReport {
+  return reportFromBatch(batchResult(entries, options));
+}
+
+function batchResult(entries: EntryOutcome[], options: BatchOptions = {}): BatchResult {
   const { mode = 'trash', recorded = true, treeStale = false } = options;
   const removed = entries.filter((entry) => entry.result.result === 'removed');
   return {
@@ -96,7 +114,7 @@ function show(preview: DialogPreview, options: ShowOptions = {}) {
   const { status = { phase: 'asking' }, onConfirm = noop, onClose = noop, initialMode } = options;
   const dialogFor = (phase: BatchStatus) => (
     <ConfirmDeleteDialog
-      preview={preview}
+      questions={questionsFromPreview(preview)}
       status={phase}
       initialMode={initialMode}
       onConfirm={onConfirm}
@@ -114,8 +132,11 @@ function dialog(): HTMLElement {
   return screen.getByRole('dialog');
 }
 
+/** The rows of the list — its own items, not the step lines a cleanup row nests in itself. */
 function entryItems(): HTMLElement[] {
-  return within(screen.getByTestId('delete-entries')).getAllByRole('listitem');
+  return Array.from(
+    screen.getByTestId('delete-entries').querySelectorAll<HTMLElement>(':scope > li'),
+  );
 }
 
 /** The path each row shows, in the order the dialog lists them. */
@@ -216,7 +237,7 @@ describe('ConfirmDeleteDialog', () => {
     expect(keeper).not.toHaveClass('text-muted');
   });
 
-  it('says each of the nine block reasons in its own words', () => {
+  it('says each of the ten block reasons in its own words', () => {
     // Pinned pairwise, and not by a shape a permutation would also satisfy. The pair the
     // backend most insists on is `missing` against `unreadable` (`ipc.ts`): one sends the
     // user hunting for a file that is gone, the other to grant Full Disk Access.
@@ -230,8 +251,9 @@ describe('ConfirmDeleteDialog', () => {
       missing: 'Nothing is there any more',
       unreadable: 'Cannot be read — it may need Full Disk Access',
       kindChanged: 'No longer what the preview saw',
+      kept: 'Marked keep — turn on its force option to clean it anyway',
     };
-    // A tenth reason mirrored into `ipc.ts` has to arrive here too, rather than falling
+    // An eleventh reason mirrored into `ipc.ts` has to arrive here too, rather than falling
     // through to the unknown-variant line that exists for older builds in the wild.
     expect(Object.keys(words).sort()).toEqual([...BLOCK_REASONS].sort());
 
@@ -503,7 +525,7 @@ describe('ConfirmDeleteDialog', () => {
     expect(closed).not.toHaveBeenCalled();
 
     // And hears it again as soon as there is a report to dismiss.
-    view.setStatus({ phase: 'done', result: batch([MOVED]) });
+    view.setStatus({ phase: 'done', report: batch([MOVED]) });
     fireEvent.keyDown(dialog(), { key: 'Escape' });
     expect(closed).toHaveBeenCalledTimes(1);
   });
@@ -528,7 +550,7 @@ describe('ConfirmDeleteDialog', () => {
           </button>
           {open && (
             <ConfirmDeleteDialog
-              preview={TWO_READY}
+              questions={questionsFromPreview(TWO_READY)}
               status={{ phase: 'asking' }}
               onConfirm={noop}
               onClose={() => setOpen(false)}
@@ -559,7 +581,7 @@ describe('ConfirmDeleteDialog', () => {
     view.setStatus({ phase: 'running' });
     expect(dialog()).toHaveFocus();
 
-    view.setStatus({ phase: 'done', result: batch([]) });
+    view.setStatus({ phase: 'done', report: batch([]) });
     expect(screen.getByRole('button', { name: 'Close' })).toHaveFocus();
   });
 
@@ -629,7 +651,7 @@ describe('ConfirmDeleteDialog', () => {
       <>
         <button type="button">Behind</button>
         <ConfirmDeleteDialog
-          preview={TWO_READY}
+          questions={questionsFromPreview(TWO_READY)}
           status={{ phase: 'asking' }}
           onConfirm={noop}
           onClose={noop}
@@ -687,7 +709,7 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     show(TWO_READY, {
       status: {
         phase: 'done',
-        result: batch([
+        report: batch([
           MOVED,
           ALSO_MOVED,
           outcomeEntry(`${ROOT}/Movies`, { result: 'failed', message: 'Permission denied' }),
@@ -706,7 +728,7 @@ describe('ConfirmDeleteDialog, after the batch', () => {
 
   it('says what a permanent batch did, in its own words', () => {
     show(TWO_READY, {
-      status: { phase: 'done', result: batch([MOVED], { mode: 'permanent' }) },
+      status: { phase: 'done', report: batch([MOVED], { mode: 'permanent' }) },
     });
     expect(screen.getByTestId('result-summary')).toHaveTextContent('Deleted 1 item · 2.0 GB');
   });
@@ -715,7 +737,7 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     // The entries carry 3.0 GB between them; only the backend knows what the disk gave
     // back, and a summary that added the rows up would print that number instead.
     show(TWO_READY, {
-      status: { phase: 'done', result: batch([MOVED, ALSO_MOVED], { freedBytes: 4e9 }) },
+      status: { phase: 'done', report: batch([MOVED, ALSO_MOVED], { freedBytes: 4e9 }) },
     });
     expect(screen.getByTestId('result-summary')).toHaveTextContent(
       'Moved 2 items to the Trash · 4.0 GB',
@@ -726,7 +748,7 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     show(TWO_READY, {
       status: {
         phase: 'done',
-        result: batch([
+        report: batch([
           MOVED,
           outcomeEntry(`${ROOT}/Movies`, {
             result: 'failed',
@@ -751,7 +773,7 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     show(TWO_READY, {
       status: {
         phase: 'done',
-        result: batch([
+        report: batch([
           MOVED,
           outcomeEntry(`${ROOT}/src`, { result: 'skipped', reason: 'kindChanged' }),
         ]),
@@ -766,21 +788,21 @@ describe('ConfirmDeleteDialog, after the batch', () => {
   });
 
   it('admits a batch that deleted without being recorded', () => {
-    show(TWO_READY, { status: { phase: 'done', result: batch([MOVED], { recorded: false }) } });
+    show(TWO_READY, { status: { phase: 'done', report: batch([MOVED], { recorded: false }) } });
     expect(screen.getByTestId('not-recorded')).toHaveTextContent(
       'Deleted, but not recorded: the Activity log has no line for this batch.',
     );
   });
 
   it('admits that the Explorer may be showing what it deleted', () => {
-    show(TWO_READY, { status: { phase: 'done', result: batch([MOVED], { treeStale: true }) } });
+    show(TWO_READY, { status: { phase: 'done', report: batch([MOVED], { treeStale: true }) } });
     expect(screen.getByTestId('tree-stale')).toHaveTextContent(
       'The Explorer may be stale until the next scan.',
     );
   });
 
   it('admits neither when the batch was recorded and the tree was patched', () => {
-    show(TWO_READY, { status: { phase: 'done', result: batch([MOVED]) } });
+    show(TWO_READY, { status: { phase: 'done', report: batch([MOVED]) } });
     expect(screen.queryByTestId('not-recorded')).not.toBeInTheDocument();
     expect(screen.queryByTestId('tree-stale')).not.toBeInTheDocument();
     // And no empty groups under the summary: a heading over nothing is a question the
@@ -793,7 +815,7 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     show(TWO_READY, {
       status: {
         phase: 'done',
-        result: batch([outcomeEntry(`${ROOT}/Movies`, { result: 'failed', message: 'denied' })]),
+        report: batch([outcomeEntry(`${ROOT}/Movies`, { result: 'failed', message: 'denied' })]),
       },
     });
     const report = screen.getByRole('group', { name: 'What the batch did' });
@@ -803,7 +825,7 @@ describe('ConfirmDeleteDialog, after the batch', () => {
 
   it('closes the result view on Escape and on its button', () => {
     const closed = vi.fn();
-    show(TWO_READY, { status: { phase: 'done', result: batch([MOVED]) }, onClose: closed });
+    show(TWO_READY, { status: { phase: 'done', report: batch([MOVED]) }, onClose: closed });
     fireEvent.keyDown(dialog(), { key: 'Escape' });
     expect(closed).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
@@ -820,5 +842,255 @@ describe('ConfirmDeleteDialog, after the batch', () => {
     expect(screen.queryByTestId('result-summary')).not.toBeInTheDocument();
     expect(screen.queryByTestId('not-recorded')).not.toBeInTheDocument();
     expect(screen.queryByTestId('tree-stale')).not.toBeInTheDocument();
+  });
+});
+
+describe('ConfirmDeleteDialog, over a cleanup batch', () => {
+  const SANDBOX = '/Users/demo/Library/Application Support/storage-monitor/demo';
+  const NAMES = new Map([['demo', 'Demo']]);
+
+  const folder = (mode: DeletionMode): CleanupEntry => ({
+    item: 'demo:build-cache',
+    module: 'demo',
+    title: 'build-cache',
+    action: 'Delete folder',
+    steps:
+      mode === 'trash'
+        ? [
+            { step: 'trash', path: `${SANDBOX}/build-cache` },
+            {
+              step: 'run',
+              command: `touch '${SANDBOX}/.last-cleanup'`,
+              effect: 'housekeeping',
+              path: null,
+            },
+          ]
+        : [{ step: 'delete', path: `${SANDBOX}/build-cache` }],
+    size: 2_015_232,
+    status: { state: 'ready' },
+    reversible: mode === 'trash',
+  });
+
+  const object: CleanupEntry = {
+    item: 'demo:old.object',
+    module: 'demo',
+    title: 'old.object',
+    action: 'Remove object',
+    steps: [
+      {
+        step: 'run',
+        command: `rm '${SANDBOX}/old.object'`,
+        effect: 'removes',
+        path: `${SANDBOX}/old.object`,
+      },
+    ],
+    size: 1_003_520,
+    status: { state: 'ready' },
+    reversible: false,
+  };
+
+  const kept: CleanupEntry = {
+    item: 'demo:keepsake',
+    module: 'demo',
+    title: 'keepsake',
+    action: 'Delete folder',
+    steps: [],
+    size: 507_904,
+    status: { state: 'blocked', reason: 'kept' },
+    reversible: true,
+  };
+
+  function previews(entries: (mode: DeletionMode) => CleanupEntry[]): CleanupPreviews {
+    const of = (mode: DeletionMode) => {
+      const list = entries(mode);
+      return {
+        entries: list,
+        totalBytes: list
+          .filter((entry) => entry.status.state === 'ready')
+          .reduce((sum, entry) => sum + entry.size, 0),
+        mode,
+      };
+    };
+    return { trash: of('trash'), permanent: of('permanent') };
+  }
+
+  function showCleanup(
+    batch: CleanupPreviews,
+    options: { status?: BatchStatus; initialMode?: DeletionMode } = {},
+  ) {
+    const dialogFor = (status: BatchStatus) => (
+      <ConfirmDeleteDialog
+        questions={questionsFromCleanup(batch, NAMES)}
+        status={status}
+        initialMode={options.initialMode}
+        onConfirm={noop}
+        onClose={noop}
+      />
+    );
+    const view = render(dialogFor(options.status ?? { phase: 'asking' }));
+    return { ...view, setStatus: (next: BatchStatus) => view.rerender(dialogFor(next)) };
+  }
+
+  function stepsOf(title: string): string[] {
+    return within(itemFor(title))
+      .getAllByRole('listitem')
+      .map((step) => step.textContent ?? '');
+  }
+
+  it('speaks of cleaning, and lists each item with its module, its action and its steps', () => {
+    showCleanup(previews((mode) => [folder(mode), object]));
+    expect(dialog()).toHaveAccessibleName('Clean 2 items?');
+    expect(screen.getByTestId('delete-entries')).toHaveAccessibleName('Items to clean');
+    expect(shownPaths()).toEqual(['build-cache', 'old.object']);
+    expect(within(itemFor('build-cache')).getByTestId('row-context')).toHaveTextContent(
+      'Demo · Delete folder',
+    );
+    expect(stepsOf('build-cache')).toEqual([
+      `Move to the Trash${SANDBOX}/build-cache`,
+      `Runtouch '${SANDBOX}/.last-cleanup'`,
+    ]);
+    // Housekeeping is what the other steps leave behind to tidy up, and drawn quieter.
+    const [, housekeeping] = within(itemFor('build-cache')).getAllByRole('listitem');
+    expect(housekeeping).toHaveAttribute('data-quiet');
+    expect(stepsOf('old.object')).toEqual([`Runrm '${SANDBOX}/old.object'`]);
+    expect(confirmButton()).toHaveTextContent('Clean');
+  });
+
+  it('shows the steps of the mode it is switched to, without asking anyone', () => {
+    showCleanup(previews((mode) => [folder(mode), object]));
+    selectMode('Permanent');
+    expect(dialog()).toHaveAccessibleName('Clean 2 items permanently?');
+    expect(stepsOf('build-cache')).toEqual([`Delete${SANDBOX}/build-cache`]);
+    expect(confirmButton()).toHaveTextContent('Clean for good');
+  });
+
+  it('asks for the acknowledgement in Trash mode when a command cannot be undone', () => {
+    showCleanup(previews((mode) => [folder(mode), object]));
+    expect(understandBox().parentElement).toHaveTextContent(
+      'I understand that 1 item cannot be undone.',
+    );
+    // Only the row that cannot be undone says so, since the other one can.
+    expect(within(itemFor('old.object')).getByTestId('irreversible')).toHaveTextContent(
+      'Cannot be undone',
+    );
+    expect(within(itemFor('build-cache')).queryByTestId('irreversible')).not.toBeInTheDocument();
+    expect(confirmButton()).toBeDisabled();
+    expect(confirmButton()).toHaveAttribute('data-variant', 'danger');
+    fireEvent.click(understandBox());
+    expect(confirmButton()).toBeEnabled();
+  });
+
+  it('says it once when every row cannot be undone', () => {
+    showCleanup(previews(() => [object]));
+    expect(understandBox().parentElement).toHaveTextContent(
+      'I understand that this cannot be undone.',
+    );
+    expect(screen.queryByTestId('irreversible')).not.toBeInTheDocument();
+  });
+
+  it('asks nothing when the Trash can undo every row', () => {
+    showCleanup(previews((mode) => [folder(mode)]));
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(confirmButton()).toBeEnabled();
+    expect(confirmButton()).toHaveAttribute('data-variant', 'primary');
+  });
+
+  it('refuses a row marked keep and says how to lift it, and names the home folder', () => {
+    const outside: CleanupEntry = {
+      ...object,
+      item: 'demo:elsewhere',
+      title: 'elsewhere',
+      status: { state: 'blocked', reason: 'outsideRoots' },
+    };
+    showCleanup(previews((mode) => [folder(mode), kept, outside]));
+    expect(within(itemFor('keepsake')).getByTestId('block-reason')).toHaveTextContent(
+      'Marked keep — turn on its force option to clean it anyway',
+    );
+    expect(within(itemFor('elsewhere')).getByTestId('block-reason')).toHaveTextContent(
+      'Outside the home folder',
+    );
+    expect(screen.getByTestId('delete-total')).toHaveTextContent('1 item · 2.0 MB · 2 blocked');
+  });
+
+  it('says how far a running batch has got', () => {
+    const view = showCleanup(previews((mode) => [folder(mode), object]));
+    view.setStatus({ phase: 'running', progress: { done: 1, total: 2, current: 'old.object' } });
+    expect(screen.getByRole('status')).toHaveTextContent('Cleaning 2 of 2 · old.object');
+    view.setStatus({ phase: 'running', progress: { done: 2, total: 2, current: null } });
+    expect(screen.getByRole('status')).toHaveTextContent('Finishing…');
+    view.setStatus({ phase: 'running' });
+    expect(screen.getByRole('status')).toHaveTextContent('Cleaning…');
+  });
+
+  function cleanupReport(fields: Partial<CleanupResult> = {}): BatchStatus {
+    const entry = (title: string, mode: DeletionMode, result: EntryResult) => ({
+      item: `demo:${title}`,
+      module: 'demo',
+      title,
+      action: 'Delete folder',
+      path: `${SANDBOX}/${title}`,
+      kind: 'dir' as const,
+      targets: [`${SANDBOX}/${title}`],
+      mode,
+      commands: [],
+      result,
+    });
+    return {
+      phase: 'done',
+      report: reportFromCleanup({
+        outcome: {
+          entries: [
+            entry('build-cache', 'trash', { result: 'removed', bytes: 2_015_232 }),
+            entry('old.object', 'permanent', { result: 'removed', bytes: 1_003_520 }),
+            entry('logs', 'trash', { result: 'failed', message: 'step 2 of 2, `touch`: no' }),
+            entry('keepsake', 'trash', { result: 'skipped', reason: 'kept' }),
+          ],
+          freedBytes: 3_018_752,
+          at: '2026-09-19T10:00:00Z',
+          mode: 'trash',
+        },
+        recorded: true,
+        treeStale: false,
+        ...fields,
+      }),
+    };
+  }
+
+  it('reports what went by how it went, and what did not by its title', () => {
+    showCleanup(
+      previews((mode) => [folder(mode), object]),
+      { status: cleanupReport() },
+    );
+    expect(screen.getByTestId('result-summary')).toHaveTextContent(
+      'Deleted 1 item and moved 1 to the Trash · 3.0 MB',
+    );
+    expect(screen.getByTestId('result-failed')).toHaveTextContent('Could not be cleaned');
+    expect(screen.getByTestId('result-failed')).toHaveTextContent('logs');
+    expect(screen.getByTestId('result-skipped')).toHaveTextContent(
+      'Marked keep — turn on its force option to clean it anyway',
+    );
+  });
+
+  it('admits a cleanup that was not recorded in its own words', () => {
+    showCleanup(
+      previews(() => [object]),
+      {
+        status: cleanupReport({ recorded: false } as Partial<CleanupResult>),
+      },
+    );
+    expect(screen.getByTestId('not-recorded')).toHaveTextContent(
+      'Cleaned, but not recorded: the Activity log has no line for this batch.',
+    );
+  });
+
+  it('tells a cleanup that did not run from one that ran badly', () => {
+    showCleanup(
+      previews(() => [object]),
+      {
+        status: { phase: 'failed', message: 'cannot determine the home folder' },
+      },
+    );
+    expect(dialog()).toHaveAccessibleName('The cleanup did not run');
+    expect(dialog()).toHaveTextContent('Nothing was cleaned.');
   });
 });

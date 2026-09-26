@@ -10,7 +10,8 @@ Rust stable, Node 22+, pnpm 10 and `just`. Then `just setup` and `just ci`.
 
 ## Workflow
 
-1. Open an issue or pick one. Module ideas use the "Module request" template.
+1. Open an issue or pick one. Module ideas use the "Module request" template, and
+   [docs/modules/README.md](docs/modules/README.md) is how a module is written.
 2. Branch from `main`, keep the change focused.
 3. Follow TDD; `just ci` must pass.
 4. Open a PR with a conventional title (`feat(core): ...`). Fill the template.
@@ -19,7 +20,8 @@ Rust stable, Node 22+, pnpm 10 and `just`. Then `just setup` and `just ci`.
 ## Commit messages
 
 Conventional commits. Types: `feat`, `fix`, `docs`, `chore`, `ci`, `refactor`,
-`perf`, `test`, `build`. Scopes: `core`, `cli`, `desktop`, a module id, or none.
+`perf`, `test`, `build`. Scopes: `core`, `cli`, `desktop`, a module id (`demo`), or
+none.
 
 ## Code of conduct
 

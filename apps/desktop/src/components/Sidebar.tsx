@@ -1,7 +1,9 @@
-import { PAGES, type PageId } from '../lib/pages';
+import { PAGES, type PageEntry, type PageId } from '../lib/pages';
 
 interface SidebarProps {
   page: PageId;
+  /** The sections as the shell knows them now; `PAGES` until it knows more. */
+  pages?: readonly PageEntry[];
   onNavigate: (page: PageId) => void;
   /** `v1.2.3`, or the error that stood in its way. */
   versionLabel: string;
@@ -11,12 +13,12 @@ interface SidebarProps {
  * The five sections of the design. Sections of later phases are disabled buttons, dimmed
  * and marked "soon" (the badge is part of their accessible name); the rest navigate.
  */
-export default function Sidebar({ page, onNavigate, versionLabel }: SidebarProps) {
+export default function Sidebar({ page, pages = PAGES, onNavigate, versionLabel }: SidebarProps) {
   return (
     <aside className="flex w-[220px] shrink-0 flex-col border-r border-neutral-200 bg-neutral-100 select-none dark:border-neutral-800 dark:bg-neutral-900">
       <nav aria-label="Sections" className="flex-1 overflow-y-auto p-2">
         <ul className="flex flex-col gap-0.5">
-          {PAGES.map(({ id, label, icon: Icon, available }) => {
+          {pages.map(({ id, label, icon: Icon, available }) => {
             const selected = id === page;
             return (
               <li key={id}>

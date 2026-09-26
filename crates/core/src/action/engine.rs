@@ -7,12 +7,12 @@
 //! silently shortened list would be a dialog that lies about the selection. The outcome
 //! keeps that shape one stage further, where it becomes the action log.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::scan::NodeKind;
 use crate::system::{System, SystemError};
 
-use super::guards::{Checked, Limits, drop_nested};
+use super::guards::{Limits, drop_nested};
 use super::model::{
     BlockReason, EntryOutcome, EntryResult, EntryStatus, Mode, Outcome, Plan, PlanEntry, Preview,
     PreviewEntry,
@@ -92,43 +92,91 @@ enum Verdict {
 /// Only that one is worth a syscall: a stale size costs nothing, and a stale kind deletes
 /// the wrong thing.
 fn check_entry(entry: &PlanEntry, limits: &Limits, sys: &dyn System) -> Verdict {
-    let blocked = |path: PathBuf, reason| {
-        Verdict::Blocked(PreviewEntry {
+    match inspect(&entry.path, limits, sys) {
+        Ok(Inspected { path, judged, kind }) => Verdict::Ready {
+            entry: PreviewEntry {
+                path,
+                kind,
+                size: entry.size,
+                status: EntryStatus::Ready,
+            },
+            judged,
+        },
+        Err(Refused { path, reason }) => Verdict::Blocked(PreviewEntry {
             path,
             // Nothing was read, so the plan's claim about the kind is all there is. It is
             // unverified, and `PreviewEntry::kind` says so.
             kind: entry.kind,
             size: entry.size,
             status: EntryStatus::Blocked(reason),
-        })
-    };
-    // Reports `Missing`, `Unreadable` and `Malformed` besides the placement rules, and each
-    // of them means something different to the person reading the dialog. Pass them on.
-    let checked = match limits.check(&entry.path) {
-        Ok(checked) => checked,
-        // Without a normalized path the only honest thing to show is what was asked for.
-        Err(reason) => return blocked(entry.path.clone(), reason),
-    };
+        }),
+    }
+}
+
+/// A path the guards let through and the disk describes: what [`preview`] and the
+/// re-validation of [`execute`] both establish before anything is deleted, and what the
+/// cleanup engine establishes for every target a module plans. One function for all three,
+/// because the rule inside it is the one in this crate that no test can hold on a Linux
+/// runner.
+pub(crate) struct Inspected {
+    /// What gets deleted: `Checked::path`, the caller's own last component.
+    pub path: PathBuf,
+    /// The form entries of one batch are compared by. Never a path to delete.
+    pub judged: PathBuf,
+    /// What the disk says the entry is, through the walker's classifier.
+    pub kind: NodeKind,
+}
+
+/// Why [`inspect`] refused a path, with the path to show for it: the one asked for when the
+/// guards refused it — without a normalized path the only honest thing to show is what was
+/// asked for — and the normalized one when the guards let it through and the disk did not.
+pub(crate) struct Refused {
+    pub path: PathBuf,
+    pub reason: BlockReason,
+}
+
+/// Judges `path` and asks the port about it.
+///
+/// `limits.check` reports `Missing`, `Unreadable` and `Malformed` besides the placement
+/// rules, and each of them means something different to the person reading the dialog, so
+/// they are passed on as they come.
+pub(crate) fn inspect(
+    path: &Path,
+    limits: &Limits,
+    sys: &dyn System,
+) -> Result<Inspected, Refused> {
+    let checked = limits.check(path).map_err(|reason| Refused {
+        path: path.to_path_buf(),
+        reason,
+    })?;
     // `checked.path`, never `checked.judged`. Nothing enforces that: the two are both
     // absolute, both in normal form, and name the same inode, so the substitution compiles,
     // passes clippy and passes every test here — only a staged race could tell them apart.
     // The reason is that the port must be asked about the form that will be deleted, so the
     // kind it reports is the kind the re-validation before the deletion compares against.
     match sys.symlink_metadata(&checked.path) {
-        Ok(meta) => Verdict::Ready {
-            entry: PreviewEntry {
-                path: checked.path,
-                // The walker's own classifier, so that a socket or a fifo is `Other` here
-                // as well. A private `if is_dir { Dir } else { File }` would disagree with
-                // the scan about every such entry, and the re-validation before the
-                // deletion would refuse them all as `KindChanged`, for ever.
-                kind: NodeKind::from_metadata(&meta),
-                size: entry.size,
-                status: EntryStatus::Ready,
-            },
+        Ok(meta) => Ok(Inspected {
+            path: checked.path,
             judged: checked.judged,
-        },
-        Err(err) => blocked(checked.path, reason_for(&err)),
+            // The walker's own classifier, so that a socket or a fifo is `Other` here as
+            // well. A private `if is_dir { Dir } else { File }` would disagree with the scan
+            // about every such entry, and the re-validation before the deletion would refuse
+            // them all as `KindChanged`, for ever.
+            kind: NodeKind::from_metadata(&meta),
+        }),
+        Err(err) => Err(Refused {
+            path: checked.path,
+            reason: reason_for(&err),
+        }),
+    }
+}
+
+/// Deletes `path` the way `mode` says: to the Trash, or for good. The path must be the one
+/// [`inspect`] answered, and nothing else.
+pub(crate) fn delete(path: &Path, mode: Mode, sys: &dyn System) -> Result<(), SystemError> {
+    match mode {
+        Mode::Trash => sys.move_to_trash(path),
+        Mode::Permanent => sys.remove(path),
     }
 }
 
@@ -250,7 +298,7 @@ fn run_entry(entry: &PreviewEntry, mode: Mode, limits: &Limits, sys: &dyn System
     if let EntryStatus::Blocked(reason) = entry.status {
         return skipped(entry.path.clone(), reason);
     }
-    // `Checked::path`, never `Checked::judged` — the same rule as in `check_entry`, and this
+    // `Inspected::path`, never `Inspected::judged` — the same rule as in `inspect`, and this
     // is the call site where breaking it destroys something. `judged` is the resolved form:
     // for a symlink the link itself, deliberately, but for everything else the name the disk
     // has rather than the one the caller wrote. Deleting by it compiles, type-checks, passes
@@ -258,23 +306,20 @@ fn run_entry(entry: &PreviewEntry, mode: Mode, limits: &Limits, sys: &dyn System
     // directory — which is to say everywhere except macOS, where this app runs. So the field
     // is dropped here, at the one point that still knows why, and the rest of the function
     // has no name for it to reach for.
-    let Checked { path, judged: _ } = match limits.check(&entry.path) {
-        Ok(checked) => checked,
-        Err(reason) => return skipped(entry.path.clone(), reason),
-    };
-    let meta = match sys.symlink_metadata(&path) {
-        Ok(meta) => meta,
-        Err(err) => return skipped(path, reason_for(&err)),
+    let Inspected {
+        path,
+        kind,
+        judged: _,
+    } = match inspect(&entry.path, limits, sys) {
+        Ok(inspected) => inspected,
+        Err(Refused { path, reason }) => return skipped(path, reason),
     };
     // What the preview showed the user is what they confirmed. A file where the dialog said
     // directory is not that, whoever swapped it and whyever.
-    if NodeKind::from_metadata(&meta) != entry.kind {
+    if kind != entry.kind {
         return skipped(path, BlockReason::KindChanged);
     }
-    let attempt = match mode {
-        Mode::Trash => sys.move_to_trash(&path),
-        Mode::Permanent => sys.remove(&path),
-    };
+    let attempt = delete(&path, mode, sys);
     EntryOutcome {
         path,
         kind: entry.kind,
@@ -306,7 +351,7 @@ fn run_entry(entry: &PreviewEntry, mode: Mode, limits: &Limits, sys: &dyn System
 mod tests {
     use super::*;
     use crate::scan::NodeKind;
-    use crate::system::TestSystem;
+    use crate::system::{Invocation, Output, TestSystem};
     use chrono::{DateTime, TimeDelta, Utc};
     use std::fs::{self, Metadata};
     use std::path::{Path, PathBuf};
@@ -384,6 +429,17 @@ mod tests {
 
         fn now(&self) -> DateTime<Utc> {
             Utc::now()
+        }
+
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            unreachable!("this port runs nothing, and was asked where {tool} is");
+        }
+
+        fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+            unreachable!(
+                "this port runs nothing, and was asked to run {}",
+                invocation.program.display()
+            );
         }
     }
 
@@ -477,6 +533,14 @@ mod tests {
         fn now(&self) -> DateTime<Utc> {
             self.inner.now()
         }
+
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            self.inner.locate(tool)
+        }
+
+        fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+            self.inner.run(invocation)
+        }
     }
 
     /// A [`TestSystem`] in which one entry disappears in the syscall between the last look
@@ -518,6 +582,14 @@ mod tests {
 
         fn now(&self) -> DateTime<Utc> {
             self.inner.now()
+        }
+
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            self.inner.locate(tool)
+        }
+
+        fn run(&self, invocation: &Invocation) -> Result<Output, SystemError> {
+            self.inner.run(invocation)
         }
     }
 

@@ -7,6 +7,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use storage_monitor_core::action::Outcome;
+use storage_monitor_core::cleanup::{CleanupOutcome, CleanupPreview};
+use storage_monitor_core::module::Item;
 use storage_monitor_core::scan::{NodeId, NodeKind, Tree};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +171,77 @@ pub struct BatchResult {
     pub recorded: bool,
     /// The tree still describes something the batch deleted.
     pub tree_stale: bool,
+}
+
+/// One page of what the modules found: at most the limit, largest first, and how many
+/// there are in all.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemsPage {
+    pub items: Vec<Item>,
+    pub total: usize,
+}
+
+/// A cleanup batch checked in both modes at once, the entries of the two aligned by index.
+///
+/// Both, because a module's steps depend on the mode — a worktree goes to the Trash and is
+/// pruned, or is removed by `git` — and a dialog that fetched the other mode on a toggle
+/// could show one mode's steps above a button armed for the other while the answer was on
+/// its way. With both in hand that is a property of the data, not of timing.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPreviews {
+    pub trash: CleanupPreview,
+    pub permanent: CleanupPreview,
+}
+
+/// What a cleanup batch did, and what the window has to say about it: [`BatchResult`]'s
+/// twin, with the same two admissions and the same rule — an `Err` from `cleanup_run` means
+/// the batch did not run, and everything that went wrong after it did is a field here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupResult {
+    pub outcome: CleanupOutcome,
+    /// Every entry of the batch reached the action log.
+    pub recorded: bool,
+    /// The Explorer still describes something the batch deleted.
+    pub tree_stale: bool,
+}
+
+/// Where a cleanup module stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModuleStatus {
+    /// Never discovered in this session.
+    Idle,
+    Discovering,
+    Ready,
+    /// Cannot work on this machine; `reason` says why.
+    Unavailable,
+    /// The last discovery did not finish; `reason` says why. The items of the one before are
+    /// still held.
+    Failed,
+}
+
+/// A cleanup module as the Cleanup screen shows it: who it is, where it stands, and the
+/// totals of the items it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub status: ModuleStatus,
+    /// Why the module is unavailable, or what made its last discovery fail.
+    pub reason: Option<String>,
+    pub item_count: usize,
+    /// Over every item it holds — which, after a failed refresh, are the items of the last
+    /// discovery that succeeded.
+    pub total_bytes: u64,
+    /// Over the items whose verdict is Safe: what the module is confident can go.
+    pub safe_bytes: u64,
+    /// When the held items were found.
+    pub discovered_at: Option<DateTime<Utc>>,
 }
 
 /// The root node holds its absolute path; only its last component is shown (the whole

@@ -24,6 +24,7 @@ import {
   type Preview,
   type ScanStatus,
 } from '../lib/ipc';
+import { questionsFromPreview, reportFromBatch } from '../lib/batchQuestion';
 import { describeNodeError } from '../lib/nodeErrors';
 
 const ROOT_ID: NodeId = 0;
@@ -519,7 +520,7 @@ export default function ExplorerPage() {
     void actionRun(asked.paths, mode)
       .then(
         (result) => {
-          setDeletion({ ...asked, status: { phase: 'done', result } });
+          setDeletion({ ...asked, status: { phase: 'done', report: reportFromBatch(result) } });
           afterBatch(result);
         },
         // A rejection means the batch did not run: nothing to invalidate, and the ticks are
@@ -616,9 +617,10 @@ export default function ExplorerPage() {
           to what it opened with. What ends a dialog is the scope rule and `onClose`. */}
       {pending?.phase === 'confirming' && (
         <ConfirmDeleteDialog
-          // A whole `Preview` where `Omit<Preview, 'mode'>` is asked for, and no cast:
-          // the dialog simply cannot read the mode the guards were called with.
-          preview={pending.preview}
+          // A whole `Preview` where `Omit<Preview, 'mode'>` is asked for, and no cast: the
+          // question the dialog reads has the same rows in both modes, and no way to learn
+          // the mode the guards happened to be called with.
+          questions={questionsFromPreview(pending.preview)}
           status={pending.status}
           initialMode={pending.mode}
           onConfirm={runDeletion}

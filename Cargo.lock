@@ -3381,6 +3381,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storage-monitor-core",
+ "storage-monitor-modules",
  "tempfile",
 ]
 
@@ -3409,10 +3410,28 @@ dependencies = [
  "serde",
  "serde_json",
  "storage-monitor-core",
+ "storage-monitor-module-demo",
+ "storage-monitor-modules",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
  "tempfile",
+]
+
+[[package]]
+name = "storage-monitor-module-demo"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "storage-monitor-core",
+]
+
+[[package]]
+name = "storage-monitor-modules"
+version = "0.4.0"
+dependencies = [
+ "storage-monitor-core",
+ "storage-monitor-module-demo",
 ]
 
 [[package]]

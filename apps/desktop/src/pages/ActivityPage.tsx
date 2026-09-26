@@ -1,10 +1,12 @@
 import { useQuery } from '@tanstack/react-query';
 import Button from '../components/Button';
 import { UNKNOWN_BLOCK_REASON, describeBlock } from '../lib/blockReasons';
+import { commandLine } from '../lib/commandLine';
 import { countLabel, formatBytes, formatTimestamp } from '../lib/format';
 import {
   activityLog,
   logDetail,
+  modulesList,
   type ActivityEntry,
   type DeletionMode,
   type LogResult,
@@ -59,7 +61,8 @@ function describeDetail(entry: ActivityEntry): Detail | null {
   if (detail !== null) {
     return detail.kind === 'message'
       ? { text: detail.message, failure: true }
-      : { text: describeBlock(detail.reason), failure: false };
+      : // A cleanup line's guards were built from the home folder, not from a scan.
+        { text: describeBlock(detail.reason, entry.source ? 'home' : 'scan'), failure: false };
   }
   // `logDetail` also answers null for a `skipped` line whose reason this build has no name
   // for — a variant added to `BlockReason` after this build — and that is the one case
@@ -99,19 +102,45 @@ const CELL = 'px-2 py-1.5 align-top';
 /** What a cell shows when the record has nothing to put there — never a zero or a guess. */
 const EMPTY_CELL = '—';
 
-function Row({ entry }: { entry: ActivityEntry }) {
+function Row({ entry, names }: { entry: ActivityEntry; names: ReadonlyMap<string, string> }) {
   const detail = describeDetail(entry);
   const bytes = describeBytes(entry);
   const mode = describeMode(entry);
+  const { source } = entry;
   return (
     <tr data-result={entry.result} className="border-t border-neutral-100 dark:border-neutral-800">
       <td className={`${CELL} whitespace-nowrap text-muted tabular-nums`}>
         {formatTimestamp(entry.at)}
       </td>
       <td className={`max-w-0 ${CELL}`}>
-        <span className="block truncate font-mono text-xs" title={entry.path}>
-          {entry.path}
-        </span>
+        {source !== undefined && (
+          // A cleanup line: the item by its title, and the module and the action it went
+          // through, as they were named when the batch ran. A module this build no longer
+          // has is named by its id — the line outlives the module.
+          <>
+            <span className="block truncate" title={source.title}>
+              {source.title}
+            </span>
+            <span data-testid="activity-source" className="block text-xs text-muted">
+              {names.get(source.module) ?? source.module} · {source.action}
+            </span>
+          </>
+        )}
+        {entry.path !== undefined && (
+          <span className="block truncate font-mono text-xs" title={entry.path}>
+            {entry.path}
+          </span>
+        )}
+        {entry.commands?.map((argv, index) => (
+          <span
+            // By index: the commands of one line are text in the order they ran.
+            key={index}
+            data-testid="activity-command"
+            className="block truncate font-mono text-xs text-muted"
+          >
+            $ {commandLine(argv)}
+          </span>
+        ))}
         {detail !== null && (
           // Wrapped rather than truncated into a `title`, for the reason the Explorer's
           // refusal banner records: a tooltip is not reachable by keyboard or touch, not
@@ -146,7 +175,13 @@ function Row({ entry }: { entry: ActivityEntry }) {
 
 const HEADER_CLASS = 'px-2 py-1 font-medium';
 
-function Entries({ entries }: { entries: readonly ActivityEntry[] }) {
+function Entries({
+  entries,
+  names,
+}: {
+  entries: readonly ActivityEntry[];
+  names: ReadonlyMap<string, string>;
+}) {
   return (
     <table className="w-full table-fixed border-collapse text-sm">
       <thead>
@@ -158,7 +193,7 @@ function Entries({ entries }: { entries: readonly ActivityEntry[] }) {
               (`PreviewEntry::kind`), so an icon here would draw a folder over something
               this app never looked at. */}
           <th scope="col" className={HEADER_CLASS}>
-            Path
+            What
           </th>
           <th scope="col" className={`w-24 ${HEADER_CLASS}`}>
             Mode
@@ -178,7 +213,7 @@ function Entries({ entries }: { entries: readonly ActivityEntry[] }) {
           // focusable in it, so reusing a position for another entry is indistinguishable
           // from keying it. Nothing else identifies a line — one path can be deleted twice,
           // and one batch can hold the same path twice over.
-          <Row key={index} entry={entry} />
+          <Row key={index} entry={entry} names={names} />
         ))}
       </tbody>
     </table>
@@ -206,6 +241,11 @@ export default function ActivityPage() {
     // the first open.)
     staleTime: 0,
   });
+  // The names of the modules a cleanup line came from: the sidebar's own query, so nothing is
+  // fetched twice. Until it answers, or for a module the build no longer ships, a line names
+  // its module by id.
+  const modules = useQuery({ queryKey: ['modules'], queryFn: modulesList, staleTime: 0 });
+  const names = new Map((modules.data ?? []).map((view) => [view.id, view.name]));
 
   if (log.isError) {
     return (
@@ -264,7 +304,7 @@ export default function ActivityPage() {
       )}
 
       {entries.length > 0 ? (
-        <Entries entries={entries} />
+        <Entries entries={entries} names={names} />
       ) : (
         // Only when there is nothing at all — a log of nothing but damaged lines is not an
         // empty one, and the note above is what it has to say for itself.

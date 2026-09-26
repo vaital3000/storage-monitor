@@ -22,7 +22,7 @@ function paths(page: Page): Locator {
   return page.getByTestId('activity-rows').locator('span[title]');
 }
 
-/** The cells of one row, in the order of the headers: When, Path, Mode, Result, Size. */
+/** The cells of one row, in the order of the headers: When, What, Mode, Result, Size. */
 function cells(page: Page, index: number): Locator {
   return rows(page).nth(index).getByRole('cell');
 }
@@ -68,7 +68,7 @@ test('records what the batch did, newest first, and says why the third was refus
   await expect(page.getByTestId('activity-summary')).toHaveText('3 entries');
   await expect(page.getByRole('columnheader')).toHaveText([
     'When',
-    'Path',
+    'What',
     'Mode',
     'Result',
     'Size',

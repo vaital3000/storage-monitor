@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::scan::NodeKind;
 
 /// How an entry leaves the disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
     /// Move to the Trash; the bytes come back only when the Trash is emptied.
@@ -78,6 +78,10 @@ pub enum BlockReason {
     Unreadable,
     /// The entry is no longer what the preview saw.
     KindChanged,
+    /// A cleanup item whose verdict is Keep, asked for without one of its action's `force`
+    /// options turned on (ADR 0008). The one refusal a user can lift from the same screen,
+    /// by turning the option on — and never for an Explorer row, which has no verdict.
+    Kept,
 }
 
 /// The verdict of the guards for one entry.
@@ -215,6 +219,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(BlockReason::Malformed).unwrap(),
             json!("malformed")
+        );
+        assert_eq!(
+            serde_json::to_value(BlockReason::Kept).unwrap(),
+            json!("kept")
         );
     }
 

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import App from './App';
 import { mockActionLog } from './mocks/actionLog';
 import { installIpcMock } from './mocks/ipc';
+import { setMockModules } from './mocks/modules';
 import { renderWithClient } from './test/render';
 
 describe('App', () => {
@@ -24,11 +25,13 @@ describe('App', () => {
     await waitFor(() => expect(screen.getByTestId('version')).toHaveTextContent('Error: boom'));
   });
 
-  it('lists the five sections: two that open, the rest disabled and marked "soon"', async () => {
+  it('lists the five sections: three that open, the rest disabled and marked "soon"', async () => {
     installIpcMock();
     renderWithClient(<App />);
     const nav = screen.getByRole('navigation', { name: 'Sections' });
     expect(within(nav).getAllByRole('button')).toHaveLength(5);
+    // Cleanup opens once the build is known to ship a module, which the mock's does.
+    expect(await within(nav).findByRole('button', { name: 'Cleanup' })).toBeEnabled();
     const explorer = within(nav).getByRole('button', { name: 'Explorer' });
     expect(explorer).toHaveAttribute('aria-current', 'page');
     expect(explorer).toBeEnabled();
@@ -37,7 +40,7 @@ describe('App', () => {
     const activity = within(nav).getByRole('button', { name: 'Activity' });
     expect(activity).toBeEnabled();
     expect(activity).not.toHaveAttribute('aria-current');
-    for (const label of ['Overview', 'Cleanup', 'Settings']) {
+    for (const label of ['Overview', 'Settings']) {
       const button = within(nav).getByRole('button', { name: `${label} soon` });
       expect(button).toBeDisabled();
       expect(button).not.toHaveAttribute('aria-disabled');
@@ -83,12 +86,30 @@ describe('App', () => {
     renderWithClient(<App />);
     expect(await screen.findByRole('button', { name: 'Scan' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cleanup soon' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Settings soon' }));
     expect(screen.getByRole('button', { name: 'Scan' })).toBeInTheDocument();
     expect(screen.queryByText('Coming in a later phase')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Explorer' })).toHaveAttribute(
       'aria-current',
       'page',
     );
+  });
+
+  it('marks Cleanup "soon" in a build that ships no module', async () => {
+    installIpcMock();
+    setMockModules(false);
+    renderWithClient(<App />);
+    expect(await screen.findByRole('button', { name: 'Scan' })).toBeInTheDocument();
+    const cleanup = screen.getByRole('button', { name: 'Cleanup soon' });
+    expect(cleanup).toBeDisabled();
+  });
+
+  it('opens the Cleanup screen from the sidebar', async () => {
+    installIpcMock();
+    renderWithClient(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Cleanup' }));
+    expect(screen.getByRole('button', { name: 'Cleanup' })).toHaveAttribute('aria-current', 'page');
+    expect(await screen.findByRole('heading', { name: 'Cleanup' })).toBeInTheDocument();
+    expect(await screen.findByTestId('item-rows')).toBeInTheDocument();
   });
 });

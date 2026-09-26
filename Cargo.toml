@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "apps/desktop/src-tauri"]
+members = [
+    "crates/core",
+    "crates/modules/demo",
+    "crates/modules/registry",
+    "crates/cli",
+    "apps/desktop/src-tauri",
+]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +17,8 @@ authors = ["Vitaliy Pomozov"]
 
 [workspace.dependencies]
 storage-monitor-core = { path = "crates/core" }
+storage-monitor-module-demo = { path = "crates/modules/demo" }
+storage-monitor-modules = { path = "crates/modules/registry" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
@@ -19,7 +27,7 @@ thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 postcard = { version = "1", features = ["alloc"] }
 lz4_flex = "0.14"
-nix = { version = "0.31", features = ["fs"] }
+nix = { version = "0.31", features = ["fs", "signal"] }
 dirs = "7"
 tempfile = "3"
 trash = "5.2.9"
