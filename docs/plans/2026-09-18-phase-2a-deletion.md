@@ -1714,8 +1714,7 @@ throws.** `new Worker(blob:…)` raised, the throw left the module body of
 degrades: a violation on the boot path is fatal. ADR 0006 now says so.
 
 **The tree patch, measured at last** — the number the plan asked for and PR #14
-left blank rather than guessed. On a home tree of 547,828 directories and
-4,107,680 files:
+left blank rather than guessed. On a home tree of about 4 million files:
 
 | touched paths | wall clock |
 |---|---|
