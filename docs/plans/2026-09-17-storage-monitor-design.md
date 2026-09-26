@@ -14,11 +14,10 @@ are, but they do not know what the bytes mean and cannot run the
 domain-specific cleanup commands (`git worktree remove`, `docker image rm`,
 `xcrun simctl delete`).
 
-Measured on the author's machine on the design date: 22 GB in DerivedData,
-12.6 GB of Docker images (9.3 GB reclaimable), 3.5 GB of simulators, and
-worktrees spread over five different locations (`.worktrees/`,
-`.claude/worktrees/`, `~/.codex/worktrees/`, `/private/tmp/`,
-`~/.config/superpowers/worktrees/`), some of them already prunable.
+Each of these can grow to gigabytes on its own, and worktrees are also the
+hardest to find: every tool that creates them keeps its own folder for them,
+inside the repository or far from it, and some are already prunable by the
+time anyone looks.
 
 ## 2. Goals
 

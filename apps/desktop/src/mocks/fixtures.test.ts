@@ -111,7 +111,7 @@ describe('fixture tree', () => {
     expect(derived.children).toHaveLength(3);
     expect(fixtureNode('src').children.length).toBeGreaterThanOrEqual(2);
     expect(fixtureNode('src/storage-monitor/target').kind).toBe('dir');
-    expect(fixtureNode('src/dodo-web/node_modules').kind).toBe('dir');
+    expect(fixtureNode('src/acme-web/node_modules').kind).toBe('dir');
     const downloads = fixtureNode('Downloads').children.map((id) => fixtureNodes[id]);
     expect(downloads.filter((n) => n.kind === 'file' && n.size > 10 * GB)).toHaveLength(2);
     for (const name of ['Library/Caches', 'Movies', '.Trash', 'Documents']) {

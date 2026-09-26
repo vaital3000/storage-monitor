@@ -1979,12 +1979,11 @@ release PR #10. `release.yml` attached the universal `.dmg`, the CLI tarball and
 `checksums.txt`; all three were downloaded and verified (checksums, ad-hoc
 signature, `x86_64 arm64`, version 0.2.0).
 
-Real data, released CLI on the maintainer's Mac (14 threads): 3.71M files,
-583k directories, 323.5 GB allocated, 133 unreadable directories, 41,851 hard
-links deduplicated, 24.8 s wall, 1.48 GB peak RSS with `--save`. The second
-scan listed real growth (OrbStack data +3.4 GB, this project's debug build
-+1.9 GB). The Explorer was verified in the browser (mock mode) and through
-nine Playwright tests; the released app was launched on the real home folder.
+Real data, the released CLI on a home folder of about 4 million files
+(14 threads): 24.8 s wall, 1.48 GB peak RSS with `--save`. A second scan
+listed the real growth between the two snapshots. The Explorer was verified
+in the browser (mock mode) and through nine Playwright tests; the released app
+was launched on a real home folder.
 
 Deviations from the plan text, all driven by reviews and folded into the code:
 
