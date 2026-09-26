@@ -106,7 +106,7 @@ const HOME: Spec = dir('demo', [
     dir('Developer', [
       dir('Xcode', [
         dir('DerivedData', [
-          dir('Dodo-cxjtbwqrnlvzmegakfoyuhpsdi', [
+          dir('Acme-cxjtbwqrnlvzmegakfoyuhpsdi', [
             dir('Build', [dir('Intermediates.noindex', [file('build.db', gb(26.83), 1)])]),
           ]),
           dir('StorageMonitor-eqzsvxkwdanbhjmurfgtlyopci', [
@@ -170,7 +170,7 @@ const HOME: Spec = dir('demo', [
         ]),
       ]),
     ]),
-    dir('dodo-web', [
+    dir('acme-web', [
       dir('node_modules', [dir('next', [file('next-swc.darwin-arm64.node', mb(140.3), 21)])]),
       dir('.next', [dir('cache', [file('0.pack', gb(6.31), 6)])]),
     ]),
@@ -196,7 +196,7 @@ const GROWTH: ReadonlyArray<[string, number]> = [
   ['Library/Developer', gb(6.2)],
   ['Library/Developer/Xcode', gb(6.2)],
   ['Library/Developer/Xcode/DerivedData', gb(6.2)],
-  ['Library/Developer/Xcode/DerivedData/Dodo-cxjtbwqrnlvzmegakfoyuhpsdi', gb(3.1)],
+  ['Library/Developer/Xcode/DerivedData/Acme-cxjtbwqrnlvzmegakfoyuhpsdi', gb(3.1)],
   ['Library/Containers/com.docker.docker', gb(1.1)],
   ['Library/Containers/com.docker.docker/Data', gb(1.1)],
   ['Library/Containers/com.docker.docker/Data/vms', gb(1.1)],
