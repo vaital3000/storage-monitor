@@ -37,3 +37,12 @@ debug = false
 codegen-units = 1
 lto = true
 strip = true
+
+# Proc macros (and build scripts, which share this override) are not stripped.
+# rustc strips through `rust-objcopy`, which can leave a dylib's string table on a
+# 4-byte boundary, and dyld on macOS 27 refuses to load such a library
+# ("mis-aligned LINKEDIT string pool"): rustc cannot load the proc macro and the
+# release build fails. An executable laid out the same way still launches, so the
+# app binary stays stripped.
+[profile.release.build-override]
+strip = false
